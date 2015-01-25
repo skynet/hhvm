@@ -16,41 +16,41 @@
 
 #include "hphp/runtime/server/fastcgi/socket-connection.h"
 #include "hphp/util/assertions.h"
-#include "folly/io/IOBuf.h"
+#include <folly/io/IOBuf.h>
 #include "thrift/lib/cpp/async/TAsyncTransport.h"
-#include "thrift/lib/cpp/transport/TSocketAddress.h"
+#include <folly/SocketAddress.h>
 #include "thrift/lib/cpp/transport/TTransportException.h"
-#include "ti/proxygen/lib/services/ManagedConnection.h"
+#include <folly/wangle/acceptor/ManagedConnection.h>
 
 namespace HPHP {
 
 using folly::IOBuf;
-using apache::thrift::async::TEventBase;
+using folly::EventBase;
 using apache::thrift::async::TAsyncTransport;
 using apache::thrift::async::TAsyncTimeout;
-using apache::thrift::transport::TSocketAddress;
+using folly::SocketAddress;
 using apache::thrift::transport::TTransportException;
 
 ///////////////////////////////////////////////////////////////////////////////
 
 SocketConnection::SocketConnection(
-  TAsyncTransport::UniquePtr sock,
-  const TSocketAddress& localAddr,
-  const TSocketAddress& peerAddr)
+  folly::AsyncSocket::UniquePtr sock,
+  const SocketAddress& localAddr,
+  const SocketAddress& peerAddr)
   : m_localAddr(localAddr),
     m_peerAddr(peerAddr),
     m_sock(std::move(sock)) {}
 
 SocketConnection::~SocketConnection() {
   assert(!m_sock->getReadCallback());
-  shutdownTransport();
+  close();
 }
 
 void SocketConnection::timeoutExpired() noexcept {
-  shutdownTransport();
+  close();
 }
 
-void SocketConnection::shutdownTransport() {
+void SocketConnection::close() {
   m_sock->close();
 }
 
@@ -63,9 +63,9 @@ bool SocketConnection::isBusy() const {
 }
 
 void SocketConnection::notifyPendingShutdown() {
-  // By default this never gets called since isBusy() returns false
-  // unconditionally.
-  not_reached();
+}
+
+void SocketConnection::closeWhenIdle() {
 }
 
 void SocketConnection::dropConnection() {
@@ -76,4 +76,3 @@ void SocketConnection::dumpConnectionState(uint8_t loglevel) {}
 
 ///////////////////////////////////////////////////////////////////////////////
 }
-

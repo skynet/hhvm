@@ -15,10 +15,10 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/ext/ext_file.h"
 #include "hphp/runtime/ext/bz2/bz2-file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/util/alloc.h"
-#include "folly/String.h"
+#include <folly/String.h>
 
 // Don't do the do { ... } while(0) trick here because we need 'f' outside of
 // the macro
@@ -33,16 +33,16 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 bool HHVM_FUNCTION(bzclose, const Resource& bz) {
-  return f_fclose(bz);
+  return HHVM_FN(fclose)(bz);
 }
 
 Variant HHVM_FUNCTION(bzread, const Resource& bz, int length /* = 1024 */) {
-  return f_fread(bz, length);
+  return HHVM_FN(fread)(bz, length);
 }
 
 Variant HHVM_FUNCTION(bzwrite, const Resource& bz, const String& data,
                                int length /* = 0 */) {
-  return f_fwrite(bz, data, length);
+  return HHVM_FN(fwrite)(bz, data, length);
 }
 
 const StaticString s_r("r"), s_w("w");
@@ -57,13 +57,13 @@ Variant HHVM_FUNCTION(bzopen, const Variant& filename, const String& mode) {
     return false;
   }
 
-  BZ2File *bz;
+  SmartPtr<BZ2File> bz;
   if (filename.isString()) {
     if (filename.asCStrRef().empty()) {
       raise_warning("filename cannot be empty");
       return false;
     }
-    bz = NEWOBJ(BZ2File)();
+    bz = makeSmartPtr<BZ2File>();
     bool ret = bz->open(File::TranslatePath(filename.toString()), mode);
     if (!ret) {
       raise_warning("%s", folly::errnoStr(errno).c_str());
@@ -74,7 +74,7 @@ Variant HHVM_FUNCTION(bzopen, const Variant& filename, const String& mode) {
       raise_warning("first parameter has to be string or file-resource");
       return false;
     }
-    PlainFile* f = filename.toResource().getTyped<PlainFile>();
+    SmartPtr<PlainFile> f(filename.toResource().getTyped<PlainFile>());
     if (!f) {
       return false;
     }
@@ -106,10 +106,9 @@ Variant HHVM_FUNCTION(bzopen, const Variant& filename, const String& mode) {
       return false;
     }
 
-    bz = NEWOBJ(BZ2File)(f);
+    bz = makeSmartPtr<BZ2File>(std::move(f));
   }
-  Resource handle(bz);
-  return handle;
+  return Variant(std::move(bz));
 }
 
 bool HHVM_FUNCTION(bzflush, const Resource& bz) {
@@ -160,14 +159,13 @@ Variant HHVM_FUNCTION(bzcompress, const String& source, int blocksize /* = 4 */,
 }
 
 Variant HHVM_FUNCTION(bzdecompress, const String& source, int small /* = 0 */) {
-  char *dest;
   int source_len = source.length();
   int error;
   uint64_t size = 0;
   bz_stream bzs;
 
-  bzs.bzalloc = NULL;
-  bzs.bzfree = NULL;
+  bzs.bzalloc = nullptr;
+  bzs.bzfree = nullptr;
 
   if (BZ2_bzDecompressInit(&bzs, 0, small) != BZ_OK) {
     return false;
@@ -179,28 +177,23 @@ Variant HHVM_FUNCTION(bzdecompress, const String& source, int small /* = 0 */) {
   // in most cases bz2 offers at least 2:1 compression, so we use that as our
   // base
   bzs.avail_out = source_len * 2;
-  bzs.next_out = dest = (char *) malloc(bzs.avail_out + 1);
-  if (!dest) {
-    return BZ_MEM_ERROR;
-  }
+  String ret(bzs.avail_out, ReserveString);
+  bzs.next_out = ret.bufferSlice().ptr;
 
   while ((error = BZ2_bzDecompress(&bzs)) == BZ_OK && bzs.avail_in > 0) {
     /* compression is better then 2:1, need to allocate more memory */
     bzs.avail_out = source_len;
     size = (bzs.total_out_hi32 * (unsigned int) -1) + bzs.total_out_lo32;
-    dest = (char *) safe_realloc(dest, size + bzs.avail_out + 1);
-    bzs.next_out = dest + size;
+    ret.setSize(size); // needs to be null-terminated before the reserve call
+    bzs.next_out = ret.reserve(size + bzs.avail_out).ptr + size;
   }
 
   if (error == BZ_STREAM_END || error == BZ_OK) {
     size = (bzs.total_out_hi32 * (unsigned int) -1) + bzs.total_out_lo32;
-    dest = (char *)safe_realloc(dest, size + 1);
-    dest[size] = '\0';
-    String ret = String(dest, size, AttachString);
     BZ2_bzDecompressEnd(&bzs);
+    ret.shrink(size);
     return ret;
   } else {
-    free(dest);
     BZ2_bzDecompressEnd(&bzs);
     return error;
   }
@@ -208,10 +201,10 @@ Variant HHVM_FUNCTION(bzdecompress, const String& source, int small /* = 0 */) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-class bz2Extension : public Extension {
+class bz2Extension final : public Extension {
  public:
   bz2Extension() : Extension("bz2") {}
-  virtual void moduleInit() {
+  void moduleInit() override {
     HHVM_FE(bzclose);
     HHVM_FE(bzread);
     HHVM_FE(bzwrite);

@@ -79,7 +79,8 @@ inline ArrayData* ArrayData::lval(const Variant& k, Variant *&ret, bool copy) {
                         : lval(getStringKey(cell), ret, copy);
 }
 
-inline ArrayData* ArrayData::set(const String& k, const Variant& v, bool copy) {
+inline ArrayData* ArrayData::set(const String& k, const Variant& v,
+                                 bool copy) {
   assert(IsValidKey(k));
   return set(k.get(), v, copy);
 }
@@ -159,6 +160,10 @@ inline const TypedValue* ArrayData::nvGet(int64_t ikey) const {
   return g_array_funcs.nvGetInt[m_kind](this, ikey);
 }
 
+inline const TypedValue* ArrayData::nvGetConverted(int64_t ikey) const {
+  return g_array_funcs.nvGetIntConverted[m_kind](this, ikey);
+}
+
 inline const TypedValue* ArrayData::nvGet(const StringData* skey) const {
   return g_array_funcs.nvGetStr[m_kind](this, skey);
 }
@@ -168,11 +173,16 @@ inline void ArrayData::nvGetKey(TypedValue* out, ssize_t pos) const {
 }
 
 inline ArrayData* ArrayData::set(int64_t k, const Variant& v, bool copy) {
-  return g_array_funcs.setInt[m_kind](this, k, v, copy);
+  return g_array_funcs.setInt[m_kind](this, k, *v.asCell(), copy);
+}
+
+inline ArrayData* ArrayData::setConverted(int64_t k, const Variant& v,
+                                          bool copy) {
+  return g_array_funcs.setIntConverted[m_kind](this, k, *v.asCell(), copy);
 }
 
 inline ArrayData* ArrayData::set(StringData* k, const Variant& v, bool copy) {
-  return g_array_funcs.setStr[m_kind](this, k, v, copy);
+  return g_array_funcs.setStr[m_kind](this, k, *v.asCell(), copy);
 }
 
 inline ArrayData* ArrayData::zSet(int64_t k, RefData* v) {
@@ -183,8 +193,8 @@ inline ArrayData* ArrayData::zSet(StringData* k, RefData* v) {
   return g_array_funcs.zSetStr[m_kind](this, k, v);
 }
 
-inline ArrayData* ArrayData::zAppend(RefData* v) {
-  return g_array_funcs.zAppend[m_kind](this, v);
+inline ArrayData* ArrayData::zAppend(RefData* v, int64_t* key_ptr) {
+  return g_array_funcs.zAppend[m_kind](this, v, key_ptr);
 }
 
 inline size_t ArrayData::vsize() const {
@@ -196,8 +206,8 @@ inline const Variant& ArrayData::getValueRef(ssize_t pos) const {
 }
 
 inline bool ArrayData::noCopyOnWrite() const {
-  // NameValueTableWrapper doesn't support COW.
-  return m_kind == kNvtwKind;
+  // GlobalsArray doesn't support COW.
+  return m_kind == kGlobalsKind;
 }
 
 inline bool ArrayData::isVectorData() const {
@@ -224,6 +234,10 @@ inline ArrayData* ArrayData::lvalNew(Variant*& ret, bool copy) {
   return g_array_funcs.lvalNew[m_kind](this, ret, copy);
 }
 
+inline ArrayData* ArrayData::lvalNewRef(Variant*& ret, bool copy) {
+  return g_array_funcs.lvalNewRef[m_kind](this, ret, copy);
+}
+
 inline ArrayData* ArrayData::setRef(int64_t k, Variant& v, bool copy) {
   return g_array_funcs.setRefInt[m_kind](this, k, v, copy);
 }
@@ -233,11 +247,11 @@ inline ArrayData* ArrayData::setRef(StringData* k, Variant& v, bool copy) {
 }
 
 inline ArrayData* ArrayData::add(int64_t k, const Variant& v, bool copy) {
-  return g_array_funcs.addInt[m_kind](this, k, v, copy);
+  return g_array_funcs.addInt[m_kind](this, k, *v.asCell(), copy);
 }
 
 inline ArrayData* ArrayData::add(StringData* k, const Variant& v, bool copy) {
-  return g_array_funcs.addStr[m_kind](this, k, v, copy);
+  return g_array_funcs.addStr[m_kind](this, k, *v.asCell(), copy);
 }
 
 inline ArrayData* ArrayData::remove(int64_t k, bool copy) {
@@ -250,6 +264,10 @@ inline ArrayData* ArrayData::remove(const StringData* k, bool copy) {
 
 inline ssize_t ArrayData::iter_begin() const {
   return g_array_funcs.iterBegin[m_kind](this);
+}
+
+inline ssize_t ArrayData::iter_last() const {
+  return g_array_funcs.iterLast[m_kind](this);
 }
 
 inline ssize_t ArrayData::iter_end() const {
@@ -342,10 +360,6 @@ inline ArrayData* ArrayData::plusEq(const ArrayData* elms) {
 
 inline ArrayData* ArrayData::merge(const ArrayData* elms) {
   return g_array_funcs.merge[m_kind](this, elms);
-}
-
-inline APCHandle* ArrayData::getAPCHandle() {
-  return g_array_funcs.getAPCHandle[m_kind](this);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

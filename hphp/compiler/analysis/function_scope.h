@@ -84,7 +84,8 @@ public:
    * System functions.
    */
   FunctionScope(bool method, const std::string &name, bool reference);
-  void setParamCounts(AnalysisResultConstPtr ar, int minParam, int maxParam);
+  void setParamCounts(AnalysisResultConstPtr ar,
+                      int minParam, int numDeclParam);
   void setParamSpecs(AnalysisResultPtr ar);
   void setParamName(int index, const std::string &name);
   void setParamDefault(int index, const char* value, int64_t len,
@@ -198,10 +199,11 @@ public:
   /**
    * Whether this function can take variable number of arguments.
    */
-  bool isVariableArgument() const;
+  bool allowsVariableArguments() const;
+  bool hasVariadicParam() const;
+  bool usesVariableArgumentFunc() const;
   bool isReferenceVariableArgument() const;
   void setVariableArgument(int reference);
-  bool isMixedVariableArgument() const;
 
   /**
    * Whether this function has no side effects
@@ -250,9 +252,12 @@ public:
   /**
    * How many parameters a caller should provide.
    */
-  int getMinParamCount() const { return m_minParam;}
-  int getMaxParamCount() const { return m_maxParam;}
-  int getOptionalParamCount() const { return m_maxParam - m_minParam;}
+  int getMinParamCount() const { return m_minParam; }
+  int getDeclParamCount() const { return m_numDeclParams; }
+  int getMaxParamCount() const {
+    return hasVariadicParam() ? (m_numDeclParams-1) : m_numDeclParams;
+  }
+  int getOptionalParamCount() const { return getMaxParamCount() - m_minParam;}
 
   /**
    * What is the inferred type of this function's return.
@@ -327,13 +332,6 @@ public:
    */
   bool matchParams(FunctionScopePtr func);
 
-  /**
-   * What is the inferred type of this function's parameter at specified
-   * index. Returns number of extra arguments to put into ArgumentArray.
-   */
-  int inferParamTypes(AnalysisResultPtr ar, ConstructPtr exp,
-                      ExpressionListPtr params, bool &valid);
-
   TypePtr setParamType(AnalysisResultConstPtr ar, int index, TypePtr type);
   TypePtr getParamType(int index);
   TypePtr getParamTypeSpec(int index) { return m_paramTypeSpecs[index]; }
@@ -396,7 +394,15 @@ public:
   public:
     explicit FunctionInfo(int rva = -1)
       : m_maybeStatic(false)
-      , m_maybeRefReturn(false)
+      /*
+       * Note: m_maybeRefReturn used to implement an optimization to
+       * avoid unbox checks when we call functions where we know no
+       * function with that name returns by reference.  This isn't
+       * correct, however, because __call can return by reference, so
+       * it's disabled here.  (The default to enable it should be
+       * 'false'.)
+       */
+      , m_maybeRefReturn(true)
       , m_refVarArg(rva)
     {}
 
@@ -433,7 +439,7 @@ private:
   static StringToFunctionInfoPtrMap s_refParamInfo;
 
   int m_minParam;
-  int m_maxParam;
+  int m_numDeclParams;
   int m_attribute;
   std::vector<std::string> m_paramNames;
   TypePtrVec m_paramTypes;

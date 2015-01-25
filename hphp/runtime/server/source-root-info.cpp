@@ -15,13 +15,16 @@
 */
 
 #include "hphp/runtime/server/source-root-info.h"
-#include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/config.h"
+#include "hphp/runtime/base/php-globals.h"
 #include "hphp/runtime/base/preg.h"
+#include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/base/string-util.h"
+#include "hphp/runtime/base/tv-arith.h"
+#include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/server/http-request-handler.h"
 #include "hphp/runtime/server/transport.h"
-#include "hphp/runtime/debugger/debugger.h"
-#include "hphp/runtime/base/tv-arith.h"
-#include "hphp/runtime/base/php-globals.h"
 
 using std::map;
 
@@ -39,6 +42,8 @@ SourceRootInfo::SourceRootInfo(Transport* transport)
 
   auto documentRoot = transport->getDocumentRoot();
   if (!documentRoot.empty()) {
+    m_user = "__builtin";
+    m_sandbox = "default";
     // The transport take precedence over the config file
     m_path = documentRoot;
     *s_path.getCheck() = documentRoot;
@@ -125,27 +130,28 @@ void SourceRootInfo::createFromUserConfig() {
     }
   }
 
-  std::string confpath = std::string(homePath.c_str()) +
+  std::string confFileName = std::string(homePath.c_str()) +
     RuntimeOption::SandboxConfFile;
+  IniSetting::Map ini = IniSetting::Map::object;
   Hdf config, serverVars;
   String sp, lp, alp, userOverride;
   try {
-    config.open(confpath);
-    userOverride = config["user_override"].get();
+    Config::ParseConfigFile(confFileName, ini, config);
+    userOverride = Config::Get(ini, config["user_override"]);
     Hdf sboxConf = config[m_sandbox.c_str()];
     if (sboxConf.exists()) {
-      sp = sboxConf["path"].get();
-      lp = sboxConf["log"].get();
-      alp = sboxConf["accesslog"].get();
+      sp = Config::Get(ini, sboxConf["path"]);
+      lp = Config::Get(ini, sboxConf["log"]);
+      alp = Config::Get(ini, sboxConf["accesslog"]);
       serverVars = sboxConf["ServerVars"];
     }
   } catch (HdfException &e) {
-    Logger::Error("%s ignored: %s", confpath.c_str(),
+    Logger::Error("%s ignored: %s", confFileName.c_str(),
                   e.getMessage().c_str());
   }
   if (serverVars.exists()) {
     for (Hdf hdf = serverVars.firstChild(); hdf.exists(); hdf = hdf.next()) {
-      m_serverVars.set(String(hdf.getName()), String(hdf.getString()));
+      m_serverVars.set(String(hdf.getName()), String(Config::GetString(ini, hdf)));
     }
   }
   if (!userOverride.empty()) {

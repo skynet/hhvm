@@ -19,6 +19,7 @@
 #define incl_HPHP_EXT_ASIO_BLOCKABLE_WAIT_HANDLE_H_
 
 #include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/asio/asio_blockable.h"
 #include "hphp/runtime/ext/asio/waitable_wait_handle.h"
 
 namespace HPHP {
@@ -30,37 +31,29 @@ namespace HPHP {
  * wait handle it is waiting for. Once a wait handle blocking this wait handle
  * is finished, a notification is received and the operation can be resumed.
  */
-FORWARD_DECLARE_CLASS(BlockableWaitHandle);
 class c_BlockableWaitHandle : public c_WaitableWaitHandle {
  public:
   DECLARE_CLASS_NO_SWEEP(BlockableWaitHandle)
 
-  explicit c_BlockableWaitHandle(Class* cls =
-      c_BlockableWaitHandle::classof())
-    : c_WaitableWaitHandle(cls)
-    , m_nextParent(nullptr)
+  explicit c_BlockableWaitHandle(Class* cls = c_BlockableWaitHandle::classof(),
+                                 HeaderKind kind = HeaderKind::Object)
+    : c_WaitableWaitHandle(cls, kind)
   {}
   ~c_BlockableWaitHandle() {}
 
-  void t___construct();
-
  public:
-  c_BlockableWaitHandle* getNextParent() { return m_nextParent; }
-  c_BlockableWaitHandle* unblock();
+  static constexpr ptrdiff_t blockableOff() {
+    return offsetof(c_BlockableWaitHandle, m_blockable);
+  }
 
   void exitContextBlocked(context_idx_t ctx_idx);
 
+  static const int8_t STATE_BLOCKED = 2;
+
  protected:
   void blockOn(c_WaitableWaitHandle* child);
-  virtual void onUnblocked() = 0;
-  c_WaitableWaitHandle* getChild() = 0;
   void detectCycle(c_WaitableWaitHandle* child) const;
   ObjectData* createCycleException(c_WaitableWaitHandle* child) const;
-
-  static const int8_t STATE_BLOCKED = 3;
-
- private:
-  c_BlockableWaitHandle* m_nextParent;
 };
 
 ///////////////////////////////////////////////////////////////////////////////

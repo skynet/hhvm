@@ -31,55 +31,50 @@ namespace HPHP {
  * wait handle if a result is not yet available. Once the wait handle finishes,
  * all blocked wait handles are notified.
  */
+class AsioBlockable;
 class AsioContext;
-FORWARD_DECLARE_CLASS(BlockableWaitHandle);
-FORWARD_DECLARE_CLASS(WaitableWaitHandle);
+
 class c_WaitableWaitHandle : public c_WaitHandle {
  public:
   DECLARE_CLASS_NO_SWEEP(WaitableWaitHandle)
 
-  explicit c_WaitableWaitHandle(Class* cls = c_WaitableWaitHandle::classof());
+  explicit c_WaitableWaitHandle(Class* cls = c_WaitableWaitHandle::classof(),
+                                HeaderKind kind = HeaderKind::Object);
   ~c_WaitableWaitHandle();
 
-  void t___construct();
   int t_getcontextidx();
   Object t_getcreator();
   Array t_getparents();
   Array t_getdependencystack();
 
  public:
-  context_idx_t getContextIdx() { return o_subclassData.u8[1]; }
+  static constexpr ptrdiff_t parentChainOff() {
+    return offsetof(c_WaitableWaitHandle, m_parentChain);
+  }
+
+  context_idx_t getContextIdx() { return m_context_idx; }
   AsioContext* getContext() {
     assert(isInContext());
     return AsioSession::Get()->getContext(getContextIdx());
   }
 
-  c_BlockableWaitHandle* addParent(c_BlockableWaitHandle* parent);
+  AsioBlockableChain& getParentChain() { return m_parentChain; }
 
   void enterContext(context_idx_t ctx_idx);
   void join();
-  virtual String getName() = 0;
+  String getName();
 
  protected:
-  void setResult(const Cell& result);
-  void setException(ObjectData* exception);
-  void done();
-
-  void setContextIdx(context_idx_t ctx_idx) { o_subclassData.u8[1] = ctx_idx; }
+  void setContextIdx(context_idx_t ctx_idx) { m_context_idx = ctx_idx; }
 
   bool isInContext() { return getContextIdx(); }
 
-  c_BlockableWaitHandle* getFirstParent() { return m_firstParent; }
-
-  virtual c_WaitableWaitHandle* getChild();
-  virtual void enterContextImpl(context_idx_t ctx_idx) = 0;
+  c_WaitableWaitHandle* getChild();
   bool isDescendantOf(c_WaitableWaitHandle* wait_handle) const;
-
-  static const int8_t STATE_NEW       = 2;
+  void enterContextImpl(context_idx_t ctx_idx);
 
  private:
-  c_AsyncFunctionWaitHandle* m_creator;
-  c_BlockableWaitHandle* m_firstParent;
+  context_idx_t m_context_idx;
 };
 
 ///////////////////////////////////////////////////////////////////////////////

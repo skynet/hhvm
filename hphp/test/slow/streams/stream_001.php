@@ -7,4 +7,3 @@ var_dump(stream_wrapper_restore('file'));
 var_dump(fopen("file://".__FILE__, "r"));
 
 echo "Done\n";
-?>

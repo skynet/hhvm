@@ -20,6 +20,7 @@
 #include "hphp/util/hdf.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/server/ip-block-map.h"
+#include "hphp/runtime/base/ini-setting.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -32,13 +33,14 @@ public:
   static const VirtualHost *GetCurrent();
   static int64_t GetMaxPostSize();
   static int64_t GetUploadMaxFileSize();
+  static void UpdateSerializationSizeLimit();
   static const std::vector<std::string> &GetAllowedDirectories();
   static void SortAllowedDirectories(std::vector<std::string>& dirs);
 public:
   VirtualHost();
-  explicit VirtualHost(Hdf vh);
+  explicit VirtualHost(const IniSetting::Map& ini, Hdf vh);
 
-  void init(Hdf vh);
+  void init(const IniSetting::Map& ini, Hdf vh);
   void addAllowedDirectories(const std::vector<std::string>& dirs);
   int getRequestTimeoutSeconds(int defaultTimeout) const;
 
@@ -101,9 +103,10 @@ private:
     int64_t maxPostSize = -1;
     int64_t uploadMaxFileSize = -1;
     std::vector<std::string> allowedDirectories;
+    int64_t serializationSizeLimit = StringData::MaxSize;
   };
 
-  void initRuntimeOption(Hdf overwrite);
+  void initRuntimeOption(const IniSetting::Map& ini, Hdf overwrite);
   bool m_disabled = false;
   bool m_checkExistenceBeforeRewrite = true;
   std::string m_name;

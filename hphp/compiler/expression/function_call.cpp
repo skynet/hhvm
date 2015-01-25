@@ -36,6 +36,7 @@
 #include "hphp/compiler/expression/assignment_expression.h"
 #include "hphp/compiler/expression/unary_op_expression.h"
 #include "hphp/parser/hphp.tab.hpp"
+#include <folly/Conv.h>
 
 using namespace HPHP;
 
@@ -50,7 +51,7 @@ FunctionCall::FunctionCall
     StaticClassName(classExp), m_nameExp(nameExp),
     m_ciTemp(-1), m_params(params), m_valid(false),
     m_extraArg(0), m_variableArgument(false), m_voidReturn(false),
-    m_voidWrapper(false), m_redeclared(false),
+    m_voidUsed(false), m_redeclared(false),
     m_noStatic(false), m_noInline(false), m_invokeFewArgsDecision(true),
     m_arrayParams(false), m_hadBackslash(hadBackslash),
     m_argArrayId(-1), m_argArrayHash(-1), m_argArrayIndex(-1) {
@@ -67,13 +68,14 @@ FunctionCall::FunctionCall
     m_name = toLower(name);
   }
   m_clsNameTemp = -1;
+  this->checkUnpackParams();
 }
 
 void FunctionCall::reset() {
   m_valid = false;
   m_extraArg = 0;
   m_variableArgument = false;
-  m_voidWrapper = false;
+  m_voidUsed = false;
 }
 
 bool FunctionCall::isTemporary() const {
@@ -117,6 +119,13 @@ int FunctionCall::getKidCount() const {
   return 3;
 }
 
+bool FunctionCall::hasUnpack() const {
+  // NOTE: hasContext(Expression::UnpackParameter) on the last parameter
+  // does not work in RepoAuthoritative mode due to contexts being cleared
+  // and copied as part of whole program optimizations
+  return m_params && m_params->containsUnpack();
+}
+
 void FunctionCall::setNthKid(int n, ConstructPtr cp) {
   switch (n) {
     case 0:
@@ -127,10 +136,28 @@ void FunctionCall::setNthKid(int n, ConstructPtr cp) {
       break;
     case 2:
       m_params = dynamic_pointer_cast<ExpressionList>(cp);
+      this->checkUnpackParams();
       break;
     default:
       assert(false);
       break;
+  }
+}
+
+void FunctionCall::checkUnpackParams() {
+  if (!m_params) { return; }
+  ExpressionList &params = *m_params;
+  const auto numParams = params.getCount();
+
+  // when supporting multiple unpacks at the end of the param list, this
+  // will need to disallow transitions from unpack to non-unpack.
+  for (int i = 0; i < (numParams - 1); ++i) {
+    ExpressionPtr p = params[i];
+    if (p->hasContext(Expression::UnpackParameter)) {
+      parseTimeFatal(
+        Compiler::NoError,
+        "Only the last parameter in a function call is allowed to use ...");
+    }
   }
 }
 
@@ -207,6 +234,9 @@ void FunctionCall::analyzeProgram(AnalysisResultPtr ar) {
   if (m_nameExp) m_nameExp->analyzeProgram(ar);
   if (m_params) m_params->analyzeProgram(ar);
   if (ar->getPhase() == AnalysisResult::AnalyzeFinal) {
+    if (m_voidUsed) {
+      Compiler::Error(Compiler::UseVoidReturn, shared_from_this());
+    }
     checkParamTypeCodeErrors(ar);
   }
 }
@@ -461,7 +491,7 @@ ExpressionPtr FunctionCall::inliner(AnalysisResultConstPtr ar,
                           (i < nAct ? arg.get() : this)->getLocation(),
                           prefix + (param ?
                                     param->getName() :
-                                    lexical_cast<string>(i))));
+                                    folly::to<string>(i))));
     var->updateSymbol(SimpleVariablePtr());
     var->getSymbol()->setHidden();
     var->getSymbol()->setUsed();
@@ -527,72 +557,4 @@ ExpressionPtr FunctionCall::preOptimize(AnalysisResultConstPtr ar) {
   return ExpressionPtr();
 }
 
-ExpressionPtr FunctionCall::postOptimize(AnalysisResultConstPtr ar) {
-  if (m_class) updateClassName();
-  return ExpressionPtr();
-}
-
 ///////////////////////////////////////////////////////////////////////////////
-
-TypePtr FunctionCall::checkParamsAndReturn(AnalysisResultPtr ar,
-                                           TypePtr type, bool coerce,
-                                           FunctionScopePtr func,
-                                           bool arrayParams) {
-#ifdef HPHP_DETAILED_TYPE_INF_ASSERT
-  assert(func->hasUser(getScope(), BlockScope::UseKindCaller));
-#endif /* HPHP_DETAILED_TYPE_INF_ASSERT */
-  ConstructPtr self = shared_from_this();
-  TypePtr frt;
-  {
-    TRY_LOCK(func);
-    func->getInferTypesMutex().assertOwnedBySelf();
-    assert(!func->inVisitScopes() || getScope() == func);
-    frt = func->getReturnType();
-  }
-
-  // fix return type for generators and async functions here, keep the
-  // infered return type in function scope to allow further optimizations
-  if (func->isGenerator()) {
-    frt = Type::GetType(Type::KindOfObject, "Continuation");
-  } else if (func->isAsync()) {
-    frt = Type::GetType(Type::KindOfObject, "WaitHandle");
-  }
-
-  if (!frt) {
-    m_voidReturn = true;
-    setActualType(TypePtr());
-    if (!isUnused() && !type->is(Type::KindOfAny)) {
-      if (!hasContext(ReturnContext) &&
-          !func->isFirstPass() && !func->isAbstract()) {
-        if (Option::WholeProgram || !func->getContainingClass() ||
-            func->isStatic() || func->isFinal() || func->isPrivate()) {
-          Compiler::Error(Compiler::UseVoidReturn, self);
-        }
-      }
-      if (!Type::IsMappedToVariant(type)) {
-        setExpectedType(type);
-      }
-      m_voidWrapper = true;
-    }
-  } else {
-    m_voidReturn = false;
-    m_voidWrapper = false;
-    type = checkTypesImpl(ar, type, frt, coerce);
-    assert(m_actualType);
-  }
-  if (arrayParams) {
-    m_extraArg = 0;
-    (*m_params)[0]->inferAndCheck(ar, Type::Array, false);
-  } else {
-    m_extraArg = func->inferParamTypes(ar, self, m_params, m_valid);
-  }
-  m_variableArgument = func->isVariableArgument();
-  if (m_valid) {
-    m_implementedType.reset();
-  } else {
-    m_implementedType = Type::Variant;
-  }
-  assert(type);
-
-  return type;
-}

@@ -20,12 +20,12 @@
 #include "hphp/runtime/server/server.h"
 #include "hphp/runtime/server/satellite-server.h"
 #include "hphp/util/async-func.h"
-#include "hphp/runtime/server/service-thread.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-class HttpServer : public Synchronizable, public TakeoverListener {
+class HttpServer : public Synchronizable, public TakeoverListener,
+                   public Server::ServerEventListener {
 public:
   static std::shared_ptr<HttpServer> Server;
   static time_t StartTime;
@@ -53,16 +53,16 @@ public:
 
   void takeoverShutdown() override;
 
+  void serverStopped(HPHP::Server* server) override;
+
   HPHP::Server *getPageServer() { return m_pageServer.get(); }
   void getSatelliteStats(std::vector<std::pair<std::string, int>> *stats);
 
-  void stopOnSignal();
-
-private:
-  static void startupFailure();
+  void stopOnSignal(int sig);
 
 private:
   bool m_stopped;
+  bool m_killed;
   const char* m_stopReason;
 
   ServerPtr m_pageServer;
@@ -70,11 +70,9 @@ private:
   std::vector<std::unique_ptr<SatelliteServer>> m_satellites;
   std::vector<std::unique_ptr<SatelliteServer>> m_danglings;
   AsyncFunc<HttpServer> m_watchDog;
-  std::vector<std::shared_ptr<ServiceThread>> m_serviceThreads;
 
   bool startServer(bool pageServer);
   void onServerShutdown();
-  void abortServers();
   void waitForServers();
 
   // pid file functions

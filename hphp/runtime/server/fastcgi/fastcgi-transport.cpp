@@ -16,16 +16,17 @@
 
 #include "hphp/runtime/server/fastcgi/fastcgi-transport.h"
 #include "hphp/runtime/server/fastcgi/fastcgi-server.h"
+#include "hphp/runtime/server/http-protocol.h"
 #include "hphp/runtime/server/transport.h"
 #include "hphp/runtime/base/runtime-error.h"
-#include "folly/io/IOBuf.h"
-#include "folly/io/IOBufQueue.h"
-#include "thrift/lib/cpp/async/TAsyncTransport.h"
-#include "thrift/lib/cpp/async/TAsyncTimeout.h"
-#include "thrift/lib/cpp/transport/TSocketAddress.h"
+#include <folly/io/IOBuf.h>
+#include <folly/io/IOBufQueue.h>
+#include "thrift/lib/cpp/async/TAsyncTransport.h" // @nolint
+#include "thrift/lib/cpp/async/TAsyncTimeout.h" // @nolint
+#include <folly/SocketAddress.h>
 #include "hphp/util/logger.h"
 #include "hphp/util/timer.h"
-#include "folly/MoveWrapper.h"
+#include <folly/MoveWrapper.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/predicate.hpp>
@@ -55,8 +56,20 @@ const char *FastCGITransport::getUrl() {
   return m_requestURI.c_str();
 }
 
+const std::string FastCGITransport::getScriptFilename() {
+  return m_scriptFilename;
+}
+
 const std::string FastCGITransport::getPathTranslated() {
   return m_pathTranslated;
+}
+
+const std::string FastCGITransport::getPathInfo() {
+  return m_pathInfo;
+}
+
+bool FastCGITransport::isPathInfoSet() {
+  return m_pathInfoSet;
 }
 
 const std::string FastCGITransport::getDocumentRoot() {
@@ -166,6 +179,18 @@ const char *FastCGITransport::getServerObject() {
 }
 
 std::string FastCGITransport::unmangleHeader(const std::string& name) {
+  if (name == "Authorization") {
+    return name; // Already unmangled
+  }
+
+  if (name == "CONTENT_LENGTH") {
+    return "Content-Length";
+  }
+
+  if (name == "CONTENT_TYPE") {
+    return "Content-Type";
+  }
+
   if (!boost::istarts_with(name, "HTTP_")) {
     return "";
   }
@@ -197,6 +222,7 @@ std::string FastCGITransport::mangleHeader(const std::string& name) {
 }
 
 static const std::string
+  s_authorization("Authorization"),
   s_contentLength("CONTENT_LENGTH"),
   s_contentType("CONTENT_TYPE");
 
@@ -207,6 +233,9 @@ std::string FastCGITransport::getHeader(const char *name) {
   auto *header = getRawHeaderPtr(mangleHeader(name));
   if (header) {
     return *header;
+  }
+  if (strcasecmp(name, "Authorization") == 0) {
+    return getRawHeader(s_authorization); // No HTTP_ prefix for Authorization
   }
   if (strcasecmp(name, "Content-Length") == 0) {
     return getRawHeader(s_contentLength); // No HTTP_ prefix for CONTENT_LENGTH
@@ -226,7 +255,6 @@ std::string FastCGITransport::getRawHeader(const std::string& name) {
 }
 
 std::string* FastCGITransport::getRawHeaderPtr(const std::string& name) {
-  assert(boost::to_upper_copy(name) == name);
   auto it = m_requestHeaders.find(name);
   return (it == m_requestHeaders.end()) ? nullptr : &it->second;
 }
@@ -275,6 +303,7 @@ void FastCGITransport::removeHeaderImpl(const char* name) {
 
 static const std::string
   s_status("Status: "),
+  s_space(" "),
   s_colon(": "),
   s_newline("\r\n");
 
@@ -285,6 +314,12 @@ void FastCGITransport::sendResponseHeaders(IOBufQueue& queue, int code) {
   if (code != 200) {
     queue.append(s_status);
     queue.append(std::to_string(code));
+    auto reasonStr = getResponseInfo();
+    if (reasonStr.empty()) {
+      reasonStr = HttpProtocol::GetReasonString(code);
+    }
+    queue.append(s_space);
+    queue.append(reasonStr);
     queue.append(s_newline);
   }
 
@@ -331,7 +366,7 @@ void FastCGITransport::onBody(std::unique_ptr<folly::IOBuf> chain) {
   size_t length = chain->computeChainDataLength();
   std::string s = cursor.readFixedString(length);
   m_monitor.lock();
-  m_bodyQueue.append(std::move(chain));
+  m_bodyQueue.append(s);
   if (m_waiting > 0) {
     m_monitor.notify();
   }
@@ -354,7 +389,10 @@ void FastCGITransport::onHeader(std::unique_ptr<folly::IOBuf> key_chain,
   cursor = Cursor(value_chain.get());
   std::string value = cursor.readFixedString(
                                value_chain->computeChainDataLength());
-  m_requestHeaders.emplace(key, value);
+  auto it = m_requestHeaders.emplace(key, value);
+  if (!it.second) {
+    it.first->second = value;
+  }
 }
 
 static const std::string
@@ -373,7 +411,12 @@ static const std::string
   s_scriptName("SCRIPT_NAME"),
   s_scriptFilename("SCRIPT_FILENAME"),
   s_queryString("QUERY_STRING"),
-  s_https("HTTPS");
+  s_https("HTTPS"),
+  s_pathInfo("PATH_INFO"),
+  s_slash("/"),
+  s_modProxy("proxy:"),
+  s_modProxySearch("://"),
+  s_questionMark("?");
 
 void FastCGITransport::onHeadersComplete() {
   m_requestURI = getRawHeader(s_requestURI);
@@ -385,7 +428,12 @@ void FastCGITransport::onHeadersComplete() {
   m_extendedMethod = getRawHeader(s_extendedMethod);
   m_httpVersion = getRawHeader(s_httpVersion);
   m_serverObject = getRawHeader(s_scriptName);
+  m_scriptFilename = getRawHeader(s_scriptFilename);
   m_pathTranslated = getRawHeader(s_pathTranslated);
+  if (getRawHeaderPtr(s_pathInfo) != nullptr) {
+    m_pathInfoSet = true;
+  }
+  m_pathInfo = getRawHeader(s_pathInfo);
   m_documentRoot = getRawHeader(s_documentRoot);
   if (!m_documentRoot.empty() &&
       m_documentRoot[m_documentRoot.length() - 1] != '/') {
@@ -428,27 +476,44 @@ void FastCGITransport::onHeadersComplete() {
     m_httpVersion = Transport::getHTTPVersion();
   }
 
-  if (m_pathTranslated.empty()) {
-    // If someone follows http://wiki.nginx.org/HttpFastcgiModule they won't
-    // pass in PATH_TRANSLATED and instead will just send SCRIPT_FILENAME
-    m_pathTranslated = getRawHeader(s_scriptFilename);
+  if (m_scriptFilename.empty() || RuntimeOption::ServerFixPathInfo) {
+    // According to php-fpm, some servers don't set SCRIPT_FILENAME. In
+    // this case, it uses PATH_TRANSLATED.
+    // Added runtime option to change m_scriptFilename to s_pathTranslated
+    // which will allow mod_fastcgi and mod_action to work correctly.
+    m_scriptFilename = getRawHeader(s_pathTranslated);
   }
 
-  // do a check for mod_proxy_cgi and remove the start portion of the string
-  const std::string modProxy = "proxy:fcgi://";
-  if (m_pathTranslated.find(modProxy) == 0) {
-    m_pathTranslated = m_pathTranslated.substr(modProxy.length());
+  // do a check for mod_proxy_fcgi and remove the extra portions of the string
+  if (m_scriptFilename.find(s_modProxy) == 0) {
+    // remove the proxy:type + :// from the start.
+    int proxyPos = m_scriptFilename.find(s_modProxySearch);
+    if (proxyPos != String::npos) {
+      m_scriptFilename = m_scriptFilename.substr(proxyPos + s_modProxySearch.size());
+    }
     // remove everything before the first / which is host:port
-    int slashPos = m_pathTranslated.find('/');
+    int slashPos = m_scriptFilename.find(s_slash);
     if (slashPos != String::npos) {
-      m_pathTranslated = m_pathTranslated.substr(slashPos);
+      m_scriptFilename = m_scriptFilename.substr(slashPos);
+    }
+    // remove everything after the first ?
+    int questionPos = m_scriptFilename.find(s_questionMark);
+    if (questionPos != String::npos) {
+      m_scriptFilename = m_scriptFilename.substr(0, questionPos);
     }
   }
 
-  // RequestURI needs path_translated to not include the document root
+  // RequestURI needs script_filename and path_translated to not include
+  // the document root
   if (!m_pathTranslated.empty()) {
     if (m_pathTranslated.find(m_documentRoot) == 0) {
       m_pathTranslated = m_pathTranslated.substr(m_documentRoot.length());
+    }
+  }
+
+  if (!m_scriptFilename.empty()) {
+    if (m_scriptFilename.find(m_documentRoot) == 0) {
+      m_scriptFilename = m_scriptFilename.substr(m_documentRoot.length());
     } else {
       // if the document root isn't in the url set document root to /
       m_documentRoot = "/";
@@ -465,4 +530,3 @@ void FastCGITransport::onHeadersComplete() {
 
 ///////////////////////////////////////////////////////////////////////////////
 }
-

@@ -1,6 +1,4 @@
 <?php
-ini_set('open_basedir', .);
-
 require_once "open_basedir.inc";
 $initdir = getcwd();
 test_open_basedir_before("file_get_contents");
@@ -13,6 +11,7 @@ var_dump(file_get_contents($initdir."/test/ok/../ok/ok.txt"));
 
 test_open_basedir_after("file_get_contents");
 ?>
+<?php error_reporting(0); ?>
 <?php
 require_once "open_basedir.inc";
 delete_directories();

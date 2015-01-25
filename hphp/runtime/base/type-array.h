@@ -66,10 +66,8 @@ public:
   ~Array();
 
   // Take ownership of this ArrayData.
-  static Array attach(ArrayData* ad) {
-    Array a(ad, SmartPtr::NoIncRef{});
-    a.m_px = ad;
-    return a;
+  static ALWAYS_INLINE Array attach(ArrayData* ad) {
+    return Array(ad, ArrayBase::NoIncRef{});
   }
 
   // Transfer ownership of our reference to this ArrayData.
@@ -108,7 +106,7 @@ public:
   {}
 
   // Move ctor
-  Array(Array&& src) : ArrayBase(std::move(src)) { }
+  Array(Array&& src) noexcept : ArrayBase(std::move(src)) { }
 
   // Move assign
   Array& operator=(Array&& src) {
@@ -200,22 +198,36 @@ public:
   /*
    * Sorting.
    */
-  static int SortRegularAscending(const Variant& v1, const Variant& v2, const void* data);
-  static int SortNumericAscending(const Variant& v1, const Variant& v2, const void* data);
-  static int SortStringAscending(const Variant& v1, const Variant& v2, const void* data);
-  static int SortStringAscendingCase(const Variant& v1, const Variant& v2, const void* data);
+  static int SortRegularAscending(const Variant& v1, const Variant& v2,
+                                  const void* data);
+  static int SortNumericAscending(const Variant& v1, const Variant& v2,
+                                  const void* data);
+  static int SortStringAscending(const Variant& v1, const Variant& v2,
+                                 const void* data);
+  static int SortStringAscendingCase(const Variant& v1, const Variant& v2,
+                                     const void* data);
   static int SortLocaleStringAscending(const Variant& v1, const Variant& v2,
                                        const void* data);
 
-  static int SortRegularDescending(const Variant& v1, const Variant& v2, const void* data);
-  static int SortNumericDescending(const Variant& v1, const Variant& v2, const void* data);
-  static int SortStringDescending(const Variant& v1, const Variant& v2, const void* data);
-  static int SortStringDescendingCase(const Variant& v1, const Variant& v2, const void* data);
+  static int SortRegularDescending(const Variant& v1, const Variant& v2,
+                                   const void* data);
+  static int SortNumericDescending(const Variant& v1, const Variant& v2,
+                                   const void* data);
+  static int SortStringDescending(const Variant& v1, const Variant& v2,
+                                  const void* data);
+  static int SortStringDescendingCase(const Variant& v1, const Variant& v2,
+                                      const void* data);
   static int SortLocaleStringDescending(const Variant& v1, const Variant& v2,
                                         const void* data);
 
-  static int SortNatural(const Variant& v1, const Variant& v2, const void* data);
-  static int SortNaturalCase(const Variant& v1, const Variant& v2, const void* data);
+  static int SortNaturalAscending(const Variant& v1, const Variant& v2,
+                                  const void* data);
+  static int SortNaturalDescending(const Variant& v1, const Variant& v2,
+                                   const void* data);
+  static int SortNaturalCaseAscending(const Variant& v1, const Variant& v2,
+                                      const void* data);
+  static int SortNaturalCaseDescending(const Variant& v1, const Variant& v2,
+                                       const void* data);
 
   void sort(PFUNC_CMP cmp_func, bool by_key, bool renumber,
             const void* data = nullptr);
@@ -289,9 +301,16 @@ public:
   const Variant operator[](const char*) const = delete; // use const String&
 
   /*
-   * Get an lval reference to a newly created element.
+   * Get an lval reference to a newly created element, with the intent
+   * of reading or writing to it as a Cell.
    */
   Variant& lvalAt();
+
+  /*
+   * Get an lval reference to a newly created element, with the intent
+   * of using binding assignment with the newly created element.
+   */
+  Variant& lvalAtRef();
 
   /*
    * Get an lval reference to an element.
@@ -425,12 +444,18 @@ public:
 // ArrNR
 
 struct ArrNR {
-  explicit ArrNR(ArrayData* data = 0) {
+  explicit ArrNR(ArrayData* data = nullptr) {
     m_px = data;
   }
 
   ArrNR(const ArrNR& a) {
     m_px = a.m_px;
+  }
+
+  ~ArrNR() {
+    if (debug) {
+      m_px = reinterpret_cast<ArrayData*>(0xdeadbeeffaceb004);
+    }
   }
 
   operator const Array&() const { return asArray(); }
@@ -463,13 +488,21 @@ private:
  */
 struct ArrayNoDtor {
   ArrayNoDtor() { new (&m_arr) Array(); }
-  ArrayNoDtor(ArrayNoDtor&& o) { new (&m_arr) Array(std::move(o.m_arr)); }
+  ArrayNoDtor(ArrayNoDtor&& o) noexcept {
+    new (&m_arr) Array(std::move(o.m_arr));
+  }
   ~ArrayNoDtor() {}
   Array& arr() { return m_arr; }
   void destroy() { m_arr.~Array(); }
 private:
   union { Array m_arr; };
 };
+
+///////////////////////////////////////////////////////////////////////////////
+
+ALWAYS_INLINE Array empty_array() {
+  return Array::attach(staticEmptyArray());
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 }

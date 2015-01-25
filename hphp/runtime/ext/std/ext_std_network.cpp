@@ -16,22 +16,24 @@
 */
 #include "hphp/runtime/ext/std/ext_std_network.h"
 
-#include <netinet/in.h>
-#include <netdb.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <resolv.h>
+#include <sys/socket.h>
 
-#include "folly/ScopeGuard.h"
+#include <folly/IPAddress.h>
+#include <folly/ScopeGuard.h>
 
-#include "hphp/runtime/ext/ext_apc.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/ext/ext_socket.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/file.h"
 #include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/ext/sockets/ext_sockets.h"
+#include "hphp/runtime/ext/std/ext_std_function.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/server/server-stats.h"
 #include "hphp/util/lock.h"
-#include "hphp/runtime/base/file.h"
 #include "hphp/util/network.h"
 
 #if defined(__APPLE__)
@@ -157,37 +159,23 @@ Variant HHVM_FUNCTION(gethostbyaddr, const String& ip_address) {
   return ip_address;
 }
 
+const StaticString s_empty("");
+
 String HHVM_FUNCTION(gethostbyname, const String& hostname) {
   IOStatusHelper io("gethostbyname", hostname.data());
-  if (RuntimeOption::EnableDnsCache) {
-    Variant success;
-    Variant resolved = f_apc_fetch(hostname, ref(success),
-                                   SHARED_STORE_DNS_CACHE);
-    if (same(success, true)) {
-      if (same(resolved, false)) {
-        return hostname;
-      }
-      return resolved.toString();
-    }
-  }
 
   HostEnt result;
   if (!safe_gethostbyname(hostname.data(), result)) {
-    if (RuntimeOption::EnableDnsCache) {
-      f_apc_store(hostname, false, RuntimeOption::DnsCacheTTL,
-                  SHARED_STORE_DNS_CACHE);
-    }
     return hostname;
   }
 
   struct in_addr in;
   memcpy(&in.s_addr, *(result.hostbuf.h_addr_list), sizeof(in.s_addr));
-  String ret(safe_inet_ntoa(in));
-  if (RuntimeOption::EnableDnsCache) {
-    f_apc_store(hostname, ret, RuntimeOption::DnsCacheTTL,
-                SHARED_STORE_DNS_CACHE);
+  try {
+    return String(folly::IPAddressV4(in).str());
+  } catch (folly::IPAddressFormatException &e) {
+    return hostname;
   }
-  return ret;
 }
 
 Variant HHVM_FUNCTION(gethostbynamel, const String& hostname) {
@@ -200,7 +188,11 @@ Variant HHVM_FUNCTION(gethostbynamel, const String& hostname) {
   Array ret;
   for (int i = 0 ; result.hostbuf.h_addr_list[i] != 0 ; i++) {
     struct in_addr in = *(struct in_addr *)result.hostbuf.h_addr_list[i];
-    ret.append(String(safe_inet_ntoa(in)));
+    try {
+      ret.append(String(folly::IPAddressV4(in).str()));
+    } catch (folly::IPAddressFormatException &e) {
+        // ok to skip
+    }
   }
   return ret;
 }
@@ -257,7 +249,7 @@ Variant HHVM_FUNCTION(inet_ntop, const String& in_addr) {
 
   char buffer[40];
   if (!inet_ntop(af, in_addr.data(), buffer, sizeof(buffer))) {
-    raise_warning("An unknown error occured");
+    raise_warning("An unknown error occurred");
     return false;
   }
   return String(buffer, CopyString);
@@ -284,8 +276,6 @@ Variant HHVM_FUNCTION(inet_pton, const String& address) {
   return String(buffer, af == AF_INET ? 4 : 16, CopyString);
 }
 
-const StaticString s_255_255_255_255("255.255.255.255");
-
 Variant HHVM_FUNCTION(ip2long, const String& ip_address) {
   struct in_addr ip;
   if (ip_address.empty() ||
@@ -297,9 +287,11 @@ Variant HHVM_FUNCTION(ip2long, const String& ip_address) {
 }
 
 String HHVM_FUNCTION(long2ip, int64_t proper_address) {
-  struct in_addr myaddr;
-  myaddr.s_addr = htonl(proper_address);
-  return safe_inet_ntoa(myaddr);
+  try {
+    return folly::IPAddress::fromLongHBO(proper_address).str();
+  } catch (folly::IPAddressFormatException &e) {
+    return s_empty;
+  }
 }
 
 /* just a hack to free resources allocated by glibc in __res_nsend()
@@ -411,7 +403,14 @@ const StaticString
   s_NAPTR("NAPTR"),
   s_IN("IN");
 
-static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
+#define CHECKCP(n) do { \
+  if ((cp + (n)) > end) { \
+    return nullptr; \
+  } \
+} while (0)
+
+static unsigned char *php_parserr(unsigned char *cp, unsigned char* end,
+                                  querybuf *answer,
                                   int type_to_fetch, bool store,
                                   Array &subarray) {
   unsigned short type, cls ATTRIBUTE_UNUSED, dlen;
@@ -428,10 +427,12 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
   }
   cp += n;
 
+  CHECKCP(10);
   GETSHORT(type, cp);
   GETSHORT(cls, cp);
   GETLONG(ttl, cp);
   GETSHORT(dlen, cp);
+  CHECKCP(dlen);
   if (type_to_fetch != T_ANY && type != type_to_fetch) {
     cp += dlen;
     return cp;
@@ -445,12 +446,14 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
   subarray.set(s_host, String(name, CopyString));
   switch (type) {
   case DNS_T_A:
+    CHECKCP(4);
     subarray.set(s_type, s_A);
     snprintf(name, sizeof(name), "%d.%d.%d.%d", cp[0], cp[1], cp[2], cp[3]);
     subarray.set(s_ip, String(name, CopyString));
     cp += dlen;
     break;
   case DNS_T_MX:
+    CHECKCP(2);
     subarray.set(s_type, s_MX);
     GETSHORT(n, cp);
     subarray.set(s_pri, n);
@@ -479,47 +482,57 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
   case DNS_T_HINFO:
     /* See RFC 1010 for values */
     subarray.set(s_type, s_HINFO);
+    CHECKCP(1);
     n = *cp & 0xFF;
     cp++;
+    CHECKCP(n);
     subarray.set(s_cpu, String((const char *)cp, n, CopyString));
     cp += n;
+    CHECKCP(1);
     n = *cp & 0xFF;
     cp++;
+    CHECKCP(n);
     subarray.set(s_os, String((const char *)cp, n, CopyString));
     cp += n;
     break;
   case DNS_T_TXT: {
-    int ll = 0;
+    int l1 = 0, l2 = 0;
 
-    subarray.set(s_type, s_TXT);
     String s = String(dlen, ReserveString);
     tp = (unsigned char *)s.bufferSlice().ptr;
 
-    while (ll < dlen) {
-      n = cp[ll];
-      memcpy(tp + ll , cp + ll + 1, n);
-      ll = ll + n + 1;
+    while (l1 < dlen) {
+      n = cp[l1];
+      if ((n + l1) > dlen) {
+        // bad record, don't set anything
+        break;
+      }
+      memcpy(tp + l1 , cp + l1 + 1, n);
+      l1 = l1 + n + 1;
+      l2 = l2 + n;
     }
-    s.setSize(dlen > 0 ? dlen - 1 : 0);
+    s.setSize(l2);
     cp += dlen;
 
+    subarray.set(s_type, s_TXT);
     subarray.set(s_txt, s);
     break;
   }
   case DNS_T_SOA:
     subarray.set(s_type, s_SOA);
-    n = dn_expand(answer->qb2, answer->qb2+65536, cp, name, (sizeof name) -2);
+    n = dn_expand(answer->qb2, end, cp, name, (sizeof name) -2);
     if (n < 0) {
       return NULL;
     }
     cp += n;
     subarray.set(s_mname, String(name, CopyString));
-    n = dn_expand(answer->qb2, answer->qb2+65536, cp, name, (sizeof name) -2);
+    n = dn_expand(answer->qb2, end, cp, name, (sizeof name) -2);
     if (n < 0) {
       return NULL;
     }
     cp += n;
     subarray.set(s_rname, String(name, CopyString));
+    CHECKCP(5*4);
     GETLONG(n, cp);
     subarray.set(s_serial, n);
     GETLONG(n, cp);
@@ -533,6 +546,7 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
     break;
   case DNS_T_AAAA:
     tp = (unsigned char *)name;
+    CHECKCP(8*2);
     for (i = 0; i < 8; i++) {
       GETSHORT(s, cp);
       if (s != 0) {
@@ -567,6 +581,7 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
   case DNS_T_A6:
     p = cp;
     subarray.set(s_type, s_A6);
+    CHECKCP(1);
     n = ((int)cp[0]) & 0xFF;
     cp++;
     subarray.set(s_masklen, n);
@@ -602,6 +617,7 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
       cp++;
     }
     for (i = (n + 8)/16; i < 8; i++) {
+      CHECKCP(2);
       GETSHORT(s, cp);
       if (s != 0) {
         if (tp > (u_char *)name) {
@@ -631,7 +647,7 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
     tp[0] = '\0';
     subarray.set(s_ipv6, String(name, CopyString));
     if (cp < p + dlen) {
-      n = dn_expand(answer->qb2, answer->qb2+65536, cp, name,
+      n = dn_expand(answer->qb2, end, cp, name,
                     (sizeof name) - 2);
       if (n < 0) {
         return NULL;
@@ -641,6 +657,7 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
     }
     break;
   case DNS_T_SRV:
+    CHECKCP(3*2);
     subarray.set(s_type, s_SRV);
     GETSHORT(n, cp);
     subarray.set(s_pri, n);
@@ -648,7 +665,7 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
     subarray.set(s_weight, n);
     GETSHORT(n, cp);
     subarray.set(s_port, n);
-    n = dn_expand(answer->qb2, answer->qb2+65536, cp, name, (sizeof name) - 2);
+    n = dn_expand(answer->qb2, end, cp, name, (sizeof name) - 2);
     if (n < 0) {
       return NULL;
     }
@@ -656,21 +673,35 @@ static unsigned char *php_parserr(unsigned char *cp, querybuf *answer,
     subarray.set(s_target, String(name, CopyString));
     break;
   case DNS_T_NAPTR:
+    CHECKCP(2*2);
     subarray.set(s_type, s_NAPTR);
     GETSHORT(n, cp);
     subarray.set(s_order, n);
     GETSHORT(n, cp);
     subarray.set(s_pref, n);
+
+    CHECKCP(1);
     n = (cp[0] & 0xFF);
-    subarray.set(s_flags, String((const char *)(++cp), n, CopyString));
+    ++cp;
+    CHECKCP(n);
+    subarray.set(s_flags, String((const char *)cp, n, CopyString));
     cp += n;
+
+    CHECKCP(1);
     n = (cp[0] & 0xFF);
-    subarray.set(s_services, String((const char *)(++cp), n, CopyString));
+    ++cp;
+    CHECKCP(n);
+    subarray.set(s_services, String((const char *)cp, n, CopyString));
     cp += n;
+
+    CHECKCP(1);
     n = (cp[0] & 0xFF);
-    subarray.set(s_regex, String((const char *)(++cp), n, CopyString));
+    ++cp;
+    CHECKCP(n);
+    subarray.set(s_regex, String((const char *)cp, n, CopyString));
     cp += n;
-    n = dn_expand(answer->qb2, answer->qb2+65536, cp, name, (sizeof name) - 2);
+
+    n = dn_expand(answer->qb2, end, cp, name, (sizeof name) - 2);
     if (n < 0) {
       return NULL;
     }
@@ -777,7 +808,7 @@ Variant HHVM_FUNCTION(dns_get_record, const String& hostname, int type /*= -1*/,
     /* YAY! Our real answers! */
     while (an-- && cp && cp < end) {
       Array retval;
-      cp = php_parserr(cp, &answer, type_to_fetch, store_results, retval);
+      cp = php_parserr(cp, end, &answer, type_to_fetch, store_results, retval);
       if (!retval.empty() && store_results) {
         ret.append(retval);
       }
@@ -792,7 +823,7 @@ Variant HHVM_FUNCTION(dns_get_record, const String& hostname, int type /*= -1*/,
   /* List of Authoritative Name Servers */
   while (ns-- > 0 && cp && cp < end) {
     Array retval;
-    cp = php_parserr(cp, &answer, DNS_T_ANY, true, retval);
+    cp = php_parserr(cp, end, &answer, DNS_T_ANY, true, retval);
     if (!retval.empty()) {
       authns.append(retval);
     }
@@ -801,7 +832,7 @@ Variant HHVM_FUNCTION(dns_get_record, const String& hostname, int type /*= -1*/,
   /* Additional records associated with authoritative name servers */
   while (ar-- > 0 && cp && cp < end) {
     Array retval;
-    cp = php_parserr(cp, &answer, DNS_T_ANY, true, retval);
+    cp = php_parserr(cp, end, &answer, DNS_T_ANY, true, retval);
     if (!retval.empty()) {
       addtl.append(retval);
     }
@@ -895,14 +926,14 @@ void HHVM_FUNCTION(header, const String& str, bool replace /* = true */,
     raise_warning("Cannot modify header information - headers already sent");
   }
 
-  String header = f_rtrim(str);
+  String header = HHVM_FN(rtrim)(str);
 
   // new line safety check
   // NOTE: PHP actually allows "\n " and "\n\t" to fall through. Is that bad
   // for security?
   if (header.find('\n') >= 0 || header.find('\r') >= 0) {
-    raise_warning("Header may not contain more than a single header, "
-                  "new line detected");
+    raise_error("Header may not contain more than a single header, "
+                "new line detected");
     return;
   }
 
@@ -911,10 +942,11 @@ void HHVM_FUNCTION(header, const String& str, bool replace /* = true */,
     const char *header_line = header.data();
 
     // handle single line of status code
-    if (header.size() >= 5 && strncasecmp(header_line, "HTTP/", 5) == 0) {
+    if ((header.size() >= 5 && strncasecmp(header_line, "HTTP/", 5) == 0) ||
+        (header.size() >= 7 && strncasecmp(header_line, "Status:", 7) == 0)) {
       int code = 200;
       const char *reason = nullptr;
-      for (const char *ptr = header_line; *ptr; ptr++) {
+      for (const char *ptr = header_line + 5; *ptr; ptr++) {
         if (*ptr == ' ' && *(ptr + 1) != ' ') {
           code = atoi(ptr + 1);
           for (ptr++; *ptr; ptr++) {
@@ -952,8 +984,7 @@ void HHVM_FUNCTION(header, const String& str, bool replace /* = true */,
       transport->addHeader(newHeader.empty() ? header : newHeader);
     }
     if (http_response_code) {
-      transport->setResponse(http_response_code,
-                             "explicit_header_response_code");
+      transport->setResponse(http_response_code);
     }
   }
 }
@@ -965,7 +996,7 @@ Variant HHVM_FUNCTION(http_response_code, int response_code /* = 0 */) {
   if (transport) {
     *s_response_code = transport->getResponseCode();
     if (response_code) {
-      transport->setResponse(response_code, "explicit_header_response_code");
+      transport->setResponse(response_code);
     }
   }
 
@@ -1005,12 +1036,20 @@ bool HHVM_FUNCTION(headers_sent, VRefParam file /* = null */,
     file = String(transport->getFirstHeaderFile());
     line = transport->getFirstHeaderLine();
     return transport->headersSent();
+  } else {
+    return g_context->getStdoutBytesWritten() > 0;
   }
   return false;
 }
 
-bool HHVM_FUNCTION(header_register_callback, const Variant& callback) {
+Variant HHVM_FUNCTION(header_register_callback, const Variant& callback) {
   Transport *transport = g_context->getTransport();
+
+  if (!HHVM_FN(is_callable)(callback)) {
+    raise_warning("First argument is expected to be a valid callback");
+    return init_null();
+  }
+
   if (!transport) {
     // fail if there is no transport
     return false;
@@ -1036,7 +1075,7 @@ void HHVM_FUNCTION(header_remove, const Variant& name /* = null_string */) {
   }
 }
 
-int HHVM_FUNCTION(get_http_request_size) {
+int64_t HHVM_FUNCTION(get_http_request_size) {
   Transport *transport = g_context->getTransport();
   if (transport) {
     return transport->getRequestSize();

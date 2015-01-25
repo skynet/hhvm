@@ -22,6 +22,7 @@
 #include "hphp/zend/zend-string.h"
 #include "hphp/zend/zend-html.h"
 #include "hphp/util/string-vsnprintf.h"
+#include "hphp/parser/parse-time-fatal-exception.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -85,16 +86,16 @@ void ScannerToken::xhpDecode() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-Scanner::Scanner(const char *filename, int type, bool md5 /* = false */)
+Scanner::Scanner(const std::string& filename, int type, bool md5 /* = false */)
     : m_filename(filename), m_stream(nullptr), m_source(nullptr), m_len(0), m_pos(0),
       m_state(Start), m_type(type), m_yyscanner(nullptr), m_token(nullptr),
       m_loc(nullptr), m_lastToken(-1), m_isHHFile(0), m_lookaheadLtDepth(0),
       m_listener(nullptr) {
-  m_stream = new std::ifstream(filename);
+  m_stream = new std::ifstream(m_filename);
   m_streamOwner = true;
   if (m_stream->fail()) {
     delete m_stream; m_stream = nullptr;
-    throw FileOpenException(filename);
+    throw FileOpenException(m_filename);
   }
   if (md5) computeMd5();
   init();
@@ -131,9 +132,13 @@ Scanner::Scanner(const char *source, int len, int type,
 }
 
 void Scanner::computeMd5() {
-  int startpos = m_stream->tellg();
+  auto startpos = m_stream->tellg();
+  always_assert(startpos != -1 &&
+                startpos <= std::numeric_limits<int32_t>::max());
   m_stream->seekg(0, std::ios::end);
-  int length = m_stream->tellg();
+  auto length = m_stream->tellg();
+  always_assert(length != -1 &&
+                length <= std::numeric_limits<int32_t>::max());
   m_stream->seekg(0, std::ios::beg);
   char *ptr = (char*)malloc(length);
   m_stream->read(ptr, length);
@@ -146,15 +151,6 @@ Scanner::~Scanner() {
   reset();
   if (m_streamOwner) {
     delete m_stream;
-  }
-}
-
-void Scanner::setHashBang(const char *rawText, int rawLeng, int type) {
-  if (m_type & ReturnAllTokens) {
-    setToken(rawText, rawLeng);
-  } else {
-    m_token->setText("", 0);
-    incLoc(rawText, rawLeng, type);
   }
 }
 
@@ -236,6 +232,9 @@ bool Scanner::nextIfToken(TokenStore::iterator& pos, int tok) {
 
 bool Scanner::tryParseTypeList(TokenStore::iterator& pos) {
   for (;;) {
+    if (pos->t == '+' || pos->t == '-') {
+      nextLookahead(pos);
+    }
     if (!tryParseNSType(pos)) return false;
     if (pos->t == T_AS) {
       nextLookahead(pos);
@@ -248,6 +247,7 @@ bool Scanner::tryParseTypeList(TokenStore::iterator& pos) {
 
 bool Scanner::tryParseNonEmptyLambdaParams(TokenStore::iterator& pos) {
   for (;; nextLookahead(pos)) {
+    if (pos->t == ')' || pos->t == T_LAMBDA_CP) return true;
     if (pos->t != T_VARIABLE) {
       if (pos->t == T_ELLIPSIS) {
         nextLookahead(pos);
@@ -336,17 +336,18 @@ void Scanner::parseApproxParamDefVal(TokenStore::iterator& pos) {
       case T_NS_C:
       case T_COMPILER_HALT_OFFSET:
       case T_STRING:
+      case T_ENUM:
       case T_XHP_LABEL:
       case T_XHP_ATTRIBUTE:
       case T_XHP_CATEGORY:
       case T_XHP_CHILDREN:
       case T_XHP_REQUIRED:
-      case T_XHP_ENUM:
       case T_NS_SEPARATOR:
       case T_NAMESPACE:
       case T_SHAPE:
       case T_ARRAY:
-      case T_TUPLE:
+      case T_MIARRAY:
+      case T_MSARRAY:
       case T_FUNCTION:
       case T_DOUBLE_ARROW:
       case T_DOUBLE_COLON:
@@ -423,8 +424,11 @@ Scanner::tryParseNSType(TokenStore::iterator& pos) {
       case T_XHP_CATEGORY:
       case T_XHP_CHILDREN:
       case T_XHP_REQUIRED:
-      case T_XHP_ENUM:
+      case T_ENUM:
       case T_ARRAY:
+      case T_CALLABLE:
+      case T_UNRESOLVED_TYPE:
+      case T_UNRESOLVED_NEWTYPE:
         nextLookahead(pos);
         break;
       case T_SHAPE:
@@ -595,7 +599,7 @@ int Scanner::getNextToken(ScannerToken &t, Location &l) {
   return tokid;
 }
 
-int Scanner::read(char *text, int &result, int max) {
+int Scanner::read(char *text, yy_size_t &result, yy_size_t max) {
   if (m_stream) {
     if (!m_stream->eof()) {
       m_stream->read(text, max);
@@ -616,6 +620,14 @@ int Scanner::read(char *text, int &result, int max) {
   }
   return (result = 0);
 }
+
+int Scanner::read(char *text, int &result, yy_size_t max) {
+  yy_size_t tmp;
+  auto const ret = read(text, tmp, max);
+  result = tmp;
+  return ret;
+}
+
 
 void Scanner::error(const char* fmt, ...) {
   va_list ap;
@@ -710,13 +722,15 @@ std::string Scanner::escape(const char *str, int len, char quote_type) const {
             case 'r':  output += '\r'; break;
             case 'v':  output += '\v'; break;
             case 'f':  output += '\f'; break;
+            case 'e':  output += '\033'; break;
             case '\\': output += '\\'; break;
             case '$':  output += '$';  break;
             case '"':
+            case '`':
               if (str[i] != quote_type) {
                 output += '\\';
               }
-              output += '"';
+              output += str[i];
               break;
             case 'x':
             case 'X': {
@@ -731,6 +745,70 @@ std::string Scanner::escape(const char *str, int len, char quote_type) const {
                 output += ch;
                 output += str[i];
               }
+              break;
+            }
+            case 'u': {
+              // Unicode escape sequence
+              //   "\u{123456}"
+              if (str[i+1] != '{') {
+                // BC for "\u1234" passthrough
+                output += ch;
+                output += str[i];
+                break;
+              }
+
+              bool valid = true;
+              auto start = str + i + 2;
+              auto closebrace = strchr(start, '}');
+              if (closebrace > start) {
+                for (auto p = start; p < closebrace; ++p) {
+                  if (!isxdigit(*p)) {
+                    valid = false;
+                    break;
+                  }
+                }
+              } else {
+                valid = false;
+              }
+
+              auto fatal = [this](const char *msg) {
+                auto loc = getLocation();
+                return ParseTimeFatalException(
+                  loc->file,
+                  loc->line0,
+                  "%s", msg);
+              };
+              if (!valid) {
+                throw fatal("Invalid UTF-8 codepoint escape sequence");
+              }
+
+              std::string codepoint(start, closebrace - start);
+              char *end = nullptr;
+              int32_t uchar = strtol(codepoint.c_str(), &end, 16);
+              if ((end && *end) || (uchar > 0x10FFFF)) {
+                throw fatal(
+                  "Invalid UTF-8 codepoint escape sequence: "
+                  "Codepoint too large");
+              }
+              if (uchar <= 0x0007F) {
+                output += (char)uchar;
+              } else if (uchar <= 0x007FF) {
+                output += (char)(0xC0 | ( uchar >> 6         ));
+                output += (char)(0x80 | ( uchar        & 0x3F));
+              } else if (uchar <= 0x00FFFF) {
+                output += (char)(0xE0 | ( uchar >> 12        ));
+                output += (char)(0x80 | ((uchar >>  6) & 0x3F));
+                output += (char)(0x80 | ( uchar        & 0x3F));
+              } else if (uchar <= 0x10FFFF) {
+                output += (char)(0xF0 | ( uchar >> 18        ));
+                output += (char)(0x80 | ((uchar >> 12) & 0x3F));
+                output += (char)(0x80 | ((uchar >>  6) & 0x3F));
+                output += (char)(0x80 | ( uchar        & 0x3F));
+              } else {
+                not_reached();
+                assert(false);
+              }
+              i += codepoint.size() + 2 /* strlen("{}") */;
               break;
             }
             default: {

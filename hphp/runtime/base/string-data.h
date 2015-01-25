@@ -22,9 +22,10 @@
 #include "hphp/util/alloc.h"
 #include "hphp/util/word-mem.h"
 
+#include "hphp/runtime/base/datatype.h"
 #include "hphp/runtime/base/types.h"
+#include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/countable.h"
-#include "hphp/runtime/base/macros.h"
 #include "hphp/runtime/base/bstring.h"
 #include "hphp/runtime/base/exceptions.h"
 
@@ -32,7 +33,6 @@ namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
-class APCHandle;
 class APCString;
 class Array;
 class String;
@@ -78,7 +78,6 @@ struct StringData {
    *   ... = size + 1; // oops, wraparound.
    */
   static constexpr uint32_t MaxSize = 0x7ffffffe; // 2^31-2
-  static constexpr uint32_t MaxCap = MaxSize + 1;
 
   /*
    * Creates an empty request-local string with an unspecified amount
@@ -94,7 +93,7 @@ struct StringData {
    */
   static StringData* Make(const char* data);
   static StringData* Make(const char* data, CopyStringMode);
-  static StringData* Make(const char* data, int len, CopyStringMode);
+  static StringData* Make(const char* data, size_t len, CopyStringMode);
   static StringData* Make(const StringData* s, CopyStringMode);
   static StringData* Make(StringSlice r1, CopyStringMode);
 
@@ -105,7 +104,7 @@ struct StringData {
    * except that it will also free `data'.
    */
   static StringData* Make(char* data, AttachStringMode);
-  static StringData* Make(char* data, int len, AttachStringMode);
+  static StringData* Make(char* data, size_t len, AttachStringMode);
 
   /*
    * Create a new request-local string by concatenating two existing
@@ -114,37 +113,24 @@ struct StringData {
   static StringData* Make(const StringData* s1, const StringData* s2);
   static StringData* Make(const StringData* s1, StringSlice s2);
   static StringData* Make(const StringData* s1, const char* lit2);
-  static StringData* Make(StringSlice s1, StringSlice s2);
   static StringData* Make(StringSlice s1, const char* lit2);
+  static StringData* Make(StringSlice s1, StringSlice s2);
+  static StringData* Make(StringSlice s1, StringSlice s2,
+                          StringSlice s3);
+  static StringData* Make(StringSlice s1, StringSlice s2,
+                          StringSlice s3, StringSlice s4);
 
   /*
    * Create a new request-local empty string big enough to hold
    * strings of length `reserve' (not counting the \0 terminator).
    */
-  static StringData* Make(int reserve);
+  static StringData* Make(size_t reserve);
 
   /*
    * Create a request-local StringData that wraps an APCString
    * that contains a string.
    */
-  static StringData* Make(APCString* shared);
-
-  /*
-   * Create a StringData that is allocated by malloc, instead of the
-   * smart allocator.
-   *
-   * This is essentially only used for APC, for non-request local
-   * StringDatas.
-   *
-   * StringDatas allocated with this function must be freed by calling
-   * destruct(), instead of release().
-   *
-   * Important: no string functions which change the StringData may be
-   * called on the returned pointer (e.g. append).  These functions
-   * below are marked by saying they require the string to be request
-   * local.
-   */
-  static StringData* MakeMalloced(const char* data, int len);
+  static StringData* Make(const APCString* shared);
 
   /*
    * Allocate a string with malloc, using the low-memory allocator if
@@ -157,11 +143,17 @@ struct StringData {
   static StringData* MakeStatic(StringSlice);
 
   /*
-   * Same as MakeStatic but the string alloated will *not* be in the static
-   * string table and will be deleted once the root goes out of scope.
-   * Currently only used by APC.
+   * Same as MakeStatic but the string allocated will *not* be in the static
+   * string table, will not be in low-memory, and should be deleted using
+   * destructUncounted once the root goes out of scope.
    */
   static StringData* MakeUncounted(StringSlice);
+
+  /*
+   * Same as MakeStatic but initializes the empty string in aligned storage.
+   * This should be called by the static string table initialization code.
+   */
+  static StringData* MakeEmpty();
 
   /*
    * Offset accessor for the JIT compiler.
@@ -173,7 +165,7 @@ struct StringData {
    * decrefing the APCString they are fronting.  This function
    * must be called at request cleanup time to handle this.
    */
-  static void sweepAll();
+  static unsigned sweepAll();
 
   /*
    * Called to return a StringData to the smart allocator.  This is
@@ -181,18 +173,19 @@ struct StringData {
    * a helper like decRefStr).
    */
   void release();
-
-  /*
-   * StringData objects allocated with MakeMalloced should be freed
-   * using this function instead of release().
-   */
-  void destruct();
+  size_t heapSize() const;
 
   /*
    * StringData objects allocated with MakeStatic should be freed
    * using this function.
    */
   void destructStatic();
+
+  /*
+   * StringData objects allocated with MakeUncounted should be freed
+   * using this function.
+   */
+  void destructUncounted();
 
   /*
    * Reference-counting related.
@@ -203,12 +196,6 @@ struct StringData {
   bool isUncounted() const;
 
   /*
-   * Get the wrapped APCHandle, or return null if this string is
-   * not shared.
-   */
-  APCHandle* getAPCHandle() const;
-
-  /*
    * Append the supplied range to this string.  If there is not
    * sufficient capacity in this string to contain the range, a new
    * string may be returned.
@@ -217,18 +204,33 @@ struct StringData {
    * Pre: the string is request-local
    */
   StringData* append(StringSlice r);
+  StringData* append(StringSlice r1, StringSlice r2);
+  StringData* append(StringSlice r1, StringSlice r2, StringSlice r3);
 
   /*
    * Reserve space for a string of length `maxLen' (not counting null
    * terminator).
    *
-   * May not be called for strings created with MakeMalloced or
+   * May not be called for strings created with MakeUncounted or
    * MakeStatic.
    *
    * Returns: possibly a new StringData, if we had to reallocate.  The
    * returned pointer is not yet incref'd.
    */
-  StringData* reserve(int maxLen);
+  StringData* reserve(size_t maxLen);
+
+  /*
+   * Shrink a string down to length `len` (not counting null terminator).
+   *
+   * May not be called for strings created with MakeUncounted or
+   * MakeStatic.
+   *
+   * Returns: possibly a new StringData, if we decided to reallocate. The
+   * returned pointer is not yet incref'd.  shrinkImpl always returns a new
+   * StringData.
+   */
+  StringData* shrink(size_t len);
+  StringData* shrinkImpl(size_t len);
 
   /*
    * Returns a slice with extents sized to the *string* that this
@@ -286,7 +288,7 @@ struct StringData {
    * Accessor for the length of a string.
    *
    * Note: size() returns a signed int for historical reasons.  It is
-   * guaranteed to be greater than zero and less than MaxSize.
+   * guaranteed to be in the range (0 <= size() <= MaxSize)
    */
   int size() const;
 
@@ -296,10 +298,8 @@ struct StringData {
   bool empty() const;
 
   /*
-   * Return the capacity of this string's buffer, including the space
+   * Return the capacity of this string's buffer, not including the space
    * for the null terminator.
-   *
-   * For shared strings, returns zero.
    */
   uint32_t capacity() const;
 
@@ -310,12 +310,17 @@ struct StringData {
    * The allow_errors flag is a boolean that does something currently
    * undocumented.
    *
+   * If overflow is set its value is initialized to either zero to
+   * indicate that no overflow occurred or 1/-1 to inidicate the direction
+   * of overflow.
+   *
    * Returns: KindOfNull, KindOfInt64 or KindOfDouble.  The int64_t or
    * double out reference params are populated in the latter two cases
    * with the numeric value of the string.  The KindOfNull case
    * indicates the string is not numeric.
    */
-  DataType isNumericWithVal(int64_t&, double&, int allowErrors) const;
+  DataType isNumericWithVal(int64_t&, double&, int allowErrors,
+                            int* overflow = nullptr) const;
 
   /*
    * Returns true if this string is numeric.
@@ -388,6 +393,7 @@ struct StringData {
    * Returns: case insensitive hash value for this string.
    */
   strhash_t hash() const;
+  NEVER_INLINE strhash_t hashHelper() const;
 
   /*
    * Equality comparison, in the sense of php's string == operator.
@@ -425,13 +431,13 @@ struct StringData {
 
 private:
   struct SharedPayload {
-    SweepNode node;
-    APCString* shared;
+    StringDataNode node;
+    const APCString* shared;
   };
 
 private:
   static StringData* MakeShared(StringSlice sl, bool trueStatic);
-  static StringData* MakeSVSlowPath(APCString*, uint32_t len);
+  static StringData* MakeAPCSlowPath(const APCString*);
 
   StringData(const StringData&) = delete;
   StringData& operator=(const StringData&) = delete;
@@ -449,11 +455,10 @@ private:
 
   void releaseDataSlowPath();
   int numericCompare(const StringData *v2) const;
-  StringData* escalate(uint32_t cap);
+  StringData* escalate(size_t cap);
   void enlist();
   void delist();
   void incrementHelper();
-  strhash_t hashHelper() const NEVER_INLINE;
   bool checkSane() const;
   void preCompute() const;
   void setStatic() const;
@@ -467,17 +472,20 @@ private:
   // fields.  (gcc does not combine the stores itself.)
   union {
     struct {
-      uint32_t m_len;
+      union {
+        struct { char m_pad[3]; HeaderKind m_kind; };
+        uint32_t m_capCode;
+      };
       mutable RefCount m_count;
     };
-    uint64_t m_lenAndCount;
+    uint64_t m_capAndCount;
   };
   union {
     struct {
-      int32_t m_cap;
+      uint32_t m_len;
       mutable strhash_t m_hash;   // precompute hash codes for static strings
     };
-    uint64_t m_capAndHash;
+    uint64_t m_lenAndHash;
   };
 
   friend class APCString;
@@ -494,10 +502,6 @@ const uint32_t SmallStringReserve = 64 - sizeof(StringData) - 1;
 /*
  * DecRef a string s, calling release if its reference count goes to
  * zero.
- *
- * Pre: either s must have been allocated as a request-local string,
- * or it must be a static string.  (I.e. it can not be created with
- * MakeMalloced.)
  */
 void decRefStr(StringData* s);
 
@@ -510,6 +514,23 @@ void decRefStr(StringData* s);
 struct string_data_hash;
 struct string_data_same;
 struct string_data_isame;
+
+//////////////////////////////////////////////////////////////////////
+
+extern std::aligned_storage<
+  sizeof(StringData) + 1,
+  alignof(StringData)
+>::type s_theEmptyString;
+
+/*
+ * Return the "static empty string". This is a singleton StaticString
+ * that can be used to return a StaticString for the empty string in
+ * as lightweight a manner as possible.
+ */
+ALWAYS_INLINE StringData* staticEmptyString() {
+  void* vp = &s_theEmptyString;
+  return static_cast<StringData*>(vp);
+}
 
 //////////////////////////////////////////////////////////////////////
 

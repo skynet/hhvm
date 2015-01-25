@@ -24,6 +24,7 @@
 #include "hphp/runtime/debugger/break_point.h"
 #include "hphp/parser/scanner.h"
 #include "hphp/util/text-util.h"
+#include "hphp/runtime/base/config.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -205,10 +206,10 @@ std::string Macro::desc(const char *indent) {
   return ret;
 }
 
-void Macro::load(Hdf node) {
+void Macro::load(const IniSetting::Map& ini, Hdf node) {
   TRACE(2, "Macro::load\n");
-  m_name = node["name"].getString();
-  node["cmds"].get(m_cmds);
+  Config::Bind(m_name, ini, node["name"]);
+  Config::Get(ini, node["cmds"], m_cmds);
 }
 
 void Macro::save(std::ostream &stream, int key) {
@@ -326,6 +327,7 @@ static void get_color(int tokid, int prev, int next,
     COLOR_ENTRY(T_AND_EQUAL,                None        );
     COLOR_ENTRY(T_MOD_EQUAL,                None        );
     COLOR_ENTRY(T_CONCAT_EQUAL,             None        );
+    COLOR_ENTRY(T_POW_EQUAL,                None        );
     COLOR_ENTRY(T_DIV_EQUAL,                None        );
     COLOR_ENTRY(T_MUL_EQUAL,                None        );
     COLOR_ENTRY(T_MINUS_EQUAL,              None        );

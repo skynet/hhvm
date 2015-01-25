@@ -16,10 +16,11 @@
 
 #include "hphp/test/ext/test_util.h"
 #include "hphp/util/logger.h"
-#include "hphp/util/file-util.h"
+#include "hphp/runtime/base/file-util.h"
 #include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/shared-string.h"
 #include "hphp/runtime/base/zend-string.h"
+#include "hphp/runtime/base/config.h"
 
 #define VERIFY_DUMP(map, exp)                                           \
   if (!(exp)) {                                                         \
@@ -48,7 +49,7 @@ bool TestUtil::RunTests(const std::string &which) {
 
 struct testhash {
   size_t operator()(const String& s) const {
-    return hash_string(s.data(), s.size());
+    return hash_string_unsafe(s.data(), s.size());
   }
 };
 
@@ -100,21 +101,26 @@ bool TestUtil::TestSharedString() {
 }
 
 bool TestUtil::TestCanonicalize() {
-  VERIFY(FileUtil::canonicalize("foo") == "foo");
-  VERIFY(FileUtil::canonicalize("/foo") == "/foo");
-  VERIFY(FileUtil::canonicalize("./foo") == "foo");
-  VERIFY(FileUtil::canonicalize("foo/bar") == "foo/bar");
-  VERIFY(FileUtil::canonicalize("foo/////bar") == "foo/bar");
-  VERIFY(FileUtil::canonicalize("foo/bar/") == "foo/bar/");
-  VERIFY(FileUtil::canonicalize("foo/../bar") == "bar");
-  VERIFY(FileUtil::canonicalize("./foo/../bar") == "bar");
-  VERIFY(FileUtil::canonicalize(".////foo/xyz////..////../bar") == "bar");
-  VERIFY(FileUtil::canonicalize("a/foo../bar") == "a/foo../bar");
-  VERIFY(FileUtil::canonicalize("a./foo/./bar") == "a./foo/bar");
-  VERIFY(FileUtil::canonicalize("////a/foo") == "/a/foo");
-  VERIFY(FileUtil::canonicalize("../foo") == "../foo");
-  VERIFY(FileUtil::canonicalize("foo/../../bar") == "../bar");
-  VERIFY(FileUtil::canonicalize("./../../") == "../../");
+  VERIFY(FileUtil::canonicalize(String("foo")) == String("foo"));
+  VERIFY(FileUtil::canonicalize(String("/foo")) == String("/foo"));
+  VERIFY(FileUtil::canonicalize(String("./foo")) == String("foo"));
+  VERIFY(FileUtil::canonicalize(String("foo/bar")) == String("foo/bar"));
+  VERIFY(FileUtil::canonicalize(String("foo/////bar")) == String("foo/bar"));
+  VERIFY(FileUtil::canonicalize(String("foo/bar/")) == String("foo/bar/"));
+  VERIFY(FileUtil::canonicalize(String("foo/../bar")) == String("bar"));
+  VERIFY(FileUtil::canonicalize(String("./foo/../bar")) == String("bar"));
+  VERIFY(FileUtil::canonicalize(String(".////foo/xyz////..////../bar"))
+         == String("bar"));
+  VERIFY(FileUtil::canonicalize(String("a/foo../bar"))
+         == String("a/foo../bar"));
+  VERIFY(FileUtil::canonicalize(String("a./foo/./bar"))
+         == String("a./foo/bar"));
+  VERIFY(FileUtil::canonicalize(String("////a/foo")) == String("/a/foo"));
+  VERIFY(FileUtil::canonicalize(String("../foo")) == String("../foo"));
+  VERIFY(FileUtil::canonicalize(String("foo/../../bar")) == String("../bar"));
+  VERIFY(FileUtil::canonicalize(String("./../../")) == String("../../"));
+  VERIFY(FileUtil::canonicalize(String("/test\0", 6, CopyString))
+         == String("/test"));
   return Count(true);
 }
 
@@ -126,12 +132,13 @@ bool TestUtil::TestHDF() {
   }
 
   {
+    IniSetting::Map ini = IniSetting::Map::object;
     Hdf doc;
     doc.fromString(
       "node.* {\n"
       "  name = value\n"
       "}");
-    VS(doc["node"][0]["name"].getString(), "value");
+    VS(Config::GetString(ini, doc["node"][0]["name"]), "value");
   }
 
   return Count(true);

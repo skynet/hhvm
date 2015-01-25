@@ -41,24 +41,32 @@ bool check_option(const char *option) {
   return false;
 }
 
+static int get_tempfile_if_not_exists(int ini_fd, char ini_path[]) {
+  if (ini_fd == -1) {
+     ini_fd = mkstemps(ini_path, 4); // keep the .ini suffix
+     if (ini_fd == -1) {
+       fprintf(stderr, "Error: unable to open temporary file");
+       exit(EXIT_FAILURE);
+     }
+  }
+  return ini_fd;
+}
+
 int emulate_zend(int argc, char** argv) {
   std::vector<std::string> newargv;
 
   newargv.push_back(argv[0]);
-#ifdef PHP_DEFAULT_HDF
-  newargv.push_back("-c");
-  newargv.push_back(PHP_DEFAULT_HDF);
-#endif
 
   bool lint = false;
   bool show = false;
   bool need_file = true;
   int ini_fd = -1;
-  char ini_path[] = "/tmp/php-ini-XXXXXX";
+  char ini_path[] = "/tmp/php-ini-XXXXXX.ini";
   std::string ini_section = "";
   const char* program = nullptr;
 
   int cnt = 1;
+  bool ignore_default_configs = false;
   while (cnt < argc) {
     if (check_option(argv[cnt])) {
       newargv.push_back(argv[cnt++]);
@@ -114,14 +122,25 @@ int emulate_zend(int argc, char** argv) {
       need_file = false;
       break;
     }
-    if (strcmp(argv[cnt], "-d")  == 0) {
-      if (ini_fd == -1) {
-        ini_fd = mkstemp(ini_path);
-        if (ini_fd == -1) {
-          fprintf(stderr, "Error: unable to open temporary file");
-          exit(EXIT_FAILURE);
-        }
+    if (strcmp(argv[cnt], "-n") == 0) {
+      ignore_default_configs = true;
+      cnt++;
+      newargv.push_back("--no-config");
+      continue;
+    }
+    if (strcmp(argv[cnt], "-c")  == 0) {
+      if (cnt + 1 < argc && argv[cnt + 1][0] != '-') {
+        newargv.push_back("-c");
+        newargv.push_back(argv[cnt + 1]);
+        cnt = cnt + 2;
+        continue;
+      } else {
+        fprintf(stderr, "Notice: No config file specified");
+        exit(EXIT_FAILURE);
       }
+    }
+    if (strcmp(argv[cnt], "-d")  == 0) {
+      ini_fd = get_tempfile_if_not_exists(ini_fd, ini_path);
 
       std::string line = argv[cnt+1];
       std::string section = "php";
@@ -198,6 +217,30 @@ int emulate_zend(int argc, char** argv) {
     newargv.push_back(ini_path);
   }
 
+  if (ignore_default_configs) {
+    // Appending empty file to -c options to avoid loading defaults
+    ini_fd = get_tempfile_if_not_exists(ini_fd, ini_path);
+  } else {
+    // Should only include this default if not explicitly ignored.
+#ifdef PHP_DEFAULT_HDF
+    newargv.push_back("-c");
+    newargv.push_back(PHP_DEFAULT_HDF);
+#endif
+
+    // If the -c option is specified without a -n, php behavior is to
+    // load the default ini/hdf
+    auto default_config_file = "/etc/hhvm/php.ini";
+    if (access(default_config_file, R_OK) != -1) {
+      newargv.push_back("-c");
+      newargv.push_back(default_config_file);
+    }
+    default_config_file = "/etc/hhvm/config.hdf";
+    if (access(default_config_file, R_OK) != -1) {
+      newargv.push_back("-c");
+      newargv.push_back(default_config_file);
+    }
+  }
+
   if (cnt < argc && strcmp(argv[cnt], "--") == 0) cnt++;
   if (cnt < argc) {
     // There are arguments following the filename, so copy them.
@@ -213,7 +256,7 @@ int emulate_zend(int argc, char** argv) {
     newargv_array[i] = (char *)newargv[i].data();
   }
   // NULL-terminate the argument array.
-  newargv_array[newargv.size()] = NULL;
+  newargv_array[newargv.size()] = nullptr;
 
   auto ret = execute_program(newargv.size(), newargv_array);
 

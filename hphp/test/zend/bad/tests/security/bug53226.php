@@ -1,6 +1,4 @@
 <?php
-ini_set('open_basedir', .);
-
 require_once "open_basedir.inc";
 create_directories();
 
@@ -10,6 +8,7 @@ var_dump(file_exists('./test/foo'));
 $file = str_repeat('x', 2 * PHP_MAXPATHLEN);
 var_dump(file_exists("./test/$file"));
 ?>
+<?php error_reporting(0); ?>
 <?php
 require_once "open_basedir.inc";
 delete_directories();

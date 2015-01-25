@@ -27,6 +27,8 @@
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
 #include "hphp/runtime/base/packed-array-defs.h"
+#include "hphp/runtime/base/shape.h"
+#include "hphp/runtime/base/struct-array.h"
 
 namespace HPHP {
 
@@ -44,7 +46,7 @@ struct EmptyArray::Initializer {
     auto const ad   = static_cast<ArrayData*>(vpEmpty);
     ad->m_kind      = ArrayData::kEmptyKind;
     ad->m_size      = 0;
-    ad->m_pos       = ArrayData::invalid_index;
+    ad->m_pos       = 0;
     ad->m_count     = 0;
     ad->setStatic();
   }
@@ -69,20 +71,21 @@ const Variant& EmptyArray::GetValueRef(const ArrayData* ad, ssize_t pos) {
   not_reached();
 }
 
-// Iterators can't be advanced or rewinded, because we have no valid
-// iterators.
+// EmptyArray::IterAdvance() is reachable; see ArrayData::next() for details
 ssize_t EmptyArray::IterAdvance(const ArrayData*, ssize_t prev) {
-  not_reached();
+  return 0;
 }
+
+// EmptyArray::IterRewind() is NOT reachable; see ArrayData::prev() for details
 ssize_t EmptyArray::IterRewind(const ArrayData*, ssize_t prev) {
   not_reached();
 }
 
-// We always return false in ValidMArrayIter, so this should never be
-// called.  ValidMArrayIter may be called on this array kind, though,
-// because Escalate is a no-op.
+// Even though we always return false in ValidMArrayIter, this function may
+// still be called because MArrayIters are constructed in an invalid position,
+// and then advanced to the first element.
 bool EmptyArray::AdvanceMArrayIter(ArrayData*, MArrayIter& fp) {
-  not_reached();
+  return false;
 }
 
 // We're always already a static array.
@@ -92,21 +95,7 @@ ArrayData* EmptyArray::NonSmartCopy(const ArrayData* ad) { not_reached(); }
 //////////////////////////////////////////////////////////////////////
 
 NEVER_INLINE
-ArrayData* EmptyArray::Copy(const ArrayData*) {
-  auto const cap = kPackedSmallSize;
-  auto const ad = static_cast<ArrayData*>(
-    MM().objMallocLogged(sizeof(ArrayData) + sizeof(TypedValue) * cap)
-  );
-  ad->m_kindAndSize = cap;
-  ad->m_posAndCount = static_cast<uint32_t>(ArrayData::invalid_index);
-  assert(ad->m_kind == ArrayData::kPackedKind);
-  assert(ad->m_size == 0);
-  assert(ad->m_packedCap == cap);
-  assert(ad->m_pos == ArrayData::invalid_index);
-  assert(ad->m_count == 0);
-  assert(PackedArray::checkInvariants(ad));
-  return ad;
-}
+ArrayData* EmptyArray::Copy(const ArrayData*) { return staticEmptyArray(); }
 
 ArrayData* EmptyArray::CopyWithStrongIterators(const ArrayData* ad) {
   // We can never have associated strong iterators, so we don't need
@@ -134,7 +123,7 @@ ArrayData* EmptyArray::CopyWithStrongIterators(const ArrayData* ad) {
 
 /*
  * Helper for empty array -> packed transitions.  Creates an array
- * with one element.  The element is transfered into the array (should
+ * with one element.  The element is transferred into the array (should
  * already be incref'd).
  */
 ALWAYS_INLINE
@@ -143,8 +132,9 @@ std::pair<ArrayData*,TypedValue*> EmptyArray::MakePackedInl(TypedValue tv) {
   auto const ad = static_cast<ArrayData*>(
     MM().objMallocLogged(sizeof(ArrayData) + cap * sizeof(TypedValue))
   );
-  ad->m_kindAndSize = uint64_t{1} << 32 | cap; // also set kind
-  ad->m_posAndCount = 0;
+  assert(cap == packedCodeToCap(cap));
+  ad->m_sizeAndPos = 1; // size=1, pos=0
+  ad->m_kindAndCount = cap; // kind=Packed, count=0
 
   auto& lval = *reinterpret_cast<TypedValue*>(ad + 1);
   lval.m_data = tv.m_data;
@@ -154,7 +144,7 @@ std::pair<ArrayData*,TypedValue*> EmptyArray::MakePackedInl(TypedValue tv) {
   assert(ad->m_size == 1);
   assert(ad->m_pos == 0);
   assert(ad->m_count == 0);
-  assert(ad->m_packedCap == cap);
+  assert((ad->m_packedCapCode & 0xFFFFFFUL) == cap);
   assert(PackedArray::checkInvariants(ad));
   return { ad, &lval };
 }
@@ -176,12 +166,11 @@ EmptyArray::MakeMixed(StringData* key, TypedValue val) {
   auto const cap  = MixedArray::computeMaxElms(mask); // 3
   auto const ad   = smartAllocArray(cap, mask);
 
-  ad->m_kindAndSize = uint64_t{1} << 32 | ArrayData::kMixedKind << 24;
-  ad->m_posAndCount = 0;
-  ad->m_capAndUsed  = uint64_t{1} << 32 | cap;
-  ad->m_tableMask   = mask;
-  ad->m_nextKI      = 0;
-  ad->m_hLoad       = 1;
+  ad->m_sizeAndPos   = 1; // size=1, pos=0
+  ad->m_kindAndCount = MixedArray::kMixedKind << 24; // capcode=0, count=0
+  ad->m_capAndUsed   = uint64_t{1} << 32 | cap;
+  ad->m_tableMask    = mask;
+  ad->m_nextKI       = 0;
 
   auto const data = reinterpret_cast<MixedArray::Elm*>(ad + 1);
   auto const hash = reinterpret_cast<int32_t*>(data + cap);
@@ -219,12 +208,11 @@ EmptyArray::MakeMixed(int64_t key, TypedValue val) {
   auto const cap  = MixedArray::computeMaxElms(mask); // 3
   auto const ad   = smartAllocArray(cap, mask);
 
-  ad->m_kindAndSize = uint64_t{1} << 32 | ArrayData::kMixedKind << 24;
-  ad->m_posAndCount = 0;
-  ad->m_capAndUsed  = uint64_t{1} << 32 | cap;
-  ad->m_tableMask   = mask;
-  ad->m_nextKI      = key + 1;
-  ad->m_hLoad       = 1;
+  ad->m_sizeAndPos    = 1; // size=1, pos=0
+  ad->m_kindAndCount  = MixedArray::kMixedKind << 24; // capcode=0, count=0
+  ad->m_capAndUsed    = uint64_t{1} << 32 | cap;
+  ad->m_tableMask     = mask;
+  ad->m_nextKI        = (key >= 0) ? key + 1 : 0;
 
   auto const data = reinterpret_cast<MixedArray::Elm*>(ad + 1);
   auto const hash = reinterpret_cast<int32_t*>(data + cap);
@@ -253,8 +241,7 @@ EmptyArray::MakeMixed(int64_t key, TypedValue val) {
 
 //////////////////////////////////////////////////////////////////////
 
-ArrayData* EmptyArray::SetInt(ArrayData*, int64_t k, const Variant& v, bool) {
-  auto c = *v.asCell();
+ArrayData* EmptyArray::SetInt(ArrayData*, int64_t k, Cell c, bool) {
   // TODO(#3888164): we should make it so we don't need KindOfUninit checks
   if (c.m_type == KindOfUninit) c.m_type = KindOfNull;
   tvRefcountedIncRef(&c);
@@ -265,9 +252,8 @@ ArrayData* EmptyArray::SetInt(ArrayData*, int64_t k, const Variant& v, bool) {
 
 ArrayData* EmptyArray::SetStr(ArrayData*,
                               StringData* k,
-                              const Variant& v,
+                              Cell val,
                               bool copy) {
-  auto val = *v.asCell();
   tvRefcountedIncRef(&val);
   // TODO(#3888164): we should make it so we don't need KindOfUninit checks
   if (val.m_type == KindOfUninit) val.m_type = KindOfNull;
@@ -344,11 +330,22 @@ ArrayData* EmptyArray::PlusEq(ArrayData*, const ArrayData* elems) {
 }
 
 ArrayData* EmptyArray::Merge(ArrayData*, const ArrayData* elems) {
-  // TODO(#4049965): can this just copy elems and then renumber?
-  auto const ret = MixedArray::MakeReserveMixed(MixedArray::SmallSize);
-  auto const tmp = MixedArray::Merge(ret, elems);
-  ret->release();
-  return tmp;
+  // Packed arrays don't need renumbering, so don't make a copy.
+  if (elems->isPacked() || elems->isStruct()) {
+    elems->incRefCount();
+    return const_cast<ArrayData*>(elems);
+  }
+  // Fast path the common case that elems is mixed.
+  if (elems->isMixed()) {
+    auto const copy = MixedArray::Copy(elems);
+    copy->incRefCount();
+    MixedArray::Renumber(copy);
+    return copy;
+  }
+  auto copy = elems->copy();
+  copy->incRefCount();
+  copy->renumber();
+  return copy;
 }
 
 ArrayData* EmptyArray::PopOrDequeue(ArrayData* ad, Variant& value) {
@@ -382,10 +379,10 @@ ArrayData* EmptyArray::ZSetStr(ArrayData* ad, StringData* k, RefData* v) {
   return arr;
 }
 
-ArrayData* EmptyArray::ZAppend(ArrayData* ad, RefData* v) {
+ArrayData* EmptyArray::ZAppend(ArrayData* ad, RefData* v, int64_t* key_ptr) {
   auto const arr = MixedArray::MakeReserveMixed(MixedArray::SmallSize);
   arr->m_count = 0;
-  DEBUG_ONLY auto const tmp = arr->zAppend(v);
+  DEBUG_ONLY auto const tmp = arr->zAppend(v, key_ptr);
   assert(tmp == arr);
   return arr;
 }

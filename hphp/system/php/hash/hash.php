@@ -60,7 +60,7 @@ function hash_file(string $algo, string $filename,
  *                  of the message digest is returned.
  */
 <<__Native>>
-function hash_final(resource $context, bool $raw_output = false): string;
+function hash_final(resource $context, bool $raw_output = false): mixed;
 
 /**
  * hash() - http://php.net/function.hash
@@ -88,15 +88,19 @@ function hash_hmac(?string $algo = null,
   $args = func_num_args();
   if ($args < 3) {
     trigger_error("hash_hmac() expects 3 parameters, $args given",
-      E_USER_WARNING);
+      E_WARNING);
     return null;
   } else if ($args > 4) {
     trigger_error("hash_hmac() expects at most 4 parameters, $args given",
-      E_USER_WARNING);
+      E_WARNING);
     return null;
   }
 
-  $ctx = hash_init($algo, HASH_HMAC, $key);
+  // hash_init() doesn't allow empty keys (for good reason)
+  // but hash_hmac() needs to support them.
+  // Rely on the fact that HMAC keys are null padded
+  // making a key of "\0" equivalent to ""
+  $ctx = hash_init($algo, HASH_HMAC, ($key !== '') ? $key : "\0");
   if (!$ctx) {
     return false;
   }
@@ -128,11 +132,15 @@ function hash_hmac_file(?string $algo = null,
   $args = func_num_args();
   if ($args < 3) {
     trigger_error("hash_hmac_file() expects 3 parameters, $args given",
-      E_USER_WARNING);
+      E_WARNING);
     return null;
   }
 
-  $ctx = hash_init($algo, HASH_HMAC, $key);
+  // hash_init() doesn't allow empty keys (for good reason)
+  // but hash_hmac_file() needs to support them.
+  // Rely on the fact that HMAC keys are null padded
+  // making a key of "\0" equivalent to ""
+  $ctx = hash_init($algo, HASH_HMAC, ($key !== '') ? $key : "\0");
   if (!$ctx) {
     return false;
   }
@@ -331,25 +339,6 @@ function hash_pbkdf2(string $algo, string $password, string $salt,
  *
  * @return bool - Whether $known == $user
  */
-function hash_equals(string $known, string $user): bool {
-  $known_len = strlen($known);
-  $user_len  = strlen($user);
-  $equals    = ($known_len == $user_len);
+<<__Native>>
+function hash_equals(mixed $known, mixed $user): bool;
 
-  // Special case to avoid divide by zeros
-  if ($user_len == 0) {
-    // Doesn't actually let it match $known === "\0"
-    // since the length check already failed.
-    // Just gives the loop below something to run against.
-    $user = "\0";
-    $user_len = 1;
-  }
-
-  for ($i = 0; $i < $known_len; ++$i) {
-    if ($user[$i % $user_len] !== $known[$i]) {
-      $equals = false;
-      // break; intentionally left out see docblock above
-    }
-  }
-  return $equals;
-}

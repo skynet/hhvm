@@ -19,11 +19,12 @@
 #include <limits>
 #include <algorithm>
 
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 
 #include "hphp/runtime/base/strings.h"
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/base/tv-conversions.h"
+#include "hphp/runtime/ext/std/ext_std_math.h"
 #include "hphp/util/overflow.h"
 
 namespace HPHP {
@@ -31,6 +32,12 @@ namespace HPHP {
 //////////////////////////////////////////////////////////////////////
 
 namespace {
+
+NEVER_INLINE ATTRIBUTE_NORETURN
+void throw_bad_array_operand() {
+  throw ExtendedException("Invalid operand type was used: "
+                          "cannot perform this operation with arrays");
+}
 
 Cell make_int(int64_t n) { return make_tv<KindOfInt64>(n); }
 Cell make_dbl(double d)  { return make_tv<KindOfDouble>(d); }
@@ -41,15 +48,31 @@ TypedNum numericConvHelper(Cell cell) {
   assert(cellIsPlausible(cell));
 
   switch (cell.m_type) {
-  case KindOfString:
-  case KindOfStaticString: return stringToNumeric(cell.m_data.pstr);
-  case KindOfBoolean:      return make_int(cell.m_data.num);
-  case KindOfUninit:
-  case KindOfNull:         return make_int(0);
-  case KindOfObject:       return make_int(cell.m_data.pobj->o_toInt64());
-  case KindOfResource:     return make_int(cell.m_data.pres->o_toInt64());
-  case KindOfArray:        throw BadArrayOperandException();
-  default:                 break;
+    case KindOfUninit:
+    case KindOfNull:
+      return make_int(0);
+
+    case KindOfBoolean:
+      return make_int(cell.m_data.num);
+
+    case KindOfString:
+    case KindOfStaticString:
+      return stringToNumeric(cell.m_data.pstr);
+
+    case KindOfArray:
+      throw_bad_array_operand();
+
+    case KindOfObject:
+      return make_int(cell.m_data.pobj->toInt64());
+
+    case KindOfResource:
+      return make_int(cell.m_data.pres->o_toInt64());
+
+    case KindOfInt64:
+    case KindOfDouble:
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
   not_reached();
 }
@@ -127,7 +150,7 @@ struct Sub {
   Cell operator()(int64_t a, int64_t b) const { return make_int(a - b); }
 
   ArrayData* operator()(ArrayData* a1, ArrayData* a2) const {
-    throw BadArrayOperandException();
+    throw_bad_array_operand();
   }
 };
 
@@ -138,7 +161,7 @@ struct Mul {
   Cell operator()(int64_t a, int64_t b) const { return make_int(a * b); }
 
   ArrayData* operator()(ArrayData* a1, ArrayData* a2) const {
-    throw BadArrayOperandException();
+    throw_bad_array_operand();
   }
 };
 
@@ -172,7 +195,7 @@ struct Div {
   }
 
   ArrayData* operator()(ArrayData* a1, ArrayData* a2) const {
-    throw BadArrayOperandException();
+    throw_bad_array_operand();
   }
 };
 
@@ -248,7 +271,7 @@ struct SubEq {
   double  operator()(double  a, double  b) const { return a - b; }
 
   ArrayData* operator()(ArrayData* ad1, ArrayData* ad2) const {
-    throw BadArrayOperandException();
+    throw_bad_array_operand();
   }
 };
 
@@ -259,7 +282,7 @@ struct MulEq {
   double  operator()(double  a, double  b) const { return a * b; }
 
   ArrayData* operator()(ArrayData* ad1, ArrayData* ad2) const {
-    throw BadArrayOperandException();
+    throw_bad_array_operand();
   }
 };
 
@@ -305,7 +328,10 @@ Cell cellBitOp(StrLenOp strLenOp, Cell c1, Cell c2) {
 template<class Op>
 void cellBitOpEq(Op op, Cell& c1, Cell c2) {
   auto const result = op(c1, c2);
-  cellSet(result, c1);
+  auto const type = c1.m_type;
+  auto const data = c1.m_data.num;
+  tvCopy(result, c1);
+  tvRefcountedDecRefHelper(type, data);
 }
 
 // Op must implement the interface described for cellIncDecOp.
@@ -324,21 +350,17 @@ void stringIncDecOp(Op op, Cell& cell) {
   double dval;
   auto const dt = sd->isNumericWithVal(ival, dval, true /* allow_errors */);
 
-  switch (dt) {
-  case KindOfInt64:
+  if (dt == KindOfInt64) {
     decRefStr(sd);
     cellCopy(make_int(ival), cell);
     op.intCase(cell);
-    break;
-  case KindOfDouble:
+  } else if (dt == KindOfDouble) {
     decRefStr(sd);
     cellCopy(make_dbl(dval), cell);
     op.dblCase(cell);
-    break;
-  default:
+  } else {
     assert(dt == KindOfNull);
     op.nonNumericString(cell);
-    break;
   }
 }
 
@@ -358,31 +380,35 @@ void cellIncDecOp(Op op, Cell& cell) {
   assert(cellIsPlausible(cell));
 
   switch (cell.m_type) {
-  case KindOfInt64:
-    op.intCase(cell);
-    break;
-  case KindOfDouble:
-    op.dblCase(cell);
-    break;
+    case KindOfUninit:
+    case KindOfNull:
+      op.nullCase(cell);
+      return;
 
-  case KindOfString:
-  case KindOfStaticString:
-    stringIncDecOp(op, cell);
-    break;
+    case KindOfInt64:
+      op.intCase(cell);
+      return;
 
-  case KindOfUninit:
-  case KindOfNull:
-    op.nullCase(cell);
-    break;
+    case KindOfDouble:
+      op.dblCase(cell);
+      return;
 
-  case KindOfBoolean:
-  case KindOfObject:
-  case KindOfResource:
-  case KindOfArray:
-    break;
-  default:
-    not_reached();
+    case KindOfStaticString:
+    case KindOfString:
+      stringIncDecOp(op, cell);
+      return;
+
+    case KindOfBoolean:
+    case KindOfArray:
+    case KindOfObject:
+    case KindOfResource:
+      return;
+
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
+  not_reached();
 }
 
 const StaticString s_1("1");
@@ -420,7 +446,7 @@ struct Inc : IncBase {
 
 struct IncO : IncBase {
   void intCase(Cell& cell) const {
-    if (add_overflow(cell.m_data.num, 1)) {
+    if (add_overflow(cell.m_data.num, int64_t{1})) {
       cellCopy(cellAddO(cell, make_int(1)), cell);
     } else {
       Inc().intCase(cell);
@@ -441,7 +467,7 @@ struct Dec : DecBase {
 
 struct DecO : DecBase {
   void intCase(Cell& cell) {
-    if (sub_overflow(cell.m_data.num, 1)) {
+    if (sub_overflow(cell.m_data.num, int64_t{1})) {
       cellCopy(cellSubO(cell, make_int(1)), cell);
     } else {
       Dec().intCase(cell);
@@ -469,25 +495,29 @@ Cell cellAddO(Cell c1, Cell c2) {
   auto over = [](int64_t a, int64_t b) {
     return make_dbl(double(a) + double(b));
   };
-  return cellArithO(Add(), add_overflow, over, c1, c2);
+  return cellArithO(Add(), add_overflow<int64_t>, over, c1, c2);
 }
 
 TypedNum cellSubO(Cell c1, Cell c2) {
   auto over = [](int64_t a, int64_t b) {
     return make_dbl(double(a) - double(b));
   };
-  return cellArithO(Sub(), sub_overflow, over, c1, c2);
+  return cellArithO(Sub(), sub_overflow<int64_t>, over, c1, c2);
 }
 
 TypedNum cellMulO(Cell c1, Cell c2) {
   auto over = [](int64_t a, int64_t b) {
     return make_dbl(double(a) * double(b));
   };
-  return cellArithO(Mul(), mul_overflow, over, c1, c2);
+  return cellArithO(Mul(), mul_overflow<int64_t>, over, c1, c2);
 }
 
 Cell cellDiv(Cell c1, Cell c2) {
   return cellArith(Div(), c1, c2);
+}
+
+Cell cellPow(Cell c1, Cell c2) {
+  return *HHVM_FN(pow)(tvAsVariant(&c1), tvAsVariant(&c2)).asCell();
 }
 
 Cell cellMod(Cell c1, Cell c2) {
@@ -523,6 +553,14 @@ Cell cellBitXor(Cell c1, Cell c2) {
   );
 }
 
+Cell cellShl(Cell c1, Cell c2) {
+  return make_int(cellToInt(c1) << cellToInt(c2));
+}
+
+Cell cellShr(Cell c1, Cell c2) {
+  return make_int(cellToInt(c1) >> cellToInt(c2));
+}
+
 void cellAddEq(Cell& c1, Cell c2) {
   cellOpEq(AddEq(), c1, c2);
 }
@@ -548,8 +586,12 @@ void cellDivEq(Cell& c1, Cell c2) {
   cellCopy(cellDiv(c1, c2), c1);
 }
 
+void cellPowEq(Cell& c1, Cell c2) {
+  cellSet(cellPow(c1, c2), c1);
+}
+
 void cellModEq(Cell& c1, Cell c2) {
-  cellCopy(cellMod(c1, c2), c1);
+  cellSet(cellMod(c1, c2), c1);
 }
 
 void cellBitAndEq(Cell& c1, Cell c2) {
@@ -564,6 +606,9 @@ void cellBitXorEq(Cell& c1, Cell c2) {
   cellBitOpEq(cellBitXor, c1, c2);
 }
 
+void cellShlEq(Cell& c1, Cell c2) { cellCopy(cellShl(c1, c2), c1); }
+void cellShrEq(Cell& c1, Cell c2) { cellCopy(cellShr(c1, c2), c1); }
+
 void cellInc(Cell& cell) { cellIncDecOp(Inc(), cell); }
 void cellIncO(Cell& cell) { cellIncDecOp(IncO(), cell); }
 void cellDec(Cell& cell) { cellIncDecOp(Dec(), cell); }
@@ -573,45 +618,53 @@ void cellBitNot(Cell& cell) {
   assert(cellIsPlausible(cell));
 
   switch (cell.m_type) {
-  case KindOfInt64:
-    cell.m_data.num = ~cell.m_data.num;
-    break;
-  case KindOfDouble:
-    cell.m_type     = KindOfInt64;
-    cell.m_data.num = ~toInt64(cell.m_data.dbl);
-    break;
+    case KindOfInt64:
+      cell.m_data.num = ~cell.m_data.num;
+      break;
 
-  case KindOfString:
-    if (cell.m_data.pstr->hasMultipleRefs()) {
+    case KindOfDouble:
+      cell.m_type     = KindOfInt64;
+      cell.m_data.num = ~toInt64(cell.m_data.dbl);
+      break;
+
+    case KindOfString:
+      if (cell.m_data.pstr->hasMultipleRefs()) {
     case KindOfStaticString:
-      auto const newSd = StringData::Make(
-        cell.m_data.pstr->slice(),
-        CopyString
-      );
-      newSd->incRefCount();
-      cell.m_data.pstr->decRefCount(); // can't go to zero
-      cell.m_data.pstr = newSd;
-      cell.m_type = KindOfString;
-    } else {
-      // Unless we go through this branch, the string was just freshly
-      // created, so the following mutation will be safe wrt its
-      // internal hash caching.
-      cell.m_data.pstr->invalidateHash();
-    }
-
-    {
-      auto const sd   = cell.m_data.pstr;
-      auto const len  = sd->size();
-      auto const data = sd->mutableData();
-      assert(sd->hasExactlyOneRef());
-      for (uint32_t i = 0; i < len; ++i) {
-        data[i] = ~data[i];
+        auto const newSd = StringData::Make(
+          cell.m_data.pstr->slice(),
+          CopyString
+        );
+        newSd->incRefCount();
+        cell.m_data.pstr->decRefCount(); // can't go to zero
+        cell.m_data.pstr = newSd;
+        cell.m_type = KindOfString;
+      } else {
+        // Unless we go through this branch, the string was just freshly
+        // created, so the following mutation will be safe wrt its
+        // internal hash caching.
+        cell.m_data.pstr->invalidateHash();
       }
-    }
-    break;
 
-  default:
-    raise_error("Unsupported operand type for ~");
+      {
+        auto const sd   = cell.m_data.pstr;
+        auto const len  = sd->size();
+        auto const data = sd->mutableData();
+        assert(sd->hasExactlyOneRef());
+        for (uint32_t i = 0; i < len; ++i) {
+          data[i] = ~data[i];
+        }
+      }
+      break;
+
+    case KindOfUninit:
+    case KindOfNull:
+    case KindOfBoolean:
+    case KindOfArray:
+    case KindOfObject:
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      raise_error("Unsupported operand type for ~");
   }
 }
 

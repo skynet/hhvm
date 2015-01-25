@@ -15,6 +15,7 @@
 */
 
 #include "hphp/compiler/statement/method_statement.h"
+#include <folly/Conv.h>
 #include <map>
 #include <set>
 #include "hphp/compiler/statement/return_statement.h"
@@ -127,29 +128,34 @@ int MethodStatement::getRecursiveCount() const {
 ///////////////////////////////////////////////////////////////////////////////
 // parser functions
 
-static inline bool hasVariadicParam(const ExpressionListPtr params) {
-  for (int i = 0; i < params->getCount(); ++i) {
-    ParameterExpressionPtr param =
-      dynamic_pointer_cast<ParameterExpression>((*params)[i]);
-    if (param->isVariadic()) return true;
-  }
-  return false;
-}
-
 FunctionScopePtr MethodStatement::onInitialParse(AnalysisResultConstPtr ar,
                                                  FileScopePtr fs) {
-  int minParam, maxParam;
   ConstructPtr self = shared_from_this();
-  minParam = maxParam = 0;
+  int minParam = 0, numDeclParam = 0;
   bool hasRef = false;
+  bool hasVariadicParam = false;
   if (m_params) {
     std::set<string> names, allDeclNames;
     int i = 0;
-    maxParam = m_params->getCount();
-    for (i = maxParam; i--; ) {
+    numDeclParam = m_params->getCount();
+    ParameterExpressionPtr lastParam =
+      dynamic_pointer_cast<ParameterExpression>(
+        (*m_params)[numDeclParam - 1]);
+    hasVariadicParam = lastParam->isVariadic();
+    if (hasVariadicParam) {
+      allDeclNames.insert(lastParam->getName());
+      // prevent the next loop from visiting the variadic param and testing
+      // its optionality. parsing ensures that the variadic capture param
+      // can *only* be the last param.
+      i = numDeclParam - 2;
+    } else {
+      i = numDeclParam - 1;
+    }
+    for (; i >= 0; --i) {
       ParameterExpressionPtr param =
         dynamic_pointer_cast<ParameterExpression>((*m_params)[i]);
-      if (param->isRef()) hasRef = true;
+      assert(!param->isVariadic());
+      if (param->isRef()) { hasRef = true; }
       if (!param->isOptional()) {
         if (!minParam) minParam = i + 1;
       } else if (minParam && !param->hasTypeHint()) {
@@ -158,13 +164,15 @@ FunctionScopePtr MethodStatement::onInitialParse(AnalysisResultConstPtr ar,
       allDeclNames.insert(param->getName());
     }
 
-    for (i = maxParam-1; i >= 0; i--) {
+    // For the purpose of naming (having entered the the function body), a
+    // variadic capture param acts as any other variable.
+    for (i = (numDeclParam - 1); i >= 0; --i) {
       ParameterExpressionPtr param =
         dynamic_pointer_cast<ParameterExpression>((*m_params)[i]);
       if (names.find(param->getName()) != names.end()) {
         Compiler::Error(Compiler::RedundantParameter, param);
         for (int j = 0; j < 1000; j++) {
-          string name = param->getName() + lexical_cast<string>(j);
+          string name = param->getName() + folly::to<string>(j);
           if (names.find(name) == names.end() &&
               allDeclNames.find(name) == allDeclNames.end()) {
             param->rename(name);
@@ -179,6 +187,9 @@ FunctionScopePtr MethodStatement::onInitialParse(AnalysisResultConstPtr ar,
   if (hasRef || m_ref) {
     m_attribute |= FileScope::ContainsReference;
   }
+  if (hasVariadicParam) {
+    m_attribute |= FileScope::VariadicArgumentParam;
+  }
 
   vector<UserAttributePtr> attrs;
   if (m_attrList) {
@@ -190,9 +201,10 @@ FunctionScopePtr MethodStatement::onInitialParse(AnalysisResultConstPtr ar,
   }
 
   StatementPtr stmt = dynamic_pointer_cast<Statement>(shared_from_this());
-  FunctionScopePtr funcScope
-    (new FunctionScope(ar, m_method, m_name, stmt, m_ref, minParam, maxParam,
-                       m_modifiers, m_attribute, m_docComment, fs, attrs));
+  FunctionScopePtr funcScope(
+    new FunctionScope(ar, m_method, m_name, stmt, m_ref, minParam,
+                      numDeclParam, m_modifiers, m_attribute, m_docComment,
+                      fs, attrs));
   if (!m_stmt) {
     funcScope->setVirtual();
   }
@@ -201,8 +213,17 @@ FunctionScopePtr MethodStatement::onInitialParse(AnalysisResultConstPtr ar,
   funcScope->setParamCounts(ar, -1, -1);
 
   if (funcScope->isNative()) {
-    funcScope->setReturnType(
-      ar, Type::FromDataType(m_retTypeAnnotation->dataType(), Type::Variant));
+    if ((m_name == "__construct") || (m_name == "__destruct")) {
+      funcScope->setReturnType(ar, Type::Null);
+      assert(!m_retTypeAnnotation ||
+             !m_retTypeAnnotation->dataType().hasValue() ||
+             (m_retTypeAnnotation->dataType() == KindOfNull));
+    } else if (m_retTypeAnnotation) {
+      funcScope->setReturnType(
+        ar, Type::FromDataType(m_retTypeAnnotation->dataType(), Type::Variant));
+    } else {
+      funcScope->setReturnType(ar, Type::Variant);
+    }
   }
 
   return funcScope;
@@ -219,11 +240,14 @@ void MethodStatement::onParseRecur(AnalysisResultConstPtr ar,
          m_modifiers->isPrivate()) > 1) {
       m_modifiers->parseTimeFatal(
         Compiler::InvalidAttribute,
-        "%s: method %s::%s()",
-        Strings::PICK_ACCESS_MODIFIER,
-        classScope->getOriginalName().c_str(),
-        getOriginalName().c_str()
+        Strings::PICK_ACCESS_MODIFIER
       );
+    }
+
+    if (m_modifiers->hasDuplicates()) {
+      m_modifiers->parseTimeFatal(
+        Compiler::InvalidAttribute,
+        Strings::PICK_ACCESS_MODIFIER);
     }
 
     if (classScope->isInterface()) {
@@ -284,6 +308,16 @@ void MethodStatement::onParseRecur(AnalysisResultConstPtr ar,
         );
       }
     }
+    if (!m_modifiers->isStatic() && classScope->isStaticUtil()) {
+      m_modifiers->parseTimeFatal(
+        Compiler::InvalidAttribute,
+        "Class %s contains non-static method %s and "
+        "therefore cannot be declared 'abstract final'",
+        classScope->getOriginalName().c_str(),
+        getOriginalName().c_str()
+      );
+    }
+
     if (isNative) {
       if (getStmts()) {
         parseTimeFatal(Compiler::InvalidAttribute,
@@ -291,9 +325,17 @@ void MethodStatement::onParseRecur(AnalysisResultConstPtr ar,
                        classScope->getOriginalName().c_str(),
                        getOriginalName().c_str());
       }
-      if (!m_retTypeAnnotation) {
+      auto is_ctordtor = (m_name == "__construct") || (m_name == "__destruct");
+      if (!m_retTypeAnnotation && !is_ctordtor) {
         parseTimeFatal(Compiler::InvalidAttribute,
                        "Native method %s::%s() must have a return type hint",
+                       classScope->getOriginalName().c_str(),
+                       getOriginalName().c_str());
+      } else if (m_retTypeAnnotation &&
+                 is_ctordtor &&
+                (m_retTypeAnnotation->dataType() != KindOfNull)) {
+        parseTimeFatal(Compiler::InvalidAttribute,
+                       "Native method %s::%s() must return void",
                        classScope->getOriginalName().c_str(),
                        getOriginalName().c_str());
       }
@@ -319,11 +361,14 @@ void MethodStatement::onParseRecur(AnalysisResultConstPtr ar,
     fs->setDynamicInvoke();
   }
   if (m_params) {
-    for (int i = 0; i < m_params->getCount(); i++) {
+    auto nParams = m_params->getCount();
+    for (int i = 0; i < nParams; i++) {
       ParameterExpressionPtr param =
         dynamic_pointer_cast<ParameterExpression>((*m_params)[i]);
       param->parseHandler(classScope);
-      if (isNative && !param->hasUserType()) {
+      // Variadic capture params don't need types because they'll
+      // be treated as Arrays as far as HNI is concerned.
+      if (isNative && !param->hasUserType() && !param->isVariadic()) {
         parseTimeFatal(Compiler::InvalidAttribute,
                        "Native method calls must have type hints on all args");
       }
@@ -352,6 +397,11 @@ void MethodStatement::setSpecialMethod(ClassScopePtr classScope) {
     classScope->setAttribute(ClassScope::HasConstructor);
   } else if (m_name == "__destruct") {
     classScope->setAttribute(ClassScope::HasDestructor);
+    if (m_params && m_params->getCount()) {
+      parseTimeFatal(Compiler::InvalidMagicMethod,
+        "Method %s::%s() cannot take any arguments",
+        m_originalClassName.c_str(), m_originalName.c_str());
+    }
   } else if (m_name == "__get") {
     classScope->setAttribute(ClassScope::HasUnknownPropGetter);
     numArgs = 1;
@@ -375,6 +425,12 @@ void MethodStatement::setSpecialMethod(ClassScopePtr classScope) {
     classScope->setAttribute(ClassScope::HasInvokeMethod);
   } else if (m_name == "__tostring") {
     numArgs = 0;
+  } else if (m_name == "__clone") {
+    if (m_params && m_params->getCount()) {
+      parseTimeFatal(Compiler::InvalidMagicMethod,
+        "Method %s::%s() cannot accept any arguments",
+        m_originalClassName.c_str(), m_originalName.c_str());
+    }
   }
   if (numArgs >= 0) {
     // Fatal if the number of arguments is wrong
@@ -541,49 +597,6 @@ void MethodStatement::setNthKid(int n, ConstructPtr cp) {
     default:
       assert(false);
       break;
-  }
-}
-
-void MethodStatement::inferTypes(AnalysisResultPtr ar) {
-}
-
-void MethodStatement::inferFunctionTypes(AnalysisResultPtr ar) {
-  IMPLEMENT_INFER_AND_CHECK_ASSERT(getFunctionScope());
-
-  FunctionScopeRawPtr funcScope = getFunctionScope();
-  bool pseudoMain = funcScope->inPseudoMain();
-
-  if (m_stmt && funcScope->isFirstPass()) {
-    if (pseudoMain ||
-        funcScope->getReturnType() ||
-        m_stmt->hasRetExp()) {
-      bool lastIsReturn = false;
-      if (m_stmt->getCount()) {
-        StatementPtr lastStmt = (*m_stmt)[m_stmt->getCount()-1];
-        if (lastStmt->is(Statement::KindOfReturnStatement)) {
-          lastIsReturn = true;
-        }
-      }
-      if (!lastIsReturn) {
-        ExpressionPtr constant =
-          makeScalarExpression(ar, funcScope->inPseudoMain() ?
-                               Variant(1) :
-                               Variant(Variant::NullInit()));
-        ReturnStatementPtr returnStmt =
-          ReturnStatementPtr(
-            new ReturnStatement(getScope(), getLabelScope(),
-                                getLocation(), constant));
-        m_stmt->addElement(returnStmt);
-      }
-    }
-  }
-
-  if (m_params) {
-    m_params->inferAndCheck(ar, Type::Any, false);
-  }
-
-  if (m_stmt) {
-    m_stmt->inferTypes(ar);
   }
 }
 

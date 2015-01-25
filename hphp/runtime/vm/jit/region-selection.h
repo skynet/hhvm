@@ -18,28 +18,23 @@
 
 #include <memory>
 #include <utility>
-#include <boost/container/flat_map.hpp>
-#include <boost/range/iterator_range.hpp>
 #include <vector>
 
-#include "folly/Format.h"
+#include <boost/container/flat_map.hpp>
 
-#include "hphp/runtime/base/smart-containers.h"
-#include "hphp/runtime/vm/srckey.h"
+#include <folly/Format.h>
+
+#include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/type.h"
 #include "hphp/runtime/vm/jit/types.h"
+#include "hphp/runtime/vm/func.h"
+#include "hphp/runtime/vm/srckey.h"
 
-namespace HPHP {
+namespace HPHP { namespace jit {
 
-namespace JIT {
-struct Tracelet;
 struct MCGenerator;
-}
-
-namespace JIT {
-
-using boost::container::flat_map;
-using boost::container::flat_multimap;
+struct ProfData;
+struct TransCFG;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -61,7 +56,7 @@ struct RegionDesc {
   struct TypePred;
   struct ReffinessPred;
   typedef std::shared_ptr<Block> BlockPtr;
-  typedef int32_t BlockId;
+  typedef TransID BlockId;
   // BlockId Encoding:
   //   - Non-negative numbers are blocks that correspond
   //     to the start of a TransProfile translation, and therefore can
@@ -69,16 +64,51 @@ struct RegionDesc {
   //   - Negative numbers are used for other blocks, which correspond
   //     to blocks created by inlining and which don't correspond to
   //     the beginning of a profiling translation.
+  typedef boost::container::flat_set<BlockId> BlockIdSet;
+  typedef std::vector<BlockPtr> BlockVec;
 
-  template<typename... Args>
-  Block* addBlock(Args&&... args) {
-    blocks.push_back(
-      std::make_shared<Block>(std::forward<Args>(args)...));
-    return blocks.back().get();
-  }
-  void addArc(BlockId src, BlockId dst);
-  std::vector<BlockPtr> blocks;
-  std::vector<Arc>      arcs;
+  bool              empty() const;
+  SrcKey            start() const;
+  BlockPtr          entry() const;
+  const BlockVec&   blocks() const;
+  BlockPtr          block(BlockId id) const;
+  const BlockIdSet& succs(BlockId bid) const;
+  const BlockIdSet& preds(BlockId bid) const;
+  const BlockIdSet& sideExitingBlocks() const;
+  bool              isExit(BlockId bid) const;
+  Block*            addBlock(SrcKey sk, int length, Offset spOffset);
+  void              deleteBlock(BlockId bid);
+  void              renumberBlock(BlockId oldId, BlockId newId);
+  void              addArc(BlockId src, BlockId dst);
+  void              setSideExitingBlock(BlockId bid);
+  bool              isSideExitingBlock(BlockId bid) const;
+  void              append(const RegionDesc&  other);
+  void              prepend(const RegionDesc& other);
+  uint32_t          instrSize() const;
+  std::string       toString() const;
+
+  template<class Work>
+  void              forEachArc(Work w) const;
+
+ private:
+  struct BlockData {
+    BlockPtr   block;
+    BlockIdSet preds;
+    BlockIdSet succs;
+    explicit BlockData(BlockPtr b = nullptr) : block(b) {}
+  };
+
+  bool       hasBlock(BlockId id) const;
+  BlockData& data(BlockId id);
+  void       copyBlocksFrom(const RegionDesc& other,
+                            BlockVec::iterator where);
+  void       copyArcsFrom(const RegionDesc& other);
+
+  std::vector<BlockPtr>             m_blocks;
+  hphp_hash_map<BlockId, BlockData> m_data;
+  // Set of blocks that that can possibly side exit the region. This
+  // is just a hint to the region translator.
+  BlockIdSet                        m_sideExitingBlocks;
 };
 
 typedef std::shared_ptr<RegionDesc>                      RegionDescPtr;
@@ -202,10 +232,10 @@ inline bool operator==(const RegionDesc::ReffinessPred& a,
  * at various execution points, including at entry to the block.
  */
 class RegionDesc::Block {
-  typedef flat_multimap<SrcKey, TypePred> TypePredMap;
-  typedef flat_map<SrcKey, bool> ParamByRefMap;
-  typedef flat_multimap<SrcKey, ReffinessPred> RefPredMap;
-  typedef flat_map<SrcKey, const Func*> KnownFuncMap;
+  typedef boost::container::flat_multimap<SrcKey, TypePred> TypePredMap;
+  typedef boost::container::flat_map<SrcKey, bool> ParamByRefMap;
+  typedef boost::container::flat_multimap<SrcKey, ReffinessPred> RefPredMap;
+  typedef boost::container::flat_map<SrcKey, const Func*> KnownFuncMap;
 
 public:
   explicit Block(const Func* func, bool resumed, Offset start, int length,
@@ -232,6 +262,7 @@ public:
   void setId(BlockId id) {
     m_id = id;
   }
+  void setInitialSpOffset(int32_t sp) { m_initialSpOffset = sp; }
 
   /*
    * Set and get whether or not this block ends with an inlined FCall. Inlined
@@ -339,8 +370,8 @@ struct RegionContext {
   Offset bcOffset;
   Offset spOffset;
   bool resumed;
-  smart::vector<LiveType> liveTypes;
-  smart::vector<PreLiveAR> preLiveARs;
+  jit::vector<LiveType> liveTypes;
+  jit::vector<PreLiveAR> preLiveARs;
 };
 
 /*
@@ -365,11 +396,22 @@ struct RegionContext::PreLiveAR {
 
 //////////////////////////////////////////////////////////////////////
 
+template<class Work> inline
+void RegionDesc::forEachArc(Work w) const {
+  for (auto& src : m_blocks) {
+    auto srcId = src->id();
+    for (auto dstId : succs(srcId)) {
+      w(srcId, dstId);
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
+
 /*
  * Select a compilation region corresponding to the given context.
  * The shape of the region selected is controlled by
- * RuntimeOption::EvalJitRegionSelector.  If the specified shape is
- * 'legacy', then the input argument t is used to build the region.
+ * RuntimeOption::EvalJitRegionSelector.
  *
  * This function may return nullptr.
  *
@@ -377,9 +419,7 @@ struct RegionContext::PreLiveAR {
  * returning nullptr causes it to use the current level 0 tracelet
  * analyzer.  Eventually we'd like this to completely replace analyze.
  */
-RegionDescPtr selectRegion(const RegionContext& context,
-                           const Tracelet* t,
-                           TransKind kind);
+RegionDescPtr selectRegion(const RegionContext& context, TransKind kind);
 
 /*
  * Select a compilation region based on profiling information.  This
@@ -390,18 +430,40 @@ RegionDescPtr selectHotRegion(TransID transId,
                               MCGenerator* mcg);
 
 /*
- * Select a compilation region using roughly the same heuristics as the old
+ * Select a compilation region as long as possible using the given context.
+ * The region will be broken before the first instruction that attempts to
+ * consume an input with an insufficiently precise type, or after most control
+ * flow instructions.  This uses roughly the same heuristics as the old
  * analyze() framework.
+ *
+ * May return a null region if the given RegionContext doesn't have enough
+ * information to translate at least one instruction.
+ *
+ * The `allowInlining' flag should be disabled when we are selecting a tracelet
+ * whose shape will be analyzed by the InliningDecider.
  */
-RegionDescPtr selectTracelet(const RegionContext& ctx, int inlineDepth,
-                             bool profiling);
+RegionDescPtr selectTracelet(const RegionContext& ctx, bool profiling,
+                             bool allowInlining = true);
 
 /*
- * Create a compilation region corresponding to a tracelet created by
- * the old analyze() framework.
+ * Select the hottest trace beginning with triggerId.
  */
-RegionDescPtr selectTraceletLegacy(Offset initSpOffset,
-                                   const Tracelet& tlet);
+RegionDescPtr selectHotTrace(TransID triggerId,
+                             const ProfData* profData,
+                             TransCFG& cfg,
+                             TransIDSet& selectedSet,
+                             TransIDVec* selectedVec = nullptr);
+
+/*
+ * Create a region, beginning with triggerId, that includes as much of
+ * the TransCFG as possible.  Excludes multiple translations of the
+ * same SrcKey.
+ */
+RegionDescPtr selectWholeCFG(TransID triggerId,
+                             const ProfData* profData,
+                             const TransCFG& cfg,
+                             TransIDSet& selectedSet,
+                             TransIDVec* selectedVec = nullptr);
 
 /*
  * Checks whether the type predictions at the beginning of block
@@ -409,6 +471,12 @@ RegionDescPtr selectTraceletLegacy(Offset initSpOffset,
  */
 bool preCondsAreSatisfied(const RegionDesc::BlockPtr& block,
                           const PostConditions& prevPostConds);
+
+/*
+ * This function returns true for control-flow bytecode instructions that
+ * are not supported in the middle of a region yet.
+ */
+bool breaksRegion(Op opc);
 
 /*
  * Creates regions covering all existing profile translations for
@@ -419,28 +487,28 @@ void regionizeFunc(const Func*  func,
                    RegionVec&   regions);
 
 /*
- * Compare the two regions. If they differ in any way other than a being longer
- * than b, trace both regions.
- */
-void diffRegions(const RegionDesc& a, const RegionDesc& b);
-
-/*
- * Functions to map BlockIds to TransIDs.
+ * Functions to map BlockIds to the TransIDs used when the block was
+ * profiled.
  */
 bool    hasTransId(RegionDesc::BlockId blockId);
 TransID getTransId(RegionDesc::BlockId blockId);
+
+/*
+ * Checks if the given region is well-formed.
+ */
+bool check(const RegionDesc& region, std::string& error);
 
 /*
  * Debug stringification for various things.
  */
 std::string show(RegionDesc::Location);
 std::string show(RegionDesc::TypePred);
+std::string show(const PostConditions&);
 std::string show(const RegionDesc::ReffinessPred&);
 std::string show(RegionContext::LiveType);
 std::string show(RegionContext::PreLiveAR);
 std::string show(const RegionContext&);
 std::string show(const RegionDesc::Block&);
-std::string show(const RegionDesc::Arc&);
 std::string show(const RegionDesc&);
 
 //////////////////////////////////////////////////////////////////////

@@ -3,11 +3,15 @@ set(files)
 set(CXX_SOURCES)
 set(C_SOURCES)
 
-auto_sources(files "*.cpp" "${SOURCE_SUBDIRS}") 
+auto_sources(files "*.cpp" "${SOURCE_SUBDIRS}")
 list(APPEND CXX_SOURCES ${files})
 
 auto_sources(files "*.c" "${SOURCE_SUBDIRS}")
 list(APPEND C_SOURCES ${files})
+
+auto_sources(files "*.h" "{$SOURCE_SUBDIRS}")
+HHVM_PUBLIC_HEADERS(compiler ${files})
+
 
 set(ERROR_INC "analysis/core_code_error.inc")
 
@@ -42,3 +46,6 @@ add_definitions(-DALWAYS_ASSERT=1)
 ADD_LIBRARY(hphp_analysis STATIC ${CXX_SOURCES} ${C_SOURCES})
 target_link_libraries(hphp_analysis ${Boost_LIBRARIES})
 add_dependencies(hphp_analysis hphp_parser)
+if (ENABLE_COTIRE)
+  cotire(hphp_analysis)
+endif()

@@ -322,6 +322,7 @@ struct sdl {
   encodeMap      encoders;
 
   sdlFunctionMap functions;
+  std::vector<std::string> functionsOrder;
   sdlBindingMap  bindings;
   sdlFunctionMap requests;
   std::string    target_ns;
@@ -338,6 +339,8 @@ struct sdlCtx {
   xmlNodeMap      portTypes;
   xmlNodeMap      bindings;
   xmlNodeMap      services;
+  
+  ~sdlCtx();
 };
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -8,34 +8,13 @@
  *
  *)
 
+include Sys_utils
 
-open Json
-
-type error = (Pos.t * string) list
-
-exception Error of error
-
-
-let to_json (e : error) : json =
-  let elts = List.map (fun (p, w) ->
-                        let line, scol, ecol = Pos.info_pos p in
-                        JAssoc [ "descr", JString w;
-                                 "path",  JString p.Pos.pos_file;
-                                 "line",  JInt line;
-                                 "start", JInt scol;
-                                 "end",   JInt ecol
-                               ]
-                      ) e
-  in
-  JAssoc [ "message", JList elts ]
-
-let error_l message =
-  raise (Error message)
-
-let error p w =
-  raise (Error [p, w])
-
+let () = Random.self_init ()
 let debug = ref false
+let profile = ref false
+
+let log = ref (fun (_ : string)  -> ())
 
 let d s =
   if !debug
@@ -51,6 +30,11 @@ let dn s =
     print_newline();
     flush stdout;
   end
+
+module String = struct
+  include String
+  let to_string x = x
+end
 
 module type MapSig = sig
   type +'a t
@@ -78,6 +62,8 @@ module type MapSig = sig
   val choose : 'a t -> key * 'a
   val keys: 'a t -> key list
   val values: 'a t -> 'a list
+
+  val map_env: ('c -> 'a -> 'c * 'b) -> 'c -> 'a t -> 'c * 'b t
   (* use only in testing code *)
   val elements: 'a t -> (key * 'a) list
 end
@@ -106,27 +92,58 @@ module MyMap: functor (Ord: Map.OrderedType)
     let keys m = fold (fun k v acc -> k :: acc) m []
     let values m = fold (fun k v acc -> v :: acc) m []
     let elements m = fold (fun k v acc -> (k,v)::acc) m []
+
+    let map_env f env m =
+      fold (
+        fun x y (env, acc) ->
+          let env, y = f env y in
+          env, add x y acc
+      ) m (env, empty)
+
   end
 
 module SMap = MyMap(String)
 module IMap = MyMap(Ident)
 module ISet = Set.Make(Ident)
 module SSet = Set.Make(String)
+module CSet = Set.Make(Char)
 module Map = struct end
+
+(* HashSet is just a HashTable where the keys are actually the values, and we
+ * ignore the actual values inside the HashTable. *)
+module type HashSetSig = sig
+  type 'a t
+
+  val create: int -> 'a t
+  val clear: 'a t -> unit
+  val copy: 'a t -> 'a t
+  val add: 'a t -> 'a -> unit
+  val mem: 'a t -> 'a -> bool
+  val remove: 'a t -> 'a -> unit
+  val iter: ('a -> unit) -> 'a t -> unit
+  val fold: ('a -> 'b -> 'b) -> 'a t -> 'b -> 'b
+  val length: 'a t -> int
+end
+
+module HashSet = (struct
+  type 'a t = ('a, unit) Hashtbl.t
+
+  let create size = Hashtbl.create size
+  let clear set = Hashtbl.clear set
+  let copy set = Hashtbl.copy set
+  let add set x = Hashtbl.replace set x ()
+  let mem set x = Hashtbl.mem set x
+  let remove set x = Hashtbl.remove set x
+  let iter f set = Hashtbl.iter (fun k _ -> f k) set
+  let fold f set acc = Hashtbl.fold (fun k _ acc -> f k acc) set acc
+  let length set = Hashtbl.length set
+end : HashSetSig)
 
 let spf = Printf.sprintf
 
-let pmsg p s =
-  Printf.sprintf "%s\n%s\n" (Pos.string p) s
-
-let pmsg_l l =
-  let l = List.map (fun (p, e) -> pmsg p e) l in
-  List.fold_right (^) l ""
-
-let to_string (e : error) : string =
-  let buf = Buffer.create 50 in
-  List.iter (fun (p, w) -> Buffer.add_string buf (pmsg p w)) e;
-  Buffer.contents buf
+let fst3 = function x, _, _ -> x
+let snd3 = function _, x, _ -> x
+let thd3 = function _, _, x -> x
 
 let internal_error s =
   Printf.fprintf stderr
@@ -137,10 +154,24 @@ let opt f env = function
   | None -> env, None
   | Some x -> let env, x = f env x in env, Some x
 
-let default x y f =
+let opt_map f = function
+  | None -> None
+  | Some x -> Some (f x)
+
+let opt_map_default f default x =
+  match x with
+  | None -> default
+  | Some x -> f x
+
+let opt_fold_left f x y =
   match y with
   | None -> x
-  | Some y -> f y
+  | Some y -> f x y
+
+let rec cat_opts = function
+  | [] -> []
+  | Some x :: xs -> x :: cat_opts xs
+  | None :: xs -> cat_opts xs
 
 let rec lmap f env l =
   match l with
@@ -179,7 +210,6 @@ let imap_inter_list = function
   | x :: rl ->
       List.fold_left imap_inter x rl
 
-
 let partition_smap f m =
   SMap.fold (
   fun x ty (acc1, acc2) ->
@@ -188,20 +218,8 @@ let partition_smap f m =
     else acc1, SMap.add x ty acc2
  ) m (SMap.empty, SMap.empty)
 
-let smap_env f env m =
-  SMap.fold (
-  fun x y (env, acc) ->
-    let env, y = f env y in
-    env, SMap.add x y acc
- ) m (env, SMap.empty)
-
-let rec lfold f env l =
-  match l with
-  | [] -> env, []
-  | x :: rl ->
-      let env, x = f env x in
-      let env, rl = lfold f env rl in
-      env, x :: rl
+(* This is a significant misnomer... you may want fold_left_env instead. *)
+let lfold = lmap
 
 let rec lfold2 f env l1 l2 =
   match l1, l2 with
@@ -212,7 +230,7 @@ let rec lfold2 f env l1 l2 =
       let env, rl = lfold2 f env rl1 rl2 in
       env, x :: rl
 
-let rec wlfold2 f env l1 l2 =
+let wlfold2 f env l1 l2 =
   match l1, l2 with
   | [], [] -> env, []
   | [], l | l, [] -> env, l
@@ -228,13 +246,16 @@ let rec wfold_left2 f env l1 l2 =
       let env = f env x1 x2 in
       wfold_left2 f env rl1 rl2
 
+let apply_for_env_fold f env acc x =
+  let env, x = f env x in
+  env, x :: acc
+
 let rec fold_left_env f env acc l =
   match l with
   | [] -> env, acc
   | x :: rl ->
       let env, acc = f env acc x in
-      let env, acc = fold_left_env f env acc rl in
-      env, acc
+      fold_left_env f env acc rl
 
 let rec make_list f n =
   if n = 0
@@ -242,8 +263,8 @@ let rec make_list f n =
   else f() :: make_list f (n-1)
 
 let safe_ios p s =
-  try int_of_string s
-  with _ -> error p "Value is too large"
+  try Some (int_of_string s)
+  with _ -> None
 
 let sl l =
   List.fold_right (^) l ""
@@ -254,9 +275,13 @@ let maybe f env = function
   | None -> ()
   | Some x -> f env x
 
-let unsafe_opt = function
-  | None -> assert false
+(* Since OCaml usually runs w/o backtraces enabled, the note makes errors
+ * easier to debug. *)
+let unsafe_opt_note note = function
+  | None -> raise (Invalid_argument note)
   | Some x -> x
+
+let unsafe_opt x = unsafe_opt_note "unsafe_opt got None" x
 
 let liter f env l = List.iter (f env) l
 
@@ -307,13 +332,6 @@ let rec cut_after n = function
   | l when n <= 0 -> []
   | x :: rl -> x :: cut_after (n-1) rl
 
-let exec_read cmd =
-  let ic = Unix.open_process_in cmd in
-  let result = input_line ic in
-  assert (result <> "");
-  assert (Unix.close_process_in ic = Unix.WEXITED 0);
-  result
-
 let iter_n_acc n f acc =
   let acc = ref acc in
   for i = 1 to n do
@@ -324,15 +342,49 @@ let iter_n_acc n f acc =
 let set_of_list list =
   List.fold_right SSet.add list SSet.empty
 
-let cat file =
-  let chan = open_in file in
-  let rec cat_aux acc ()  =
-    let line = try Some (input_line chan) with End_of_file -> None in
-    match line with
-    | Some l -> cat_aux (l::acc) ()
-    | None -> acc
-  in
-  cat_aux [] () |> List.rev |> (fun x -> close_in chan; x)
-
 let strip_ns s =
-  if s.[0] = '\\' then String.sub s 1 ((String.length s) - 1) else s
+  if String.length s == 0 || s.[0] <> '\\' then s
+  else String.sub s 1 ((String.length s) - 1)
+
+let str_starts_with long short =
+  try
+    let long = String.sub long 0 (String.length short) in
+    long = short
+  with Invalid_argument _ ->
+    false
+
+let str_ends_with long short =
+  try
+    let len = String.length short in
+    let long = String.sub long (String.length long - len) len in
+    long = short
+  with Invalid_argument _ ->
+    false
+
+(*****************************************************************************)
+(* Same as List.iter2, except that we only iterate as far as the shortest
+ * of both lists.
+ *)
+(*****************************************************************************)
+
+let rec iter2_shortest f l1 l2 =
+  match l1, l2 with
+  | [], _ | _, [] -> ()
+  | x1 :: rl1, x2 :: rl2 -> f x1 x2; iter2_shortest f rl1 rl2
+
+(* We may want to replace this with a tail-recursive map at some point,
+ * factoring here so we have a clean way to grep. *)
+let rev_rev_map f l = List.rev (List.rev_map f l)
+
+let fold_fun_list acc fl =
+  List.fold_left (|>) acc fl
+
+let compose f g x = f (g x)
+
+let with_context ~enter ~exit ~do_ =
+  enter ();
+  let result = try do_ () with e ->
+    exit ();
+    raise e in
+  exit ();
+  result

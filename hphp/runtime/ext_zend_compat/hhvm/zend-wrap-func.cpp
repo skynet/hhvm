@@ -17,42 +17,50 @@
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-wrap-func.h"
 #include <algorithm>
 #include "hphp/runtime/base/proxy-array.h"
+#include "hphp/runtime/ext_zend_compat/php-src/Zend/zend.h"
 #include "hphp/runtime/ext_zend_compat/php-src/TSRM/TSRM.h"
+#include "hphp/runtime/ext_zend_compat/php-src/Zend/zend_exceptions.h"
+#include "hphp/runtime/ext_zend_compat/php-src/Zend/zend_globals.h"
+#include "hphp/runtime/vm/jit/translator-inline.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
-
-// TODO zPrepArgs needs to be updated so take care of
-// boxing varargs
-void zPrepArgs(ActRec* ar) {
-  // If you call a function with too few params, zend_parse_parameters will
-  // reject it, but we don't want this function boxing random slots from the
-  // stack
-  int32_t numArgs = std::min(ar->numArgs(), ar->m_func->numParams());
-  TypedValue* args = (TypedValue*)ar - 1;
-  for (int32_t i = 0; i < numArgs; ++i) {
-    TypedValue* arg = args-i;
-    zBoxAndProxy(arg);
-  }
-}
 
 void zBoxAndProxy(TypedValue* arg) {
   if (arg->m_type != KindOfRef) {
     tvBox(arg);
   }
   auto inner = arg->m_data.pref->tv();
-  if (inner->m_type == KindOfArray) {
-    inner->m_data.parr = ProxyArray::Make(inner->m_data.parr);
+  if (inner->m_type == KindOfArray && !inner->m_data.parr->isProxyArray()) {
+    ArrayData * inner_arr = inner->m_data.parr;
+    if (inner_arr->isStatic() || inner_arr->hasMultipleRefs()) {
+      ArrayData * tmp = inner_arr->copy();
+      tmp->incRefCount();
+      inner_arr->decRefAndRelease();
+      inner_arr = tmp;
+    }
+    inner->m_data.parr = ProxyArray::Make(inner_arr);
   }
 }
 
+static void zend_wrap_func_cleanup() {
+    ZendExecutionStack::popHHVMStack();
+    if (EG(exception)) {
+      zval_ptr_dtor(&EG(exception));
+      EG(exception) = NULL;
+    }
+}
+
 TypedValue* zend_wrap_func(ActRec* ar) {
+  // Sync the translator state.
+  // We need to do this before a native function calls into a C library
+  // compiled with -fomit-frame-pointer with the intention of having it call
+  // back. Normal HHVM extensions have the luxury of only when such a thing
+  // will be attempted, but we have no way to know in advance.
+  VMRegAnchor _;
+
   TSRMLS_FETCH();
   zend_ext_func native_func = reinterpret_cast<zend_ext_func>(ar->func()->nativeFuncPtr());
-
-  // Prepare the arguments and return value before they are
-  // exposed to the PHP extension
-  zPrepArgs(ar);
 
   // Using Variant so exceptions will decref them
   Variant return_value_var(Variant::NullInit{});
@@ -73,11 +81,10 @@ TypedValue* zend_wrap_func(ActRec* ar) {
   auto *return_value_ptr = &return_value->m_data.pref;
 
   // Clear any stored exception
-  ZendExceptionStore& exceptionStore = ZendExceptionStore::getInstance();
-  exceptionStore.clear();
+  zend_clear_exception(TSRMLS_C);
 
   // Invoke the PHP extension function/method
-  ZendExecutionStack::pushHHVMStack();
+  ZendExecutionStack::pushHHVMStack((void*)ar);
   try {
     native_func(
       ar->numArgs(),
@@ -88,12 +95,13 @@ TypedValue* zend_wrap_func(ActRec* ar) {
       TSRMLS_CC
     );
   } catch (...) {
-    ZendExecutionStack::popHHVMStack();
+    zend_wrap_func_cleanup();
     throw;
   }
-  ZendExecutionStack::popHHVMStack();
+  zend_wrap_func_cleanup();
 
   // If an exception was caught, rethrow it
+  ZendExceptionStore& exceptionStore = ZendExceptionStore::getInstance();
   if (!exceptionStore.empty()) {
     exceptionStore.rethrow();
   }
@@ -117,4 +125,3 @@ TypedValue* zend_wrap_func(ActRec* ar) {
 
 ///////////////////////////////////////////////////////////////////////////////
 }
-

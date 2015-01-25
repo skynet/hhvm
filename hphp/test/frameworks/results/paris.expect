@@ -28,6 +28,8 @@ ParisTest::testFilterWithArguments
 .
 ParisTest::testFilterWithNoArguments
 .
+ParisTest::testFindResultSet
+.
 ParisTest::testHasManyRelation
 .
 ParisTest::testHasManyRelationWithCustomForeignKeyName
@@ -54,6 +56,12 @@ ParisTest::testInsertData
 .
 ParisTest::testInsertingDataContainingAnExpression
 .
+ParisTest::testInvalidModelFunctionCallDoesNotRecurse
+.
+ParisTest::testInvalidORMWrapperFunctionCallDoesNotRecurse
+.
+ParisTest::testIssue80RecursiveErrorFromInstantiatingModelClass
+.
 ParisTest::testModelWithCustomTable
 .
 ParisTest::testSimpleAutoTableName
@@ -71,6 +79,8 @@ Paris\Tests\ModelPrefixingTest53::testPrefixOnAutoTableNameWithTableSpecified
 Paris\Tests\ModelPrefixingTest53::testPrefixOnHasManyThroughRelation
 .
 Paris\Tests\ModelPrefixingTest53::testPrefixOnHasManyThroughRelationWithCustomIntermediateModelAndKeyNames
+.
+Paris\Tests\ParisTest53::testIgnoredNamespaceTableName
 .
 Paris\Tests\ParisTest53::testModelWithCustomTable
 .

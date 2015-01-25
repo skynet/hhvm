@@ -15,8 +15,11 @@
 */
 
 #include "hphp/runtime/debugger/cmd/cmd_flow_control.h"
+
 #include <algorithm>
+
 #include "hphp/runtime/vm/debugger-hook.h"
+#include "hphp/runtime/vm/vm-regs.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -74,7 +77,7 @@ bool CmdFlowControl::onServer(DebuggerProxy &proxy) {
   return true;
 }
 
-// Setup the last location filter on the VM context for all offsets covered by
+// Setup the flow filter on the VM context for all offsets covered by
 // the current source line. This will short-circuit the work done in
 // phpDebuggerOpcodeHook() and ensure we don't interrupt on this source line.
 // We exclude continuation opcodes which transfer control out of the function,
@@ -83,11 +86,8 @@ bool CmdFlowControl::onServer(DebuggerProxy &proxy) {
 void CmdFlowControl::installLocationFilterForLine(InterruptSite *site) {
   // We may be stopped at a place with no source info.
   if (!site || !site->valid()) return;
-  if (g_context->m_lastLocFilter) {
-    g_context->m_lastLocFilter->clear();
-  } else {
-    g_context->m_lastLocFilter = new PCFilter();
-  }
+  RequestInjectionData &rid = ThreadInfo::s_threadInfo->m_reqInjectionData;
+  rid.m_flowFilter.clear();
   TRACE(3, "Prepare location filter for %s:%d, unit %p:\n",
         site->getFile(), site->getLine0(), site->getUnit());
   OffsetRangeVec ranges;
@@ -107,25 +107,22 @@ void CmdFlowControl::installLocationFilterForLine(InterruptSite *site) {
     }
   }
   auto func = unit->getFunc(site->getCurOffset());
-  if (func->isAsync() || func->isGenerator()) {
-    auto excludeContinuationReturns = [] (Op op) {
+  if (func->isResumable()) {
+    auto excludeResumableReturns = [] (Op op) {
       return (op != OpYield) &&
              (op != OpYieldK) &&
-             (op != OpAsyncSuspend) &&
+             (op != OpAwait) &&
              (op != OpRetC);
     };
-    g_context->m_lastLocFilter->addRanges(unit, ranges,
-                                            excludeContinuationReturns);
+    rid.m_flowFilter.addRanges(unit, ranges,
+                                      excludeResumableReturns);
   } else {
-    g_context->m_lastLocFilter->addRanges(unit, ranges);
+    rid.m_flowFilter.addRanges(unit, ranges);
   }
 }
 
 void CmdFlowControl::removeLocationFilter() {
-  if (g_context->m_lastLocFilter) {
-    delete g_context->m_lastLocFilter;
-    g_context->m_lastLocFilter = nullptr;
-  }
+  ThreadInfo::s_threadInfo->m_reqInjectionData.m_flowFilter.clear();
 }
 
 bool CmdFlowControl::hasStepOuts() {
@@ -146,12 +143,12 @@ bool CmdFlowControl::atStepOutOffset(Unit* unit, Offset o) {
 void CmdFlowControl::setupStepOuts() {
   // Existing step outs should be cleaned up before making new ones.
   assert(!hasStepOuts());
-  auto fp = g_context->getFP();
+  auto fp = vmfp();
   if (!fp) return; // No place to step out to!
   Offset returnOffset;
   bool fromVMEntry;
   while (!hasStepOuts()) {
-    fp = g_context->getPrevVMState(fp, &returnOffset, nullptr, &fromVMEntry);
+    fp = g_context->getPrevVMStateUNSAFE(fp, &returnOffset, nullptr, &fromVMEntry);
     // If we've run off the top of the stack, just return having setup no
     // step outs. This will cause cmds like Next and Out to just let the program
     // run, which is appropriate.
@@ -216,7 +213,7 @@ void CmdFlowControl::cleanupStepOuts() {
 // a StepDestination is constructed then it will not remove the
 // breakpoint when it is destructed. The move assignment operator
 // handles the transfer of ownership, and we delete the copy
-// constructor/assignment operators explictly to ensure no two
+// constructor/assignment operators explicitly to ensure no two
 // StepDestinations believe they can remove the same internal
 // breakpoint.
 //

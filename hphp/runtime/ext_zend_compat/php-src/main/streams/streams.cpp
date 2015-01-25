@@ -18,7 +18,7 @@
    |          Jim Winstead <jimw@php.net>                                 |
    +----------------------------------------------------------------------+
  */
-
+/* @nolint */
 /* $Id$ */
 
 #include "php.h"
@@ -93,57 +93,57 @@ PHPAPI php_stream_context *php_stream_context_alloc(TSRMLS_D)
 /* allocate a new stream for a particular ops */
 PHPAPI php_stream *_php_stream_alloc(php_stream_ops *ops, void *abstract, const char *persistent_id, const char *mode STREAMS_DC TSRMLS_DC) /* {{{ */
 {
-	php_stream *ret;
+  php_stream *ret;
 
-	ret = (php_stream*) pemalloc(sizeof(php_stream), persistent_id ? 1 : 0);
+  ret = (php_stream*) pemalloc(sizeof(php_stream), persistent_id ? 1 : 0);
 
-	memset(ret, 0, sizeof(php_stream));
+  memset(ret, 0, sizeof(php_stream));
 
-	ret->readfilters.stream = ret;
-	ret->writefilters.stream = ret;
+  ret->readfilters.stream = ret;
+  ret->writefilters.stream = ret;
 
 #if STREAM_DEBUG
-fprintf(stderr, "stream_alloc: %s:%p persistent=%s\n", ops->label, ret, persistent_id);
+  fprintf(stderr, "stream_alloc: %s:%p persistent=%s\n", ops->label, ret, persistent_id);
 #endif
 
-	ret->ops = ops;
-	ret->abstract = abstract;
-	ret->is_persistent = persistent_id ? 1 : 0;
-	ret->chunk_size = FG(def_chunk_size);
+  ret->ops = ops;
+  ret->abstract = abstract;
+  ret->is_persistent = persistent_id ? 1 : 0;
+  ret->chunk_size = FG(def_chunk_size);
 
-	if (FG(auto_detect_line_endings)) {
-		ret->flags |= PHP_STREAM_FLAG_DETECT_EOL;
-	}
+  if (FG(auto_detect_line_endings)) {
+    ret->flags |= PHP_STREAM_FLAG_DETECT_EOL;
+  }
 
-	if (persistent_id) {
-		zend_rsrc_list_entry le;
+  if (persistent_id) {
+    zend_rsrc_list_entry le;
 
-		le.type = le_pstream;
-		le.ptr = ret;
-		le.refcount = 0;
+    le.type = le_pstream;
+    le.ptr = ret;
+    le.refcount = 0;
 
-		if (FAILURE == zend_hash_update(&EG(persistent_list), (char *)persistent_id,
-					strlen(persistent_id) + 1,
-					(void *)&le, sizeof(le), NULL)) {
+    if (FAILURE == zend_hash_update(&EG(persistent_list), (char *)persistent_id,
+          strlen(persistent_id) + 1,
+          (void *)&le, sizeof(le), NULL)) {
 
-			pefree(ret, 1);
-			return NULL;
-		}
-	}
+      pefree(ret, 1);
+      return NULL;
+    }
+  }
 
-	ret->rsrc_id = ZEND_REGISTER_RESOURCE(NULL, ret, persistent_id ? le_pstream : le_stream);
-	strlcpy(ret->mode, mode, sizeof(ret->mode));
+  ret->rsrc_id = ZEND_REGISTER_RESOURCE(NULL, ret, persistent_id ? le_pstream : le_stream);
+  strlcpy(ret->mode, mode, sizeof(ret->mode));
 
-	ret->wrapper          = NULL;
-	ret->wrapperthis      = NULL;
-	ret->wrapperdata      = NULL;
-	ret->stdiocast        = NULL;
-	ret->orig_path        = NULL;
-	ret->context          = NULL;
-	ret->readbuf          = NULL;
-	ret->enclosing_stream = NULL;
+  ret->wrapper          = NULL;
+  ret->wrapperthis      = NULL;
+  ret->wrapperdata      = NULL;
+  ret->stdiocast        = NULL;
+  ret->orig_path        = NULL;
+  ret->context          = NULL;
+  ret->readbuf          = NULL;
+  ret->enclosing_stream = NULL;
 
-	return ret;
+  return ret;
 }
 /* }}} */
 
@@ -164,14 +164,14 @@ PHPAPI int _php_stream_stat(php_stream *stream, php_stream_statbuf *ssb TSRMLS_D
   // kinda weird this is on the wrapper not the file
   auto path = stream->hphp_file->getName();
   auto w = HPHP::Stream::getWrapperFromURI(path);
-  return w->stat(path, &ssb->sb);
+  return w ? w->stat(path, &ssb->sb) : -1;
 }
 
 /* If buf == NULL, the buffer will be allocated automatically and will be of an
  * appropriate length to hold the line, regardless of the line length, memory
  * permitting */
 PHPAPI char *_php_stream_get_line(php_stream *stream, char *buf, size_t maxlen,
-		size_t *returned_len TSRMLS_DC)
+    size_t *returned_len TSRMLS_DC)
 {
   auto s = stream->hphp_file->readLine(maxlen);
   if (s.empty()) {
@@ -198,7 +198,7 @@ PHPAPI php_stream *_php_stream_opendir(char *path, int options, php_stream_conte
   }
 
   // TODO this leaks
-  php_stream *stream = HPHP::smart_new<php_stream>(dir);
+  php_stream *stream = HPHP::smart_new<php_stream>(dir.get());
   stream->hphp_dir->incRefCount();
   return stream;
 }
@@ -284,20 +284,21 @@ PHPAPI int _php_stream_cast(php_stream *stream, int castas, void **ret, int show
 
 PHPAPI php_stream *_php_stream_open_wrapper_ex(char *path, const char *mode, int options, char **opened_path, php_stream_context *context STREAMS_DC TSRMLS_DC) {
   HPHP::Stream::Wrapper* w = HPHP::Stream::getWrapperFromURI(path);
-  HPHP::File* file = w->open(path, mode, options, context);
+  if (!w) return nullptr;
+  auto file = w->open(path, mode, options, context);
   if (!file) {
     return nullptr;
   }
   // TODO this leaks
-  php_stream *stream = HPHP::smart_new<php_stream>(file);
+  php_stream *stream = HPHP::smart_new<php_stream>(file.get());
   stream->hphp_file->incRefCount();
 
-  if (auto urlFile = dynamic_cast<HPHP::UrlFile*>(file)) {
+  if (auto urlFile = dynamic_cast<HPHP::UrlFile*>(file.get())) {
     // Why is there no ZVAL_ARRAY?
     MAKE_STD_ZVAL(stream->wrapperdata);
     Z_TYPE_P(stream->wrapperdata) = IS_ARRAY;
     Z_ARRVAL_P(stream->wrapperdata) = HPHP::ProxyArray::Make(
-      urlFile->getWrapperMetaData().detach()
+      urlFile->getWrapperMetaData().getArrayData()
     );
   } else {
     stream->wrapperdata = nullptr;

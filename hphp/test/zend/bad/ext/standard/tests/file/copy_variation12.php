@@ -23,6 +23,8 @@ var_dump( filesize($dest) );
 
 echo "*** Done ***\n";
 ?>
+
+<?php error_reporting(0); ?>
 <?php
 rmdir(dirname(__FILE__)."/copy_variation12");
 ?>

@@ -17,10 +17,13 @@
 #define incl_HPHP_JIT_SERVICE_REQUESTS_X64_H_
 
 #include "hphp/runtime/vm/jit/service-requests.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 #include "hphp/util/asm-x64.h"
 #include "hphp/util/data-block.h"
 
-namespace HPHP { namespace JIT { namespace X64 {
+namespace HPHP { namespace jit {
+struct Vout;
+namespace x64 {
 
 /*
  * emitServiceReqWork --
@@ -31,29 +34,32 @@ namespace HPHP { namespace JIT { namespace X64 {
  *   the TC.
  *
  *   Return value is a destination; we emit the bulky service
- *   request code into astubs.
+ *   request code into acold.
  *
  *   Returns a continuation that will run after the arguments have been
  *   emitted. This is gross, but is a partial workaround for the inability
  *   to capture argument packs in the version of gcc we're using.
  */
-TCA emitServiceReqWork(CodeBlock& cb, TCA start, bool persist, SRFlags flags,
+TCA emitServiceReqWork(CodeBlock& cb, TCA start, SRFlags flags,
                        ServiceRequest req, const ServiceReqArgVec& argInfo);
 
 /*
- * "cb" may be either the main section or stubs section.
+ * "cb" may be either the main section or frozen section.
  */
-void emitBindSideExit(CodeBlock& cb, CodeBlock& stubs, JIT::ConditionCode cc,
-                      SrcKey dest);
-void emitBindJcc(CodeBlock& cb, CodeBlock& stubs, JIT::ConditionCode cc,
-                 SrcKey dest);
-void emitBindJmp(CodeBlock& cb, CodeBlock& stubs, SrcKey dest);
+void emitBindJmp(CodeBlock& cb, CodeBlock& frozen, SrcKey dest,
+                 TransFlags trflags = TransFlags{});
+void emitBindJcc(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
+                 SrcKey dest, TransFlags trflags = TransFlags{});
 
 /*
- * Returns the amount by which rVmSp should be adjusted.
+ * Similar to the emitBindJ() series.  The address of the jmp is returned.
  */
-int32_t emitBindCall(CodeBlock& mainCode, CodeBlock& stubsCode,
-                     SrcKey srcKey, const Func* funcd, int numArgs);
+TCA emitRetranslate(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
+                    SrcKey dest, TransFlags trflags);
+
+// An intentionally funny-looking-in-core-dumps constant for uninitialized
+// instruction pointers.
+constexpr uint64_t kUninitializedRIP = 0xba5eba11acc01ade;
 
 }}}
 

@@ -18,28 +18,31 @@
 #include <algorithm>
 #include <utility>
 
-#include "folly/Lazy.h"
-#include "folly/Optional.h"
-#include "folly/MapUtil.h"
+#include <folly/Lazy.h>
+#include <folly/Optional.h>
+#include <folly/MapUtil.h>
 
-#include "hphp/runtime/base/smart-containers.h"
-#include "hphp/util/trace.h"
 #include "hphp/runtime/vm/jit/block.h"
 #include "hphp/runtime/vm/jit/cfg.h"
+#include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/frame-state.h"
-#include "hphp/runtime/vm/jit/ir.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
 #include "hphp/runtime/vm/jit/ir-instruction.h"
 #include "hphp/runtime/vm/jit/ir-unit.h"
+#include "hphp/runtime/vm/jit/mc-generator.h"
 #include "hphp/runtime/vm/jit/print.h"
-#include "hphp/runtime/vm/jit/simplifier.h"
+#include "hphp/runtime/vm/jit/punt.h"
+#include "hphp/runtime/vm/jit/simplify.h"
 #include "hphp/runtime/vm/jit/ssa-tmp.h"
 #include "hphp/runtime/vm/jit/state-vector.h"
 #include "hphp/runtime/vm/jit/timer.h"
 #include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/jit/analysis.h"
+#include "hphp/util/trace.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
-TRACE_SET_MOD(hhir);
+TRACE_SET_MOD(hhir_refcount);
 
 namespace {
 
@@ -82,7 +85,7 @@ struct IdMap {
 
  private:
   StateVector<IRInstruction, Point> m_ids;
-  smart::vector<IRInstruction*> m_insts;
+  jit::vector<IRInstruction*> m_insts;
 };
 
 /*
@@ -91,7 +94,7 @@ struct IdMap {
  * just a single id because it's possible for the same pending reference to
  * come from different instructions in different control flow paths.
  */
-typedef smart::flat_set<Point> IncSet;
+typedef jit::flat_set<Point> IncSet;
 std::string show(const IncSet& incs, const IdMap& ids) {
   std::string ret;
   auto* separator = "";
@@ -121,17 +124,58 @@ struct Value {
     return pendingIncs.empty() && realCount == 0 && !fromLoad;
   }
 
-  void pessimize() {
-    realCount = 0;
-    pendingIncs.clear();
-  }
+  /*
+   * Merge other's state with this state.
+   *
+   * Precondition:
+   * If realCounts do not match, the lesser value must be fromLoad.  The idea
+   * is that fromLoad allows us to make more aggressive assumptions, so we
+   * shouldn't have both a higher count and fromLoad.
+   *
+   * For an example of where this is OK, consider:
+   *
+   * B0:
+   *  t1 = LdLoc<0>
+   *       IncRef t1
+   *       DecRef t2
+   *       JmpNZ B2
+   * B1:
+   *       IncRef t1
+   *       SpillStack t1
+   *       TakeStk t1
+   *       DecRef t1
+   * B2:
+   *       ...
+   *
+   * The count of t1 at B2 will be 1 if coming from B0, and 0 if coming from
+   * B1, due to the SpillStack.  However, the TakeStk marks t1 as fromLoad,
+   * which lets us know that there's at least one surviving reference, so we
+   * can move forward assuming the max of the two.
+   *
+   * Postconditions:
+   * 1. realCount becomes the max of the incoming value;
+   * 2. fromLoad is set if either incoming value has it;
+   * 3. pendingIncs is truncated to the size of the smaller of the two, then
+   *    the sets at each index are merged. The two can differ when a value's
+   *    count is observed in one branch of a conditional but not the other, and
+   *    it's safe because any differences are resolved in mergeStates().
+   */
+  void merge(const Value& other, const IRUnit& unit) {
+    auto showFailure = [&] {
+      return folly::format(
+        "Failed to merge values in unit:\n{}\n{}\n{}\n",
+        show(*this), show(other), unit
+      ).str();
+    };
 
-  /* Merge other's state with this state. realCount becomes the minimum from
-   * the two. pendingIncs is truncated to the size of the smaller of the two,
-   * then the sets at each index are merged. */
-  void merge(const Value& other) {
-    assert(fromLoad == other.fromLoad);
-    realCount = std::min(realCount, other.realCount);
+    always_assert_log(
+      IMPLIES(realCount > other.realCount, other.fromLoad) &&
+      IMPLIES(realCount < other.realCount, fromLoad),
+      showFailure);
+
+    fromLoad = fromLoad || other.fromLoad;
+    realCount = std::max(realCount, other.realCount);
+
     auto minSize = std::min(pendingIncs.size(), other.pendingIncs.size());
     pendingIncs.resize(minSize);
     for (unsigned i = 0; i < minSize; ++i) {
@@ -154,6 +198,10 @@ struct Value {
     return incs;
   }
 
+  void clearPendingIncs() {
+    pendingIncs.clear();
+  }
+
   /* realCount is the number of live references currently owned by the
    * jit. Since it represents references with lifetimes we can reliably track,
    * it's also used as a lower bound of the refcount of the object. */
@@ -162,7 +210,7 @@ struct Value {
   /* fromLoad represents whether or not the value came from a load
    * instruction. This optimization is based on the idea of producing and
    * consuming references, and most of our load instructions sometimes produce
-   * a reference and sometimes don't. Rather that splitting up all the loads
+   * a reference and sometimes don't. Rather than splitting up all the loads
    * into two flavors, we allow consumption of a value from a load even if
    * there appear to be no live references. */
   bool fromLoad;
@@ -173,7 +221,7 @@ struct Value {
   /* pendingIncs contains ids of IncRef instructions that have yet to be placed
    * before an observer. The size of pendingIncs represents the delta between
    * the real count and the optimized count. */
-  smart::vector<IncSet> pendingIncs;
+  jit::vector<IncSet> pendingIncs;
 };
 
 std::string show(const Value& state) {
@@ -202,14 +250,14 @@ struct Frame {
   {}
 
   /* The canonical form of $this. For the outermost frame of the trace, this
-   * will be nullptr if we haven't loaded $this yet, or a LdThis if we
-   * have. For inlined frames, this will be the canonical SSATmp* for the $this
-   * pointer given to the SpillFrame. */
+   * will be nullptr if we haven't loaded the context yet, or a pointer to the
+   * first CastCtxThis we saw. For inlined frames, this will be the canonical
+   * SSATmp* for the $this pointer given to the SpillFrame. */
   SSATmp* mainThis;
 
   /* Latest live temp holding $this. This is updated whenever we see a new
-   * LdThis in a frame, and it's set to nullptr after any instructions that
-   * kill all live temps (calls, mostly). */
+   * CastCtxThis in a frame, and it's set to nullptr after any instructions
+   * that kill all live temps (calls, mostly). */
   SSATmp* currentThis;
 
   bool operator==(const Frame b) const {
@@ -254,7 +302,7 @@ struct FrameStack {
   /* Pop an inlined frame to represent an InlineReturn, forgetting what we know
    * about its $this pointer. */
   void popInline(const IRInstruction* fpInst) {
-    assert(frameRoot(fpInst) == fpInst);
+    assert(fpInst->is(DefInlineFP));
     assert(live.size() >= 2);
     auto it = live.find(fpInst);
     assert(it != live.end());
@@ -280,18 +328,18 @@ struct FrameStack {
   }
 
   /* Map from the instruction defining the frame to a Frame object. */
-  smart::hash_map<const IRInstruction*, Frame> live;
+  jit::flat_map<const IRInstruction*, Frame> live;
 
   /* Similar to live, but for frames that have been popped. We keep track of
    * these because we often refer to a LdThis from an inlined function after
    * it's returned. */
-  smart::hash_map<const IRInstruction*, Frame> dead;
+  jit::flat_map<const IRInstruction*, Frame> dead;
 
   /* Frames that have been pushed but not activated. */
-  smart::vector<Frame> preLive;
+  jit::vector<Frame> preLive;
 };
 
-typedef smart::hash_map<SSATmp*, SSATmp*> CanonMap;
+typedef jit::flat_map<SSATmp*, SSATmp*> CanonMap;
 
 /*
  * State holds all the information we care about during the analysis pass, and
@@ -300,7 +348,7 @@ typedef smart::hash_map<SSATmp*, SSATmp*> CanonMap;
 struct State {
   /* values maps from live SSATmps to the currently known state about the
    * value. */
-  smart::hash_map<SSATmp*, Value> values;
+  jit::flat_map<SSATmp*, Value> values;
 
   /* canon keeps track of values that have been through passthrough
    * instructions, like CheckType and AssertType. */
@@ -355,11 +403,16 @@ struct IncomingState {
     , state(s)
   {}
 
+  IncomingState(const Block* f, State&& s)
+    : from(f)
+    , state(std::move(s))
+  {}
+
   const Block* from;
   State state;
 };
-typedef smart::vector<IncomingState> IncomingStateVec;
-typedef smart::hash_map<const Block*, IncomingStateVec> SavedStates;
+typedef jit::vector<IncomingState> IncomingStateVec;
+typedef jit::hash_map<const Block*, IncomingStateVec> SavedStates;
 
 /*
  * One SinkPoint exists for each optimizable IncRef in each control flow path
@@ -388,16 +441,16 @@ struct SinkPoint {
   SSATmp* value;
 };
 
-typedef smart::flat_multimap<IncSet, SinkPoint> SinkPoints;
+typedef jit::flat_multimap<IncSet, SinkPoint> SinkPoints;
 
 struct SinkPointsMap {
   // Maps values to SinkPoints for their IncRefs
-  smart::hash_map<SSATmp*, SinkPoints> points;
+  jit::hash_map<SSATmp*, SinkPoints> points;
 
   // Maps ids of DecRef instructions to the incoming lower bound of the object's
   // refcount. Only DecRefs that cannot go to zero are in this map, so there
   // will be no entries with a value of less than 2.
-  smart::hash_map<Point, int> decRefs;
+  jit::hash_map<Point, int> decRefs;
 };
 
 /*
@@ -411,11 +464,11 @@ Point idForEdge(const Block* from, const Block* to, const IdMap& ids) {
   assert(next || taken);
 
   auto before = [&](const IRInstruction& inst) {
-    ITRACE(3, "id for B{} -> B{} is before {}\n", from->id(), to->id(), inst);
+    ITRACE(6, "id for B{} -> B{} is before {}\n", from->id(), to->id(), inst);
     return ids.before(inst);
   };
   auto after = [&](const IRInstruction& inst) {
-    ITRACE(3, "id for B{} -> B{} is after {}\n", from->id(), to->id(), inst);
+    ITRACE(6, "id for B{} -> B{} is after {}\n", from->id(), to->id(), inst);
     return ids.after(inst);
   };
 
@@ -439,6 +492,9 @@ Point idForEdge(const Block* from, const Block* to, const IdMap& ids) {
   }
 }
 
+const StaticString s_get_defined_vars("get_defined_vars"),
+  s_get_defined_vars_SystemLib("__SystemLib\\get_defined_vars");
+
 /*
  * SinkPointAnalyzer is responsible for inspecting a trace and determining two
  * things: the latest safe point to sink each IncRef to, and which DecRefs
@@ -446,9 +502,10 @@ Point idForEdge(const Block* from, const Block* to, const IdMap& ids) {
  */
 struct SinkPointAnalyzer : private LocalStateHook {
   SinkPointAnalyzer(const BlockList* blocks, const IdMap* ids,
-                    IRUnit& unit, FrameState&& frameState)
+                    IRUnit& unit, FrameStateMgr&& frameState)
     : m_unit(unit)
     , m_blocks(*blocks)
+    , m_loopHeaders(findLoopHeaders(unit))
     , m_block(nullptr)
     , m_inst(nullptr)
     , m_ids(*ids)
@@ -466,14 +523,37 @@ struct SinkPointAnalyzer : private LocalStateHook {
       ITRACE(3, "entering B{}\n", block->id());
       Indent _i;
 
+      auto const oldBlock = m_block;
+
+      // mergeStates depends on us having set m_block as the new block.
       m_block = block;
-      m_frameState.startBlock(block);
 
       if (block != m_blocks.front()) {
         assert(m_savedStates.count(block) == 1);
-        m_state = mergeStates(m_savedStates[block]);
+        m_state = mergeStates(std::move(m_savedStates[block]));
         m_savedStates.erase(block);
       }
+
+      // Hack so that FrameStateMgr::startBlock can place sink points correctly
+      // if it ends up consuming locals.
+      if (m_loopHeaders.count(block) != 0) {
+        // oldBlock must be the loop pre-header as we're processing the unit
+        // in reverse postorder.
+        //
+        // TODO(#4887242): Get pre-header from Loop data structure.
+        assert(oldBlock->numSuccs() == 1);
+        assert(oldBlock->taken() == block);
+
+        // Need to set m_inst as startBlock will consume values upon entering
+        // a loop header, and it will need to know where to place the sink
+        // points.
+        m_inst = &oldBlock->back();
+      }
+
+      // startBlock will set local values to nullptr if we're entering a loop,
+      // so this has to happen after we merge in our incoming states.
+      m_frameState.startBlock(block, block->front().marker());
+      m_inst = nullptr;
 
       for (auto& inst : *block) {
         m_inst = &inst;
@@ -481,18 +561,8 @@ struct SinkPointAnalyzer : private LocalStateHook {
       }
       m_inst = nullptr;
 
-      // Propagate current state to the next block, if one exists. If we have a
-      // taken branch, that information will be propagated in processInst().
       auto* next = block->next();
       auto* taken = block->taken();
-      if (next) {
-        ITRACE(3, "propagating B{}'s state to next - B{}\n",
-               m_block->id(), next->id());
-        Indent _i;
-        FTRACE(3, "{}", show(m_state));
-        m_savedStates[next].emplace_back(block, m_state);
-      }
-
       if (!next && !taken) {
         // This block is terminal. Ensure that all live references have been
         // accounted for.
@@ -502,6 +572,9 @@ struct SinkPointAnalyzer : private LocalStateHook {
 
         auto showFailure = [&]{
           std::string ret;
+          if (auto const rd = m_unit.context().regionDesc) {
+            ret += show(*rd) + "\n";
+          }
           ret += folly::format("Unconsumed reference(s) leaving B{}\n",
                                block->id()).str();
           ret += show(m_state);
@@ -516,6 +589,16 @@ struct SinkPointAnalyzer : private LocalStateHook {
                             valState.second.optDelta() == 0,
                             showFailure);
         }
+      }
+
+      // Propagate current state to the next block, if one exists. If we have a
+      // taken branch, that information will be propagated in processInst().
+      if (next) {
+        ITRACE(3, "propagating B{}'s state to next - B{}\n",
+               m_block->id(), next->id());
+        Indent _i;
+        FTRACE(3, "{}", show(m_state));
+        m_savedStates[next].emplace_back(block, std::move(m_state));
       }
       FTRACE(3, "\n");
 
@@ -537,10 +620,10 @@ struct SinkPointAnalyzer : private LocalStateHook {
   };
   struct IncomingValue {
     Value value;
-    smart::vector<IncomingBranch> inBlocks;
+    jit::vector<IncomingBranch> inBlocks;
   };
 
-  State mergeStates(const IncomingStateVec& states) {
+  State mergeStates(IncomingStateVec&& states) {
     DEBUG_ONLY auto doTrace = [&] {
       ITRACE(3, "merging {} state(s) into B{}\n", states.size(), m_block->id());
       for (DEBUG_ONLY auto const& inState : states) {
@@ -553,33 +636,92 @@ struct SinkPointAnalyzer : private LocalStateHook {
     ONTRACE(3, doTrace());
 
     assert(!states.empty());
-    // Short circuit the easy, common case: one incoming state
-    if (states.size() == 1) return states.front().state;
-
-    // We start by building a map from values to their merged incoming state
-    // and which blocks provide information about the value.
+    /*
+     * Short circuit the easy, common case: one incoming state.  (This
+     * is just to save JIT time.)
+     *
+     * Except if it's a DefLabel---there could still be unconsumed
+     * references that need to be forwarded through the DefLabel (for
+     * example in the case of a control flow diamond where one side
+     * was optimized away because the branch turned into a Nop).
+     */
+    if (states.size() == 1 && !m_block->front().is(DefLabel)) {
+      return std::move(states.front().state);
+    }
 
     auto const& firstFrames = states.front().state.frames;
-    smart::hash_map<SSATmp*, IncomingValue> mergedValues;
+    State retState;
+    retState.canon = mergeCanons(states);
+    retState.frames = firstFrames;
+
+    // If the current block begins with a DefLabel, we start by taking
+    // unconsumed references for each dest of the label that produces a
+    // reference.
+    if (m_block->front().is(DefLabel)) {
+      auto& label = m_block->front();
+      auto& refsVec = m_unit.labelRefs().at(&label);
+      always_assert(refsVec.size() == label.numDsts());
+
+      ITRACE(3, "producing refs for dests of {}\n", label);
+      Indent _i;
+      for (auto i = 0U, n = label.numDsts(); i < n; ++i) {
+        if (label.dst(i)->type().notCounted()) continue;
+
+        auto refs = refsVec[i];
+        if (refs == 0) continue;
+
+        ITRACE(3, "dest {} produces {} ref(s)\n", i, refs);
+        Indent _i;
+        m_block->forEachSrc(
+          i, [&](IRInstruction* jmp, SSATmp* src) {
+            if (src->type().notCounted()) return;
+
+            auto it = find_if(states.begin(), states.end(),
+                              [jmp](const IncomingState& s) {
+                                return s.from == jmp->block();
+                              });
+            always_assert(it != states.end());
+            src = canonical(src);
+            auto& valState = it->state.values[src];
+            always_assert(valState.optDelta() == 0);
+            ITRACE(3, "consuming refs from {} | {}\n",
+                   show(valState), *src->inst());
+            if (valState.realCount >= refs) {
+              valState.realCount -= refs;
+            } else {
+              always_assert(valState.fromLoad);
+              valState.realCount = 0;
+            }
+          });
+
+        retState.values[label.dst(i)].realCount = refs;
+      }
+    }
+
+    // Now, we build a map from values to their merged incoming state and which
+    // blocks provide information about the value.
+    jit::hash_map<SSATmp*, IncomingValue> mergedValues;
     for (auto const& inState : states) {
       if (inState.state.frames != firstFrames) {
+        // Task #5216936: add support for merging states with
+        // different FrameStacks, and get rid of the TRACE_PUNT below.
         if (RuntimeOption::EvalHHIRBytecodeControlFlow) {
-          throw ControlFlowFailedExc(__FILE__, __LINE__);
+          TRACE_PUNT("refcount-opts needs support for merging states with "
+                     "different FrameStacks");
         }
         always_assert(false &&
           "merging states with different FrameStacks is not supported");
       }
 
       for (auto const& inPair : inState.state.values) {
+        if (inPair.second.empty()) continue;
+
         auto* value = inPair.first;
         assert(!value->inst()->isPassthrough());
         const bool existed = mergedValues.count(value);
         auto& mergedState = mergedValues[value];
-
-        // If the value was already provided by another block, merge this
-        // block's state in.
         if (existed) {
-          mergedState.value.merge(inPair.second);
+          mergedState.value.merge(inPair.second, m_unit);
         } else {
           mergedState.value = inPair.second;
         }
@@ -589,20 +731,26 @@ struct SinkPointAnalyzer : private LocalStateHook {
       }
     }
 
-    State retState;
-    retState.canon = mergeCanons(states);
-    retState.frames = firstFrames;
-
     // Now, for each incoming value, insert it into the resulting state. If
     // there is a difference in a value's state between incoming branches,
     // resolve it by inserting sink points on the appropriate incoming edges.
     for (auto& pair : mergedValues) {
       auto mergedState = pair.second.value;
 
-      // If the value wasn't provided by every incoming branch, we have to
-      // completely resolve it in all incoming branches.
+      // If the value wasn't provided by every incoming branch, we're hosed
+      // unless it was just fromLoad in some branches.
       if (pair.second.inBlocks.size() < states.size()) {
-        mergedState.pessimize();
+        for (auto& inBlock : pair.second.inBlocks) {
+          always_assert_flog(
+            inBlock.value.realCount == 0 && inBlock.value.optDelta() == 0,
+            "While merging incoming states for B{}, value {} not provided by"
+            " all preds but has nontrivial state `{}' from B{}."
+            "\n\n{:-^80}\n{}{:-^80}\n",
+            m_block->id(), *pair.first->inst(),
+            show(inBlock.value), inBlock.from->id(),
+            " unit ", m_unit, ""
+          );
+        }
       }
 
       auto* incVal =
@@ -616,8 +764,9 @@ struct SinkPointAnalyzer : private LocalStateHook {
         while (inState.optDelta() > mergedDelta) {
           ITRACE(3, "Inserting sink point on edge B{} -> B{}\n",
                  inBlock.from->id(), m_block->id());
-          m_ret.points[pair.first].insert(std::make_pair(inState.popRef(),
-                                           SinkPoint(insertId, incVal, false)));
+          m_ret.points[pair.first].insert(
+            std::make_pair(inState.popRef(),
+                           SinkPoint(insertId, incVal, false)));
         }
       }
 
@@ -629,6 +778,9 @@ struct SinkPointAnalyzer : private LocalStateHook {
       }
     }
 
+    ITRACE(3, "returning state:\n");
+    Indent _i;
+    FTRACE(3, "{}", show(retState));
     return retState;
   }
 
@@ -661,7 +813,7 @@ struct SinkPointAnalyzer : private LocalStateHook {
 
     // First, build a map from canonical values to the values they map to and
     // how many incoming branches have the mapped value available.
-    smart::flat_map<SSATmp*, smart::flat_map<SSATmp*, int>> mergedCanon;
+    jit::flat_map<SSATmp*, jit::flat_map<SSATmp*, int>> mergedCanon;
 
     for (auto const& inState : states) {
       for (auto const& pair : inState.state.canon) {
@@ -676,7 +828,7 @@ struct SinkPointAnalyzer : private LocalStateHook {
       auto* trueRoot = pair.first;
       // Build a list of versions of this value that exist in all incoming
       // branches.
-      smart::flat_set<SSATmp*> tmps;
+      jit::flat_set<SSATmp*> tmps;
       for (auto const& countPair : pair.second) {
         if (countPair.first != trueRoot && countPair.second == states.size()) {
           tmps.insert(countPair.first);
@@ -697,7 +849,7 @@ struct SinkPointAnalyzer : private LocalStateHook {
       // We found more than one value coming in from all branches, so find the
       // most derived one. This is the one temp that doesn't appear as an
       // ancestor of any of the others.
-      smart::flat_set<SSATmp*> ancestors;
+      jit::flat_set<SSATmp*> ancestors;
       for (auto* val : tmps) {
         // trueRoot shouldn't be in the set
         assert(val->inst()->isPassthrough());
@@ -741,8 +893,6 @@ struct SinkPointAnalyzer : private LocalStateHook {
     Indent _i;
 
     auto const nSrcs = m_inst->numSrcs();
-    auto const nDsts = m_inst->numDsts();
-    m_frameState.setMarker(m_inst->marker());
 
     if (auto* taken = m_inst->taken()) {
       // If an instruction's branch is ever taken, none of its sources will be
@@ -765,11 +915,11 @@ struct SinkPointAnalyzer : private LocalStateHook {
       m_takenState = nullptr;
     }
 
-    if (m_inst->is(IncRef, IncRefCtx)) {
+    if (m_inst->is(IncRef, IncRefCtx, TakeRef)) {
       auto* src = m_inst->src(0);
 
-      // We only consider an IncRef optimizable if it's not an IncRefCtx and
-      // the value doesn't have an optimized count of 0. This prevents any
+      // We only consider an IncRef optimizable if it's not an IncRefCtx/TakeRef
+      // and the value doesn't have an optimized count of 0. This prevents any
       // subsequent instructions from taking in a source with count 0.
       if (src->type().maybeCounted()) {
         auto& valState = m_state.values[canonical(src)];
@@ -783,9 +933,9 @@ struct SinkPointAnalyzer : private LocalStateHook {
         }
         ITRACE(3, "{}\n", show(m_state.values[canonical(src)]));
       }
-    } else if (m_inst->is(TakeStack)) {
-      // TakeStack is used to indicate that we've logically popped a value off
-      // the stack, in place of a LdStack.
+    } else if (m_inst->is(TakeStk)) {
+      // TakeStk is used to indicate that we've logically popped a value off
+      // the stack, in place of a LdStk.
       auto* src = m_inst->src(0);
       if (src->type().maybeCounted()) {
         m_state.values[canonical(src)].fromLoad = true;
@@ -797,52 +947,43 @@ struct SinkPointAnalyzer : private LocalStateHook {
       for (uint32_t i = 0; i < nSrcs; ++i) {
         resolveValue(m_inst->src(i));
       }
-    } else if (m_inst->is(DefLabel)) {
-      // Values produced by a label take the pessimistic combinations of
-      // their incoming values.
-      constexpr int32_t kInfCount = 1 << 30;
-      auto minCount = kInfCount;
-      auto fromLoad = false;
-      for (uint32_t i = 0; i < nDsts; ++i) {
-        m_block->forEachSrc(i, [&](const IRInstruction* inst, SSATmp* src) {
-          src = canonical(src);
-          if (src->type().notCounted()) return;
-
-          auto const& valState = m_state.values[src];
-          minCount = std::min(minCount, valState.realCount);
-          fromLoad = fromLoad || valState.fromLoad;
-        });
-
-        assert(IMPLIES(fromLoad, minCount != kInfCount));
-        if (minCount != kInfCount) {
-          m_state.values.emplace(m_inst->dst(i),
-                                 Value(minCount, fromLoad));
-        }
-      }
+    } else if (m_inst->is(BeginCatch)) {
+      consumeExceptional(*m_block->preds().front().inst());
     } else if (m_inst == &m_block->back() && m_block->isExit() &&
                // Make sure it's not a RetCtrl from Ret{C,V}
                (!m_inst->is(RetCtrl) ||
-                m_inst->extra<RetCtrlData>()->suspendingResumed) &&
-               // The EndCatch in FunctionExitSurpriseHook's catch block is
-               // special: it happens after locals and $this have been
-               // decreffed, so we don't want to do the normal cleanup
-               !(m_inst->is(EndCatch) &&
-                 m_block->preds().front().inst()
-                   ->is(FunctionExitSurpriseHook) &&
-                 !m_block->preds().front().inst()
-                   ->extra<RetCtrlData>()->suspendingResumed)) {
-      // When leaving a trace, we need to account for all live references in
-      // locals and $this pointers.
-      consumeAllLocals();
-      consumeAllFrames();
+                m_inst->extra<RetCtrlData>()->suspendingResumed)) {
+      // The EndCatch in ReturnHook or SuspendHookE's catch block is special:
+      // it happens after locals and $this have been decreffed, so we don't
+      // want to do the normal cleanup.  (XXX: We ought to treat this as a
+      // property of the SuspendHookE and ReturnHook instructions rather than
+      // the EndCatch, but we don't right now.)
+      auto const specialCatch = [&]() -> bool {
+        if (!m_inst->is(EndCatch)) return false;
+        auto const pred = m_block->preds().front().inst();
+        return pred->is(ReturnHook, SuspendHookE);
+      }();
+      if (!specialCatch) {
+        consumeAllLocals();
+        consumeAllFrames();
+      }
     } else if (m_inst->is(GenericRetDecRefs, NativeImpl)) {
-      consumeAllLocals();
-    } else if (m_inst->is(CreateCont, CreateAFWH)) {
-      consumeAllLocals();
+      consumeCurrentLocals();
+    } else if (m_inst->is(CreateCont)) {
+      always_assert(false && "CreateCont appeared in non-generator");
+    } else if (m_inst->is(CreateAFWH)) {
       consumeInputs();
+      consumeCurrentLocals();
+      auto frame = m_inst->src(0)->inst();
+      consumeFrame(m_state.frames.live.at(frame));
       defineOutputs();
     } else if (m_inst->is(DecRefLoc)) {
       consumeLocal(m_inst->extra<DecRefLoc>()->locId);
+    } else if (m_inst->is(DecRefThis)) {
+      // This only happens during a RetC, and it happens instead of a normal
+      // DecRef on $this.
+      auto frame = m_inst->src(0)->inst();
+      consumeFrame(m_state.frames.live.at(frame));
     } else {
       // All other instructions take the generic path.
       consumeInputs();
@@ -852,16 +993,22 @@ struct SinkPointAnalyzer : private LocalStateHook {
     m_frameState.update(m_inst);
   }
 
-  /* JIT::canonical() traces through passthrough instructions to get the root
+  /* jit::canonical() traces through passthrough instructions to get the root
    * of a value. Since we're tracking the state of inlined frames in the trace,
-   * there are often cases where the root value for a LdThis is really a value
-   * up in some enclosing frame. */
+   * there are often cases where the root value for a $this context is really a
+   * value up in some enclosing frame. */
   SSATmp* canonical(SSATmp* value) {
-    auto* root = JIT::canonical(value);
+    auto* root = jit::canonical(value);
     auto* inst = root->inst();
-    if (!inst->is(LdThis)) return root;
+    if (!inst->is(CastCtxThis)) return root;
 
-    auto* fpInst = frameRoot(inst->src(0)->inst());
+    // TODO(#5623596): This code is not correct if we have a phi of a LdCtx or
+    // for some situations in inlined functions.  Right now this code is
+    // relying on other passes (simplifier and ir-builder) to make this work.
+    auto const ctx = jit::canonical(root->inst()->src(0));
+    assert(ctx->inst()->is(LdCtx));
+
+    auto* fpInst = ctx->inst()->src(0)->inst();
     auto it = m_state.frames.live.find(fpInst);
     if (it == m_state.frames.live.end()) {
       it = m_state.frames.dead.find(fpInst);
@@ -870,14 +1017,67 @@ struct SinkPointAnalyzer : private LocalStateHook {
     return it->second.mainThis;
   }
 
+  /*
+   * Consumes all local values, including those in callers if we're inlined.
+   */
   void consumeAllLocals() {
     ITRACE(3, "consuming all locals\n");
     Indent _i;
-    m_frameState.forEachLocal(
-      [&](uint32_t id, SSATmp* value) {
-        if (value) consumeValue(value);
+    m_frameState.forEachLocalValue(
+      [&](SSATmp* value) {
+        consumeValue(value);
       }
     );
+  }
+
+  /*
+   * Resolves all local values, including those in callers if we're inlined.
+   */
+  void resolveAllLocals() {
+    ITRACE(3, "resolving all locals\n");
+    Indent _i;
+    m_frameState.forEachLocalValue(
+      [&](SSATmp* value) {
+        resolveValue(value);
+      }
+    );
+  }
+
+  /*
+   * Consumes all locals in the current frame, not including inline callers.
+   */
+  void consumeCurrentLocals() {
+    ITRACE(3, "consume current frame locals\n");
+    Indent _i;
+    for (uint32_t i = 0, n = m_frameState.func()->numLocals(); i < n; ++i) {
+      if (auto value = m_frameState.localValue(i)) {
+        consumeValue(value);
+      }
+    }
+  }
+
+  /*
+   * Some unusual instructions consume sources only if they ended up throwing
+   * an exception.
+   */
+  void consumeExceptional(const IRInstruction& inst) {
+    switch (inst.op()) {
+    case LookupClsMethod: consumeValueAfter(inst.src(1)); break;
+    case LdArrFuncCtx:    consumeValueAfter(inst.src(0)); break;
+    case LdArrFPushCuf:   consumeValueAfter(inst.src(0)); break;
+    case LdStrFPushCuf:   consumeValueAfter(inst.src(0)); break;
+    case SuspendHookE:
+      // In this situation, the suspend hook is going to decref the wait
+      // handle while it's throwing.  XXX: it's not that cool to do this by
+      // chasing a LdAFWHActRec.  (note: we also run through this codepath
+      // for continuations, but we threw NotWorthOptimizing for those.)
+      if (inst.src(1)->inst()->is(LdAFWHActRec)) {
+        consumeValue(inst.src(1)->inst()->src(0));
+      }
+      break;
+    default:
+      break;
+    }
   }
 
   void consumeInputs() {
@@ -918,22 +1118,24 @@ struct SinkPointAnalyzer : private LocalStateHook {
       m_state.frames.pushInline(m_inst);
     } else if (m_inst->is(InlineReturn)) {
       FTRACE(3, "{}", show(m_state));
-      m_state.frames.popInline(frameRoot(m_inst->src(0)->inst()));
-    } else if (m_inst->is(RetAdjustStack)) {
+      m_state.frames.popInline(m_inst->src(0)->inst());
+    } else if (m_inst->is(RetAdjustStk)) {
       m_state.frames.pop();
     } else if (m_inst->is(Call, CallArray)) {
       resolveAllFrames();
       callPreLiveFrame();
     } else if (m_inst->is(ContEnter)) {
       resolveAllFrames();
-    } else if (m_inst->is(CallBuiltin) &&
-               !strcasecmp(m_inst->src(0)->funcVal()->fullName()->data(),
-                           "get_defined_vars")) {
-      observeLocalRefs();
+    } else if (m_inst->is(CallBuiltin)) {
+      const auto callee = m_inst->extra<CallBuiltinData>()->callee->fullName();
+      if (callee->isame(s_get_defined_vars.get()) ||
+          callee->isame(s_get_defined_vars_SystemLib.get())) {
+        observeLocalRefs();
+      }
     } else if (m_inst->is(InterpOne, InterpOneCF)) {
       // InterpOne can push and pop ActRecs.
       auto const op = m_inst->extra<InterpOneData>()->opcode;
-      if (JIT::getInstrInfo(op).type == JIT::InstrFlags::OutFDesc) {
+      if (jit::getInstrInfo(op).type == jit::InstrFlags::OutFDesc) {
         m_state.frames.pushPreLive();
       } else if (isFCallStar(op)) {
         resolveAllFrames();
@@ -954,31 +1156,28 @@ struct SinkPointAnalyzer : private LocalStateHook {
       }
     }
 
-    // SpillStack and Call may have some of their sources replaced with None,
-    // to indicate that the value doesn't need to be stored again. We still
-    // want to trace down the original source to track its refcount state, and
-    // we do so by scanning all currently tracked values from LdStacks.
-    auto ldStacksLazy = folly::lazy([&]{
-      auto* spill = m_inst->is(SpillStack) ? m_inst : m_inst->src(0)->inst();
-      assert(spill->is(SpillStack));
-      return collectLdStacks(spill->src(0));
-    });
-
     ITRACE(3, "consuming normal inputs\n");
     for (uint32_t i = 0; i < m_inst->numSrcs(); ++i) {
       Indent _i;
-      auto* src = m_inst->src(i);
+      auto src = m_inst->src(i);
 
       if (src->isA(Type::StkPtr) && src->inst()->is(SpillFrame) &&
-                 !m_inst->is(DefInlineFP, DefInlineSP,
-                             Call, CallArray, ContEnter)) {
-        // If the StkPtr being consumed points to a pre-live ActRec, observe
-        // its $this pointer since many of our helper functions decref it.
-        auto* this_ = src->inst()->src(2);
-        if (this_->isA(Type::Obj)) {
-          auto const sinkPoint = SinkPoint(m_ids.before(m_inst), this_, false);
-          this_ = canonical(this_);
-          observeValue(this_, m_state.values[this_], sinkPoint);
+          !m_inst->is(DefInlineFP,
+                      Call,
+                      CallArray,
+                      ContEnter)) {
+        bool const beginInlDefSP = m_inst->is(ReDefSP) &&
+                                     m_inst->src(0)->inst()->is(DefInlineFP);
+        if (!beginInlDefSP) {
+          // If the StkPtr being consumed points to a pre-live ActRec, observe
+          // its $this pointer since many of our helper functions decref it.
+          auto this_ = src->inst()->src(2);
+          if (this_->isA(Type::Obj)) {
+            auto const sinkPoint = SinkPoint(m_ids.before(m_inst), this_,
+              false);
+            this_ = canonical(this_);
+            observeValue(this_, m_state.values[this_], sinkPoint);
+          }
         }
       }
 
@@ -992,27 +1191,13 @@ struct SinkPointAnalyzer : private LocalStateHook {
       }
     }
 
-    // Many instructions have complicated effects on the state of the
-    // locals. Get this information from FrameState.
-    ITRACE(3, "getting local effects from FrameState\n");
+    ITRACE(3, "getting local effects\n");
     Indent _i;
-    m_frameState.getLocalEffects(m_inst, *this);
-  }
-
-  /* For all LdStack instructions from the given sp, build a map from stack
-   * offset to value. Used above in consumeInputs. */
-  smart::hash_map<int32_t, SSATmp*> collectLdStacks(SSATmp* sp) {
-    smart::hash_map<int32_t, SSATmp*> ret;
-
-    for (auto const& pair : m_state.values) {
-      auto* inst = pair.first->inst();
-      if (inst->is(LdStack) && inst->src(0) == sp) {
-        auto const offset = inst->extra<LdStack>()->offset;
-        ret[offset] = inst->dst();
-      }
+    // We already consumed everything for InterpOneCF above, because it's
+    // leaving the trace, so we need to ignore local_effects for it.
+    if (!m_inst->is(InterpOneCF)) {
+      local_effects(m_frameState, m_inst, *this);
     }
-
-    return ret;
   }
 
   /*
@@ -1023,12 +1208,7 @@ struct SinkPointAnalyzer : private LocalStateHook {
     // If we have no prelive frames the FPush* was in a different trace.
     if (m_state.frames.preLive.empty()) return;
 
-    auto& frame = m_state.frames.preLive.back();
-    if (frame.currentThis) {
-      consumeValue(frame.currentThis);
-    } else if (frame.mainThis) {
-      consumeValueEraseOnly(frame.mainThis);
-    }
+    consumeFrame(m_state.frames.preLive.back());
     m_state.frames.preLive.pop_back();
   }
 
@@ -1056,16 +1236,26 @@ struct SinkPointAnalyzer : private LocalStateHook {
   }
 
   /*
+   * Consume the $this pointer for a Frame, if it has one. If currentThis is
+   * nullptr but mainThis exists we use an "erase-only" sink point, which means
+   * it's not safe to actually sink the IncRef but it's safe to erase the
+   * IncRef/DecRef pair (usually because the value has been smashed by a Call).
+   */
+  void consumeFrame(Frame& f) {
+    if (f.currentThis) {
+      consumeValue(f.currentThis);
+    } else if (f.mainThis) {
+      consumeValueEraseOnly(f.mainThis);
+    }
+  }
+
+  /*
    * When we leave a trace, we have to account for all the references we're
    * tracking in pre-live frames and inlined frames.
    */
   void consumeAllFrames() {
     forEachFrame([this](Frame& f) {
-      if (f.currentThis) {
-        consumeValue(f.currentThis);
-      } else if (f.mainThis) {
-        consumeValueEraseOnly(f.mainThis);
-      }
+      consumeFrame(f);
     });
   }
 
@@ -1088,6 +1278,15 @@ struct SinkPointAnalyzer : private LocalStateHook {
   void consumeValue(SSATmp* value)          { consumeValueImpl(value, false); }
   void consumeValueEraseOnly(SSATmp* value) { consumeValueImpl(value, true); }
 
+  // Just like consumeValue, except the sync point is after the current
+  // instruction.
+  void consumeValueAfter(SSATmp* value) {
+    if (value->type().notCounted()) return;
+    auto const root = canonical(value);
+    consumeValue(root, m_state.values[root],
+                 SinkPoint(m_ids.after(m_inst), value, false));
+  }
+
   void consumeValue(SSATmp* value, Value& valState, SinkPoint sinkPoint) {
     ITRACE(3, "consuming value {}\n", *value->inst());
     assert(value == canonical(value));
@@ -1098,6 +1297,12 @@ struct SinkPointAnalyzer : private LocalStateHook {
     assert(valState.optCount() >= 0);
 
     assertCanConsume(value);
+
+    // Drop one IncRef right before a DecRef, so that we don't end up
+    // missing opportunities because we sunk IncRefs too late.
+    if (m_inst->is(DecRef, DecRefNZ) && valState.optDelta() > 0) {
+      placeSinkPoint(value, valState, sinkPoint);
+    }
 
     // Note that we're treating consumers and observers the same here, which is
     // necessary until we have better alias analysis.
@@ -1156,27 +1361,8 @@ struct SinkPointAnalyzer : private LocalStateHook {
       };
 
       // This is ok as long as the value came from a load (see the Value struct
-      // for why) or it's from a phi node where one or more of the incoming
-      // values has an uncounted type (when we process the DefLabel we take the
-      // pessimistic combination of all inputs and the uncounted value won't
-      // have any references).
-      auto uncountedPhiSource = [&]{
-        auto* inst = value->inst();
-        if (!inst->is(DefLabel)) return false;
-        for (uint32_t i = 0; i < inst->numDsts(); ++i) {
-          auto foundUncounted = false;
-          inst->block()->forEachSrc(i,
-            [&](const IRInstruction* inst, SSATmp* src) {
-              if (src->type().notCounted()) foundUncounted = true;
-            }
-          );
-          if (foundUncounted) return true;
-        }
-        return false;
-      };
-
-      always_assert_log((valState.fromLoad && valState.optCount() == 0) ||
-                        uncountedPhiSource(),
+      // for why).
+      always_assert_log((valState.fromLoad && valState.optCount() == 0),
                         showFailure);
     } else if (checkConsume) {
       auto showFailure = [&] {
@@ -1198,10 +1384,8 @@ struct SinkPointAnalyzer : private LocalStateHook {
   void observeLocalRefs() {
     // If any locals are RefDatas, the behavior of get_defined_vars can
     // depend on whether or not the count is >= 2.
-    m_frameState.forEachLocal(
-      [&](uint32_t id, SSATmp* value) {
-        if (!value) return;
-
+    m_frameState.forEachLocalValue(
+      [&](SSATmp* value) {
         auto const sp = SinkPoint(m_ids.before(m_inst), value, false);
         value = canonical(value);
         observeValue(value, m_state.values[value], sp, RefObserver());
@@ -1237,7 +1421,7 @@ struct SinkPointAnalyzer : private LocalStateHook {
   void resolveValueEraseOnly(SSATmp* val) { resolveValueImpl(val, true); }
 
   /* Remember that oldVal has been replace by newVal, either because of a
-   * passthrough instruction or something from FrameState. */
+   * passthrough instruction or something from FrameStateMgr. */
   void replaceValue(SSATmp* oldVal, SSATmp* newVal) {
     ITRACE(3, "replacing {} with {}\n", *oldVal, *newVal);
 
@@ -1246,13 +1430,34 @@ struct SinkPointAnalyzer : private LocalStateHook {
     m_state.canon[canonical(newVal)] = newVal;
   }
 
+  // Helper for refineLocalValues.
+  void refineLocalValue(SSATmp* oldVal, SSATmp* newVal) {
+    if (oldVal->type().maybeCounted() && newVal->type().notCounted()) {
+      assert(newVal->inst()->is(CheckType, AssertType));
+      assert(newVal->inst()->src(0) == oldVal);
+      // Similar to what we do when processing the CheckType directly, we
+      // "consume" the value on behalf of the CheckType.
+      oldVal = canonical(oldVal);
+      auto& valState = m_state.values[oldVal];
+      ITRACE(2, "'consuming' reference to {} for refineLocalValue\n",
+             *oldVal->inst());
+      if (valState.realCount) --valState.realCount;
+    }
+  }
+
   void defineOutputs() {
     if (m_inst->is(LdLoc)) {
       // LdLoc's output is the new value of the local we loaded, and this has
       // already been tracked in setLocalValue().
       return;
-    } else if (m_inst->is(LdThis)) {
-      auto* fpInst = frameRoot(m_inst->src(0)->inst());
+    } else if (m_inst->is(CastCtxThis)) {
+      // TODO(#5623596): This code is not correct if we have a phi of a LdCtx
+      // or for some situations in inlined functions.  Right now this code is
+      // relying on other passes (simplifier and ir-builder) to make this work.
+      auto const ctx = canonical(m_inst->src(0));
+      assert(ctx->inst()->is(LdCtx));
+
+      auto* fpInst = ctx->inst()->src(0)->inst();
       assert(m_state.frames.live.count(fpInst));
       auto& frame = m_state.frames.live[fpInst];
       frame.currentThis = m_inst->dst();
@@ -1261,7 +1466,9 @@ struct SinkPointAnalyzer : private LocalStateHook {
         // the main $this for the frame and indicate that we're tracking a
         // reference to it.
         frame.mainThis = m_inst->dst();
-        m_state.values[frame.mainThis].realCount = 1;
+
+        auto& valState = m_state.values[frame.mainThis];
+        valState.realCount = 1;
       }
       return;
     }
@@ -1310,27 +1517,30 @@ struct SinkPointAnalyzer : private LocalStateHook {
 
       if (dst->type().notCounted()) continue;
 
-      auto pair = m_state.values.emplace(dst, Value());
-      assert(pair.second);
+      if (m_inst->producesReference(i) || m_inst->isRawLoad()) {
+        assert(!m_state.values.count(dst));
+        ITRACE(3, "defining value {}\n", *m_inst);
+        Indent _i;
 
-      ITRACE(3, "defining value {}\n", *m_inst);
-      Indent _i;
+        auto& state = m_state.values[dst];
+        if (m_inst->producesReference(i)) state.realCount = 1;
+        if (m_inst->isRawLoad()) state.fromLoad = true;
 
-      auto& state = pair.first->second;
-      if (m_inst->producesReference(i)) state.realCount = 1;
-
-      if (m_inst->isRawLoad()) state.fromLoad = true;
-      ITRACE(3, "{}\n", show(state));
-      assert(state.optDelta() == 0);
+        ITRACE(3, "{}\n", show(state));
+      }
     }
   }
 
   ///// LocalStateHook overrides /////
-  void setLocalValue(uint32_t id, SSATmp* newVal) override {
-    assert(IMPLIES(m_inst->is(LdLoc),
-                   m_frameState.localValue(id) == nullptr ||
-                   m_frameState.localValue(id)->inst()->is(DefConst)));
 
+  void dropLocalRefsInnerTypes() override {}
+  void refineLocalType(uint32_t, Type, TypeSource) override {}
+  void predictLocalType(uint32_t, Type) override {}
+  void setBoxedLocalPrediction(uint32_t, Type) override {}
+  void updateLocalRefPredictions(SSATmp*, SSATmp*) override {}
+  void setLocalTypeSource(uint32_t, TypeSource) override {}
+
+  void setLocalValue(uint32_t id, SSATmp* newVal) override {
     // When a local's value is updated by StLoc(NT), the consumption of the old
     // value should've been visible to us, so we ignore that here.
     if (!m_inst->is(StLoc, StLocNT)) {
@@ -1350,19 +1560,16 @@ struct SinkPointAnalyzer : private LocalStateHook {
     }
   }
 
-  void refineLocalValue(uint32_t id, unsigned inlineIdx,
-                        SSATmp* oldVal, SSATmp* newVal) override {
-    if (oldVal->type().maybeCounted() && newVal->type().notCounted()) {
-      assert(newVal->inst()->is(CheckType, AssertType));
-      assert(newVal->inst()->src(0) == oldVal);
-      // Similar to what we do when processing the CheckType directly, we
-      // "consume" the value on behalf of the CheckType.
-      oldVal = canonical(oldVal);
-      auto& valState = m_state.values[oldVal];
-      ITRACE(2, "'consuming' reference to {} for refineLocalValue\n",
-             *oldVal->inst());
-      if (valState.realCount) --valState.realCount;
-    }
+  void clearLocals() override { consumeCurrentLocals(); }
+
+  void refineLocalValues(SSATmp* oldVal, SSATmp* newVal) override {
+    m_frameState.forEachLocalValue(
+      [&] (SSATmp* curVal) {
+        if (canonical(curVal) == canonical(oldVal)) {
+          refineLocalValue(oldVal, newVal);
+        }
+      }
+    );
   }
 
   void setLocalType(uint32_t id, Type) override {
@@ -1371,24 +1578,33 @@ struct SinkPointAnalyzer : private LocalStateHook {
     consumeLocal(id);
   }
 
-  void killLocalForCall(uint32_t id, unsigned inlineIdx,
-                        SSATmp* value) override {
-    ITRACE(3, "consuming local {} at inline level {} for killLocalForCall\n",
-           id, inlineIdx);
-    Indent _i;
-    consumeValue(value);
-  }
-
-  void updateLocalRefValue(uint32_t id, unsigned,
-                           SSATmp* oldVal, SSATmp* newVal) override {
-    ITRACE(3, "replacing {} with {} in local {} for updateLocalRefValue\n",
-           *oldVal, *newVal, id);
-    replaceValue(oldVal, newVal);
+  void killLocalsForCall(bool callDestroysLocals) override {
+    if (callDestroysLocals) {
+      // Consume the current frame's locals.
+      clearLocals();
+    }
+    m_frameState.walkAllInlinedLocals(
+      [&](uint32_t id, unsigned inlineIdx, const LocalState& local) {
+        auto* value = local.value;
+        if (!value || value->inst()->is(DefConst)) return;
+        ITRACE(3, "consuming local {} at inline level {} for "
+          "killLocalsForCall\n", id, inlineIdx);
+        Indent _i;
+        consumeValue(value);
+      },
+      // We have to skip the first frame if we already did it, because
+      // otherwise we think we're consuming locals more than once, which
+      // currently doesn't work here.
+      callDestroysLocals
+    );
   }
 
   /* The IRUnit being processed and its blocks */
   const IRUnit& m_unit;
   const BlockList& m_blocks;
+
+  /* The set of loop headers in the unit. */
+  BlockSet m_loopHeaders;
 
   /* Current block and current instruction */
   const Block* m_block;
@@ -1409,12 +1625,12 @@ struct SinkPointAnalyzer : private LocalStateHook {
   SinkPointsMap m_ret;
 
   /* Used to track local state and other information about the trace */
-  FrameState m_frameState;
+  FrameStateMgr m_frameState;
 };
 
 ////////// Refcount validation pass //////////
-typedef smart::hash_map<SSATmp*, double> TmpDelta;
-typedef smart::hash_map<Block*, TmpDelta> BlockMap;
+typedef jit::hash_map<SSATmp*, double> TmpDelta;
+typedef jit::hash_map<Block*, TmpDelta> BlockMap;
 
 /*
  * Simulate the effect of block b on refcounts of SSATmps.
@@ -1478,7 +1694,7 @@ bool validateDeltas(BlockMap& orig, BlockMap& opt) {
       SSATmp* src = it2->first;
       double delta = deltaOrig[src];
       if (fabs(delta - it2->second) > deltaThreshold) {
-        if (src->inst()->is(LdThis)) {
+        if (src->inst()->is(CastCtxThis)) {
           // The optimization does some nontrivial state tracking to keep track
           // of $this pointers, so this is probably a false positive.
           FTRACE(1, "possible ");
@@ -1488,18 +1704,19 @@ bool validateDeltas(BlockMap& orig, BlockMap& opt) {
                    deltaOrig[src],
                    it2->second,
                    it->first->id());
-        return src->inst()->is(LdThis);
+        return src->inst()->is(CastCtxThis);
       }
     }
   }
   return true;
 }
 
+std::string show(const SinkPointsMap& sinkPoints, const IdMap& ids) DEBUG_ONLY;
 std::string show(const SinkPointsMap& sinkPoints, const IdMap& ids) {
   std::string ret;
 
   typedef std::pair<SSATmp*, SinkPoints> SinkPair;
-  smart::vector<SinkPair> sortedPoints(
+  jit::vector<SinkPair> sortedPoints(
     sinkPoints.points.begin(), sinkPoints.points.end());
   std::sort(sortedPoints.begin(), sortedPoints.end(),
             [&](const SinkPair& a, const SinkPair& b) {
@@ -1529,7 +1746,7 @@ std::string show(const SinkPointsMap& sinkPoints, const IdMap& ids) {
   }
 
   typedef std::pair<Point, int> DecRefPair;
-  smart::vector<DecRefPair> sortedDecs(
+  jit::vector<DecRefPair> sortedDecs(
     sinkPoints.decRefs.begin(), sinkPoints.decRefs.end());
   std::sort(sortedDecs.begin(), sortedDecs.end(),
             [](const DecRefPair& a, const DecRefPair& b) {
@@ -1585,7 +1802,7 @@ void sinkIncRefs(IRUnit& unit, const SinkPointsMap& info, const IdMap& ids) {
           // sink the IncRef to this point but we don't have access to the
           // value, probably because the SSATmp was killed by a Call. For now
           // we refuse to optimize this case, but it's possible to use this
-          // sink point as long as we've proven that doing so will eliminte the
+          // sink point as long as we've proven that doing so will eliminate the
           // Inc/Dec pair.
           ITRACE(2, "found erase-only SinkPoint; not optimizing\n");
           doSink = false;
@@ -1680,12 +1897,12 @@ void eliminateRefcounts(IRUnit& unit, const SinkPointsMap& info,
   ITRACE(2, "\n");
 }
 
-/* After this pass completes, we don't need the TakeStack instructions anymore.
- * this pass converts them to Nop, and dce removes them. */
-void eliminateTakeStacks(const BlockList& blocks) {
+/* After this pass completes, we don't need the TakeStk/TakeRef instructions
+ * anymore. This pass converts them to Nop, and dce removes them. */
+void eliminateTakes(const BlockList& blocks) {
   for (auto b : blocks) {
     for (auto& inst : *b) {
-      if (inst.op() == TakeStack) {
+      if (inst.is(TakeStk, TakeRef)) {
         inst.convertToNop();
       }
     }
@@ -1726,12 +1943,23 @@ void eliminateTakeStacks(const BlockList& blocks) {
  * complete, a separate validation pass is run to ensure the net effect on the
  * refcount of each object has not changed.
  */
-void optimizeRefcounts(IRUnit& unit, FrameState&& fs) {
+void optimizeRefcounts(IRUnit& unit, FrameStateMgr&& fs) {
+  fs.setLegacyReoptimize();
   Timer _t(Timer::optimize_refcountOpts);
   FTRACE(2, "vvvvvvvvvv refcount opts vvvvvvvvvv\n");
-  auto const changed = splitCriticalEdges(unit);
-  if (changed) {
-    dumpTrace(6, unit, "after splitting critical edges for refcount opts");
+
+  auto& ctx = unit.context();
+  if (ctx.func->isGenerator() && !ctx.resumed) {
+    ITRACE(2, "Inside non-resumed generator body; refcount-opts bailing\n");
+    return;
+  }
+
+  if (splitCriticalEdges(unit)) {
+    printUnit(6, unit, "after splitting critical edges for refcount opts");
+  }
+
+  if (insertLoopPreHeaders(unit)) {
+    printUnit(6, unit, "after inserting loop pre-headers for refcount opts");
   }
 
   auto const blocks = rpoSortCfg(unit);
@@ -1749,13 +1977,13 @@ void optimizeRefcounts(IRUnit& unit, FrameState&& fs) {
 
   sinkIncRefs(unit, sinkPoints, ids);
   eliminateRefcounts(unit, sinkPoints, ids);
-  eliminateTakeStacks(blocks);
+  eliminateTakes(blocks);
 
   if (RuntimeOption::EvalHHIRValidateRefCount) {
     BlockMap after;
     getRefDeltas(unit, after);
     if (!validateDeltas(before, after)) {
-      dumpTrace(0, unit, "after refcount optimization");
+      printUnit(0, unit, "after refcount optimization");
       always_assert(false && "refcount validation failed");
     }
   }

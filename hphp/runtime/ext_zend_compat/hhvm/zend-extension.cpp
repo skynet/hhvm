@@ -17,7 +17,7 @@
 
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-extension.h"
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-object.h"
-#include "folly/AtomicHashMap.h"
+#include <folly/AtomicHashMap.h>
 #include "hphp/runtime/ext_zend_compat/php-src/Zend/zend_modules.h"
 #include "hphp/runtime/ext_zend_compat/php-src/Zend/zend_API.h"
 #include "hphp/runtime/vm/native.h"
@@ -25,12 +25,14 @@
 
 #include <atomic>
 
+namespace HPHP {
+
 // Initial size of the map
 #define APPROXIMATE_STATIC_ZEND_MODULES 10
 static std::atomic_int s_zend_next_module(1);
 static folly::AtomicHashMap<int, ZendExtension*> *s_zend_extensions;
 
-ZendExtension::ZendExtension(const char* name) : HPHP::Extension(name) {
+ZendExtension::ZendExtension(const char* name) : Extension(name) {
   if (!s_zend_extensions) {
     // No need to worry about races, this all happens during pre-main
     // initialization
@@ -38,9 +40,6 @@ ZendExtension::ZendExtension(const char* name) : HPHP::Extension(name) {
       APPROXIMATE_STATIC_ZEND_MODULES
     );
   }
-  zend_module_entry* module = this->getEntry();
-  module->module_number = s_zend_next_module++;
-  s_zend_extensions->insert(module->module_number, this);
 }
 
 ZendExtension* ZendExtension::GetByModuleNumber(int module_number) {
@@ -52,34 +51,43 @@ ZendExtension* ZendExtension::GetByModuleNumber(int module_number) {
   return nullptr;
 }
 
+bool ZendExtension::moduleEnabled() const {
+  return RuntimeOption::EnableZendCompat;
+}
+
 void ZendExtension::moduleInit() {
-  if (!HPHP::RuntimeOption::EnableZendCompat) {
+  if (!RuntimeOption::EnableZendCompat) {
     return;
   }
-  HPHP::ZendObject::registerNativeData();
+  // Give it a module number
+  zend_module_entry* module = getEntry();
+  module->module_number = s_zend_next_module++;
+  s_zend_extensions->insert(module->module_number, this);
+
+  ZendObject::registerNativeData();
   // Allocate globals
-  zend_module_entry* entry = getEntry();
-  if (entry->globals_size) {
-    ts_allocate_id(entry->globals_id_ptr, entry->globals_size,
-        (ts_allocate_ctor) entry->globals_ctor,
-        (ts_allocate_dtor) entry->globals_dtor);
+  if (module->globals_size) {
+    ts_allocate_id(module->globals_id_ptr, module->globals_size,
+        (ts_allocate_ctor) module->globals_ctor,
+        (ts_allocate_dtor) module->globals_dtor);
   }
   // Register global functions
-  const zend_function_entry * fe = entry->functions;
+  const zend_function_entry * fe = module->functions;
   while (fe->fname) {
     assert(fe->handler);
-    HPHP::Native::registerBuiltinFunction(HPHP::makeStaticString(fe->fname),
-                                          fe->handler);
+    Native::registerBuiltinFunction(fe->fname, fe->handler);
     fe++;
   }
   // Call MINIT
-  if (entry->module_startup_func) {
+  if (module->module_startup_func) {
     TSRMLS_FETCH();
-    entry->module_startup_func(1, entry->module_number TSRMLS_CC);
+    module->module_startup_func(1, module->module_number TSRMLS_CC);
   }
   // The systemlib name must match the name used by the build process. For
   // in-tree builds this is the directory name, which is typically the same
   // as the extension name converted to lower case.
-  std::string slName = HPHP::toLower(std::string(getName()));
+  std::string slName = toLower(std::string(getName()));
   loadSystemlib(slName);
+}
+
 }

@@ -13,7 +13,8 @@
 open Utils
 open Nast
 open Typing_defs
-open Silent
+
+module SN = Naming_special_names
 
 (* Exception raised when we hit a return statement and the initialization
  * is not over.
@@ -37,44 +38,7 @@ type cvar_status =
   | Vnull (* The value is still potentially null *)
   | Vinit (* Yay! it has been initialized *)
 
-
-module Error = struct
-
-  let read_before_write (p, v) =
-    error p (
-    sl[
-    "Read access to $this->"; v; " before initialization"
-  ])
-
-  let no_construct_parent p =
-    error p (sl[
-    "You are extending a class that needs to be initialized\n";
-    "Make sure you call parent::__construct.\n"
-    ])
-
-  let not_initialized (p, c) =
-    if c = "parent::__construct" then no_construct_parent p else
-    error p (sl[
-    "The class member "; c;" is not always properly initialized\n";
-    "Make sure you systematically set $this->"; c;
-    " when the method __construct is called\n";
-    "Alternatively, you can define the type as optional (?...)\n"
-    ])
-
-  let call_before_init p cv =
-    if !is_silent_mode then () else
-    error p (
-    sl([
-       "Until the initialization of $this is over,";
-       " you can only call private methods\n";
-        "The initialization is not over because ";
-     ] @
-       if cv = "parent::__construct"
-       then ["you forgot to call parent::__construct"]
-       else ["$this->"; cv; " can still potentially be null"])
-   )
-
-end
+let parent_init_cvar = "parent::__construct"
 
 (* Module initializing the environment
    Originally, every class member has 2 possible states,
@@ -96,32 +60,37 @@ module Env = struct
     | Done
 
     (* We have never computed this private bethod before *)
-    | Todo of block
+    | Todo of body_block
 
   type t = {
-      methods : method_status ref SMap.t ;
-      cvars   : SSet.t ;
-    }
+    methods : method_status ref SMap.t ;
+    cvars   : SSet.t ;
+  }
 
-  (* If we need to call parent::__construct, we treat it as if it was a class
-   * variable that needs to be initialized. It's a bit hacky but it works.
-   * The idea here is that if the parent needs to be initialized,
-   * we add a phone class variable called parent::__construct.
-   *)
-  let parent tenv cvars c =
-    if c.c_mode = Ast.Mdecl then cvars else
-    match c.c_extends with
-    | [] -> cvars
-    | (_, Happly ((_, parent), _)) :: _ ->
-        let _, class_ = Typing_env.get_class tenv parent in
+  (* If we need to call parent::__construct, we treat it as if it were
+   * a class variable that needs to be initialized. It's a bit hacky
+   * but it works. The idea here is that if the parent needs to be
+   * initialized, we add a phony class variable. *)
+  let add_parent_construct c tenv cvars parent_hint =
+    match parent_hint with
+      | (_, Happly ((_, parent), _)) ->
+        let class_ = Typing_env.get_class tenv parent in
         (match class_ with
-        | Some class_ when
-            class_.Typing_defs.tc_need_init &&
-            c.c_constructor <> None
-          -> SSet.add "parent::__construct" cvars
-        | _ -> cvars
+          | Some class_ when
+              class_.Typing_defs.tc_need_init && c.c_constructor <> None
+              -> SSet.add parent_init_cvar cvars
+          | _ -> cvars
         )
-    | _ -> cvars
+      | _ -> cvars
+
+  let parent tenv cvars c =
+    if c.c_mode = Ast.Mdecl then cvars
+    else
+      if c.c_kind = Ast.Ctrait
+      then List.fold_left (add_parent_construct c tenv) cvars c.c_req_extends
+      else match c.c_extends with
+      | [] -> cvars
+      | parent_hint :: _ -> add_parent_construct c tenv cvars parent_hint
 
   let rec make tenv c =
     let tenv = Typing_env.set_root tenv (Typing_deps.Dep.Class (snd c.c_name)) in
@@ -133,31 +102,30 @@ module Env = struct
 
   and method_ acc m =
     if m.m_visibility <> Private then acc else
-    let name = snd m.m_name in
-    let acc = SMap.add name (ref (Todo m.m_body)) acc in
-    acc
+      let name = snd m.m_name in
+      let acc = SMap.add name (ref (Todo m.m_body)) acc in
+      acc
 
   and cvar acc cv =
-    let cname = snd cv.cv_id in
-    match cv.cv_type with
-    | Some (_, Hoption _) | None -> acc
-    | _ ->
-        match cv.cv_expr with
-        | Some _ -> acc
+    if cv.cv_is_xhp then acc else begin
+      let cname = snd cv.cv_id in
+      match cv.cv_type with
+        | Some (_, Hoption _) | Some (_, Hmixed) | None -> acc
         | _ ->
-            SSet.add cname acc
+          match cv.cv_expr with
+            | Some _ -> acc
+            | _ -> SSet.add cname acc
+    end
 
   and parent_cvars tenv acc c =
-  List.fold_left begin fun acc parent ->
-    match parent with _, Happly ((_, parent), _) ->
-    let _, tc = Typing_env.get_class tenv parent in
-    (match tc with
-    | None -> acc
-    | Some { tc_members_init = members } ->
-      SSet.union members acc
-    )
-    | _ -> acc
-  end acc (c.c_extends @ c.c_uses)
+    List.fold_left begin fun acc parent ->
+      match parent with _, Happly ((_, parent), _) ->
+        let tc = Typing_env.get_class tenv parent in
+        (match tc with
+          | None -> acc
+          | Some { tc_members_init = members; _ } -> SSet.union members acc)
+        | _ -> acc
+    end acc (c.c_extends @ c.c_uses)
 
   let get_method env m =
     SMap.get m env.methods
@@ -173,7 +141,7 @@ open Env
 (*****************************************************************************)
 
 let is_whitelisted = function
-  | "\\get_class" -> true
+  | x when x = SN.StdlibFunctions.get_class -> true
   | _ -> false
 
 let rec class_decl tenv c =
@@ -190,10 +158,7 @@ let rec class_decl tenv c =
 and class_ tenv c =
   if c.c_mode = Ast.Mdecl then () else begin
   match c.c_constructor with
-  | _ when
-      c.c_kind = Ast.Cinterface ||
-      c.c_kind = Ast.Ctrait
-    -> ()
+  | _ when c.c_kind = Ast.Cinterface -> ()
   | Some { m_unsafe = true; _ } -> ()
   | _ ->
       let p =
@@ -203,45 +168,45 @@ and class_ tenv c =
       in
       let env = Env.make tenv c in
       let inits = constructor env c.c_constructor in
+
       Typing_suggest.save_initalized_members (snd c.c_name) inits;
-      (* When the class is abstract, and it has a constructor
-       * the only thing we are about is that the constructor
-       * calls parent::__construct if it is needed.
-       * Because after that, it won't be reachable in the
-       * sub-classes anymore.
-       *)
-      if c.c_kind = Ast.Cabstract
+      (* When the class is abstract, and it has a constructor the only
+       * thing we care about is that the constructor calls
+       * parent::__construct if it is needed. Because after that, it
+       * won't be reachable in the sub-classes anymore. *)
+      if c.c_kind = Ast.Ctrait || c.c_kind = Ast.Cabstract
       then begin
-        let parent = "parent::__construct" in
         let has_constructor = c.c_constructor <> None in
-        let needs_parent_call = SSet.mem parent env.cvars in
-        let is_calling_parent = SSet.mem parent inits in
+        let needs_parent_call = SSet.mem parent_init_cvar env.cvars in
+        let is_calling_parent = SSet.mem parent_init_cvar inits in
         if has_constructor && needs_parent_call && not is_calling_parent
-        then Error.not_initialized (p, parent);
+        then Errors.not_initialized (p, parent_init_cvar);
       end
       else begin
         SSet.iter begin fun x ->
           if not (SSet.mem x inits)
-          then Error.not_initialized (p, x);
+          then Errors.not_initialized (p, x);
         end env.cvars
       end
   end
 
 and constructor env cstr =
   match cstr with
-  | None -> SSet.empty
-  | Some cstr -> toplevel env SSet.empty cstr.m_body
+    | None -> SSet.empty
+    | Some cstr -> match cstr.m_body with
+        | NamedBody b -> toplevel env SSet.empty b
+        | UnnamedBody _ -> (* FIXME FIXME *) SSet.empty
 
-and assign env acc x =
+and assign _env acc x =
   SSet.add x acc
 
 and assign_expr env acc e1 =
   match e1 with
-  | _, Obj_get ((_, This), (_, Id (_, y))) ->
+    | _, Obj_get ((_, This), (_, Id (_, y)), _) ->
       assign env acc y
-  | _, List el ->
+    | _, List el ->
       List.fold_left (assign_expr env) acc el
-  | _ -> acc
+    | _ -> acc
 
 and stmt env acc st =
   let expr = expr env in
@@ -249,24 +214,24 @@ and stmt env acc st =
   let catch = catch env in
   let case = case env in
   match st with
-  | Expr (_, Call (Cnormal, (_, Class_const (CIparent, (_, m))), el)) ->
+    | Expr (_, Call (Cnormal, (_, Class_const (CIparent, _)), el, _uel)) ->
       let acc = List.fold_left expr acc el in
-      assign env acc "parent::__construct"
-  | Expr e -> expr acc e
-  | Break -> acc
-  | Continue -> acc
-  | Throw (_, e) -> expr acc e
-  | Return (p, None) ->
+      assign env acc parent_init_cvar
+    | Expr e -> expr acc e
+    | Break _ -> acc
+    | Continue _ -> acc
+    | Throw (_, e) -> expr acc e
+    | Return (_, None) ->
       if are_all_init env acc
       then acc
       else raise (InitReturn acc)
-  | Return (p, Some x) ->
+    | Return (_, Some x) ->
       let acc = expr acc x in
       if are_all_init env acc
       then acc
       else raise (InitReturn acc)
-  | Static_var el -> List.fold_left expr acc el
-  | If (e1, b1, b2) ->
+    | Static_var el -> List.fold_left expr acc el
+    | If (e1, b1, b2) ->
       let acc = expr acc e1 in
       let is_term1 = Nast_terminality.Terminal.block b1 in
       let is_term2 = Nast_terminality.Terminal.block b2 in
@@ -277,24 +242,24 @@ and stmt env acc st =
       else if is_term2
       then SSet.union acc b1
       else SSet.union acc (SSet.inter b1 b2)
-  | Do (b, e) ->
+    | Do (b, e) ->
       let acc = block acc b in
       expr acc e
-  | While (e, _) ->
+    | While (e, _) ->
       expr acc e
-  | For (e1, _, _, _) ->
+    | For (e1, _, _, _) ->
       expr acc e1
-  | Switch (e, cl) ->
+    | Switch (e, cl) ->
       let acc = expr acc e in
       let _ = List.map (case acc) cl in
       let cl = List.filter (function c -> not (Nast_terminality.Terminal.case c)) cl in
       let cl = List.map (case acc) cl in
       let c = inter_list cl in
       SSet.union acc c
-  | Foreach (e, _, _) ->
+    | Foreach (e, _, _) ->
       let acc = expr acc e in
       acc
-  | Try (b, cl, fb) ->
+    | Try (b, cl, fb) ->
       let c = block acc b in
       let f = block acc fb in
       let _ = List.map (catch acc) cl in
@@ -309,8 +274,7 @@ and stmt env acc st =
 
 and toplevel env acc l =
   try List.fold_left (stmt env) acc l
-  with InitReturn acc ->
-    acc
+  with InitReturn acc -> acc
 
 and block env acc l =
   let acc_before_block = acc in
@@ -326,7 +290,7 @@ and are_all_init env set =
 and check_all_init p env acc =
   SSet.iter begin fun cv ->
     if not (SSet.mem cv acc)
-    then Error.call_before_init p cv
+    then Errors.call_before_init p cv
   end env.cvars
 
 and exprl env acc l = List.fold_left (expr env) acc l
@@ -338,6 +302,7 @@ and expr_ env acc p e =
   let afield = afield env in
   let fun_paraml = fun_paraml env in
   match e with
+  | Any -> acc
   | Array fdl -> List.fold_left afield acc fdl
   | ValCollection (_, el) -> exprl acc el
   | KeyValCollection (_, fdl) -> List.fold_left field acc fdl
@@ -348,12 +313,12 @@ and expr_ env acc p e =
   | Method_caller _
   | Id _ -> acc
   | Lvar _ -> acc
-  | Obj_get ((_, This), (_, Id (_, vx as v))) ->
+  | Obj_get ((_, This), (_, Id (_, vx as v)), _) ->
       if SSet.mem vx env.cvars && not (SSet.mem vx acc)
-      then Error.read_before_write v
+      then (Errors.read_before_write v; acc)
       else acc
   | Clone e -> expr acc e
-  | Obj_get (e1, e2) ->
+  | Obj_get (e1, e2, _) ->
       let acc = expr acc e1 in
       expr acc e2
   | Array_get (e, eo) ->
@@ -363,7 +328,7 @@ and expr_ env acc p e =
       | Some e -> expr acc e)
   | Class_const _
   | Class_get _ -> acc
-  | Call (Cnormal, (p, Obj_get ((_, This), (_, Id (_, f)))), _) ->
+  | Call (Cnormal, (p, Obj_get ((_, This), (_, Id (_, f)), _)), _, _) ->
       let method_ = Env.get_method env f in
       (match method_ with
       | None ->
@@ -373,23 +338,38 @@ and expr_ env acc p e =
           (match !method_ with
           | Done -> acc
           | Todo b ->
-              method_ := Done;
-              toplevel env acc b
+            method_ := Done;
+            (match b with
+              | NamedBody b -> toplevel env acc b
+              | UnnamedBody _b -> (* FIXME *) acc
+            )
           )
       )
-  | Assert (AE_invariant_violation (e, el))
-  | Call (_, e, el) ->
-      let el =
-        match e with
+  | Assert (AE_invariant_violation (e, el)) ->
+    let el =
+      match e with
         | _, Id (_, fun_name) when is_whitelisted fun_name ->
-            List.filter begin function
-              | _, This -> false
-              | _ -> true
-            end el
+          List.filter begin function
+            | _, This -> false
+            | _ -> true
+          end el
         | _ -> el
-      in
-      let acc = List.fold_left expr acc el in
-      expr acc e
+    in
+    let acc = List.fold_left expr acc el in
+    expr acc e
+  | Call (_, e, el, uel) ->
+    let el = el @ uel in
+    let el =
+      match e with
+        | _, Id (_, fun_name) when is_whitelisted fun_name ->
+          List.filter begin function
+            | _, This -> false
+            | _ -> true
+          end el
+        | _ -> el
+    in
+    let acc = List.fold_left expr acc el in
+    expr acc e
   | True
   | False
   | Int _
@@ -397,8 +377,8 @@ and expr_ env acc p e =
   | Null
   | String _
   | String2 _ -> acc
-  | Assert (AE_assert e)
-  | Yield e -> expr acc e
+  | Assert (AE_assert e) -> expr acc e
+  | Yield e -> afield acc e
   | Yield_break -> acc
   | Await e -> expr acc e
   | List _ ->
@@ -412,7 +392,8 @@ and expr_ env acc p e =
   | Special_func (Genva el)
   | Special_func (Gen_array_va_rec el) ->
       exprl acc el
-  | New (_, el) -> exprl acc el
+  | New (_, el, uel) ->
+      exprl acc (el @ uel)
   | Pair (e1, e2) ->
     let acc = expr acc e1 in
     expr acc e2
@@ -449,7 +430,7 @@ and expr_ env acc p e =
       let acc = exprl acc l in
       exprl acc el
   | Shape fdm ->
-      SMap.fold begin fun _ v acc ->
+      ShapeMap.fold begin fun _ v acc ->
         expr acc v
       end fdm acc
 

@@ -67,6 +67,14 @@ struct SrcKey : private boost::totally_ordered<SrcKey> {
     assert(0 <= (int32_t)off);
   }
 
+  SrcKey(SrcKey other, Offset off)
+    : m_funcId{other.getFuncId()}
+    , m_offset{(uint32_t)off}
+    , m_resumed{other.resumed()}
+  {
+    assert(0 <= (int32_t)off);
+  }
+
   explicit SrcKey(AtomicInt in)
     : m_atomicInt(in)
   {}
@@ -123,6 +131,10 @@ struct SrcKey : private boost::totally_ordered<SrcKey> {
 
   bool resumed() const {
     return m_resumed;
+  }
+
+  OffsetSet succOffsets() const {
+    return instrSuccOffsets((Op*)pc(), unit());
   }
 
   /*

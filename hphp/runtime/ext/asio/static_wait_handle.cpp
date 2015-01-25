@@ -17,11 +17,45 @@
 
 #include "hphp/runtime/ext/asio/static_wait_handle.h"
 
+#include "hphp/system/systemlib.h"
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 void c_StaticWaitHandle::t___construct() {
-  throw NotSupportedException(__func__, "WTF? This is an abstract class");
+  // gen-ext-hhvm requires at least one declared method in the class to work
+  not_reached();
+}
+
+/**
+ * Create succeeded StaticWaitHandle object.
+ *
+ * - consumes reference of the given cell
+ * - produces reference for the returned StaticWaitHandle object
+ */
+c_StaticWaitHandle* c_StaticWaitHandle::CreateSucceeded(const Cell result) {
+  auto waitHandle = newobj<c_StaticWaitHandle>();
+  waitHandle->setState(STATE_SUCCEEDED);
+  waitHandle->incRefCount();
+  cellCopy(result, waitHandle->m_resultOrException);
+  return waitHandle;
+}
+
+/**
+ * Create failed StaticWaitHandle object.
+ *
+ * - consumes reference of the given Exception object
+ * - produces reference for the returned StaticWaitHandle object
+ */
+c_StaticWaitHandle* c_StaticWaitHandle::CreateFailed(ObjectData* exception) {
+  assert(exception);
+  assert(exception->instanceof(SystemLib::s_ExceptionClass));
+
+  auto waitHandle = newobj<c_StaticWaitHandle>();
+  waitHandle->setState(STATE_FAILED);
+  waitHandle->incRefCount();
+  cellCopy(make_tv<KindOfObject>(exception), waitHandle->m_resultOrException);
+  return waitHandle;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

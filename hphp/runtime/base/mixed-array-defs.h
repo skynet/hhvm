@@ -18,14 +18,40 @@
 #define incl_HPHP_HPHP_ARRAY_DEFS_H_
 
 #include "hphp/runtime/base/mixed-array.h"
+
 #include "hphp/runtime/base/array-iterator.h"
 #include "hphp/runtime/base/array-iterator-defs.h"
+#include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/base/struct-array.h"
+#include "hphp/runtime/base/struct-array-defs.h"
 
 #include "hphp/util/stacktrace-profiler.h"
+#include "hphp/util/word-mem.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
+
+/*
+ * Return the payload from a ArrayData* that is kMixedKind.
+ */
+ALWAYS_INLINE
+MixedArray::Elm* mixedData(const MixedArray* arr) {
+  return reinterpret_cast<MixedArray::Elm*>(
+    const_cast<MixedArray*>(arr) + 1
+  );
+}
+
+ALWAYS_INLINE
+MixedArray* getArrayFromMixedData(const MixedArray::Elm* elms) {
+  // Note: changes to this scheme will require changes in the JIT for
+  // LdColArray.
+  auto* a = const_cast<MixedArray*>(
+    reinterpret_cast<const MixedArray*>(elms) - 1
+  );
+  assert(mixedData(a) == elms);
+  return a;
+}
 
 inline ArrayData::~ArrayData() {
   if (UNLIKELY(strong_iterators_exist())) {
@@ -45,8 +71,7 @@ ALWAYS_INLINE
 bool MixedArray::isFull() const {
   assert(!isPacked());
   assert(m_used <= m_cap);
-  assert(m_hLoad <= m_cap);
-  return m_used == m_cap || m_hLoad == m_cap;
+  return m_used == m_cap;
 }
 
 inline void MixedArray::initHash(int32_t* hash, size_t tableSize) {
@@ -61,6 +86,23 @@ MixedArray::copyHash(int32_t* to, const int32_t* from, size_t count) {
 inline MixedArray::Elm*
 MixedArray::copyElms(Elm* to, const Elm* from, size_t count) {
   return wordcpy(to, from, count);
+}
+
+extern int32_t* warnUnbalanced(size_t n, int32_t* ei);
+
+ALWAYS_INLINE int32_t*
+MixedArray::findForNewInsertCheckUnbalanced(int32_t* table, size_t mask,
+                                            size_t h0) const {
+  assert(!isPacked());
+  size_t balanceLimit = size_t(RuntimeOption::MaxArrayChain);
+  for (size_t i = 1, probe = h0;; ++i) {
+    auto ei = &table[probe & mask];
+    if (!validPos(*ei)) {
+      return LIKELY(i <= balanceLimit) ? ei : warnUnbalanced(i, ei);
+    }
+    probe += i;
+    assert(i <= mask && probe == h0 + ((i + i * i) / 2));
+  }
 }
 
 ALWAYS_INLINE int32_t*
@@ -91,7 +133,7 @@ void MixedArray::getElmKey(const Elm& e, TypedValue* out) {
     out->m_type = KindOfInt64;
     return;
   }
-  auto str = e.key;
+  auto str = e.skey;
   out->m_data.pstr = str;
   out->m_type = KindOfString;
   str->incRefCount();
@@ -129,25 +171,23 @@ void MixedArray::dupArrayElmWithRef(ssize_t pos,
 ALWAYS_INLINE
 MixedArray::Elm& MixedArray::allocElm(int32_t* ei) {
   assert(!validPos(*ei) && !isFull());
-  assert(m_size != 0 || m_used == 0);
+  assert(m_size == 0 || m_used != 0);
   ++m_size;
-  m_hLoad += (*ei == Empty);
   size_t i = m_used;
   (*ei) = i;
   m_used = i + 1;
-  if (m_pos == invalid_index) m_pos = i;
   return data()[i];
 }
 
 inline MixedArray* MixedArray::asMixed(ArrayData* ad) {
-  assert(ad->kind() == kMixedKind);
+  assert(ad->isMixed());
   auto a = static_cast<MixedArray*>(ad);
   assert(a->checkInvariants());
   return a;
 }
 
 inline const MixedArray* MixedArray::asMixed(const ArrayData* ad) {
-  assert(ad->kind() == kMixedKind);
+  assert(ad->isMixed());
   auto a = static_cast<const MixedArray*>(ad);
   assert(a->checkInvariants());
   return a;
@@ -166,7 +206,7 @@ inline size_t MixedArray::computeDataSize(uint32_t tableMask) {
          computeMaxElms(tableMask) * sizeof(Elm);
 }
 
-inline ArrayData* MixedArray::addVal(int64_t ki, const Variant& data) {
+inline ArrayData* MixedArray::addVal(int64_t ki, Cell data) {
   assert(!exists(ki));
   assert(!isPacked());
   assert(!isFull());
@@ -174,22 +214,40 @@ inline ArrayData* MixedArray::addVal(int64_t ki, const Variant& data) {
   auto& e = allocElm(ei);
   e.setIntKey(ki);
   if (ki >= m_nextKI && m_nextKI >= 0) m_nextKI = ki + 1;
-  // TODO(#3888164): constructValHelper is making KindOfUninit checks.
-  tvAsUninitializedVariant(&e.data).constructValHelper(data);
+  cellDup(data, e.data);
+  // TODO(#3888164): should avoid needing these KindOfUninit checks.
+  if (UNLIKELY(e.data.m_type == KindOfUninit)) {
+    e.data.m_type = KindOfNull;
+  }
   return this;
 }
 
-inline ArrayData* MixedArray::addVal(StringData* key, const Variant& data) {
+inline ArrayData* MixedArray::addVal(StringData* key, Cell data) {
   assert(!exists(key));
   assert(!isPacked());
   assert(!isFull());
+  return addValNoAsserts(key, data);
+}
+
+inline ArrayData* MixedArray::addValNoAsserts(StringData* key, Cell data) {
   strhash_t h = key->hash();
   auto ei = findForNewInsert(h);
   auto& e = allocElm(ei);
   e.setStrKey(key, h);
-  // TODO(#3888164): constructValHelper is making KindOfUninit checks.
-  tvAsUninitializedVariant(&e.data).constructValHelper(data);
+  cellDup(data, e.data);
+ // TODO(#3888164): should refactor to avoid making KindOfUninit checks.
+ if (UNLIKELY(e.data.m_type == KindOfUninit)) {
+    e.data.m_type = KindOfNull;
+  }
   return this;
+}
+
+inline MixedArray::Elm& MixedArray::addKeyAndGetElem(StringData* key) {
+  strhash_t h = key->hash();
+  auto ei = findForNewInsert(h);
+  auto& e = allocElm(ei);
+  e.setStrKey(key, h);
+  return e;
 }
 
 template <class K>
@@ -218,53 +276,70 @@ ArrayData* MixedArray::addLvalImpl(K k, Variant*& ret) {
 //////////////////////////////////////////////////////////////////////
 
 struct MixedArray::ValIter {
+
+  ALWAYS_INLINE
+  static bool isMixed(const ArrayData::ArrayKind& kind) {
+    return kind == ArrayData::kMixedKind ||
+      kind == ArrayData::kIntMapKind ||
+      kind == ArrayData::kStrMapKind;
+  }
+
   explicit ValIter(ArrayData* arr)
     : m_arr(arr)
     , m_kind(arr->m_kind)
   {
-    assert(m_kind == kMixedKind || m_kind == kPackedKind);
-    if (m_kind == kMixedKind) {
+    assert(isMixed(m_kind) || m_kind == kPackedKind || m_kind == kStructKind);
+    if (isMixed(m_kind)) {
       m_iterMixed = asMixed(arr)->data();
       m_stopMixed = m_iterMixed + asMixed(arr)->m_used;
-     } else {
-       m_iterPacked = reinterpret_cast<TypedValue*>(arr + 1);
-       m_stopPacked = m_iterPacked + arr->m_size;
-     }
-   }
+    } else if (m_kind == kStructKind) {
+      auto structArray = StructArray::asStructArray(arr);
+      m_iterStruct = structArray->data();
+      m_stopStruct = m_iterStruct + structArray->size();
+    } else {
+      m_iterPacked = reinterpret_cast<TypedValue*>(arr + 1);
+      m_stopPacked = m_iterPacked + arr->m_size;
+    }
+  }
 
-   explicit ValIter(ArrayData* arr, ssize_t start_pos)
-     : m_arr(arr)
-     , m_kind(arr->m_kind)
-   {
-     assert(m_kind == kMixedKind || m_kind == kPackedKind);
-     if (m_kind == kMixedKind) {
-       m_iterMixed = asMixed(arr)->data() + start_pos;
-       m_stopMixed = asMixed(arr)->data() + asMixed(arr)->m_used;
-       assert(m_iterMixed <= m_stopMixed);
-     } else {
-       m_iterPacked = reinterpret_cast<TypedValue*>(arr + 1) + start_pos;
-       m_stopPacked = reinterpret_cast<TypedValue*>(arr + 1) + arr->m_size;
-       assert(m_iterPacked <= m_stopPacked);
-     }
-   }
+  explicit ValIter(ArrayData* arr, ssize_t start_pos)
+    : m_arr(arr)
+    , m_kind(arr->m_kind)
+  {
+    assert(isMixed(m_kind) || m_kind == kPackedKind || m_kind == kStructKind);
+    if (isMixed(m_kind)) {
+      m_iterMixed = asMixed(arr)->data() + start_pos;
+      m_stopMixed = asMixed(arr)->data() + asMixed(arr)->m_used;
+      assert(m_iterMixed <= m_stopMixed);
+     } else if (m_kind == kStructKind) {
+      auto structArray = StructArray::asStructArray(arr);
+      m_iterStruct = structArray->data() + start_pos;
+      m_stopStruct = structArray->data() + arr->size();
+      assert(m_iterStruct <= m_stopStruct);
+    } else {
+      m_iterPacked = reinterpret_cast<TypedValue*>(arr + 1) + start_pos;
+      m_stopPacked = reinterpret_cast<TypedValue*>(arr + 1) + arr->m_size;
+      assert(m_iterPacked <= m_stopPacked);
+    }
+  }
 
    TypedValue* current() const {
-     return UNLIKELY(m_kind == kMixedKind) ? &currentElm()->data
-                                           : m_iterPacked;
+     return UNLIKELY(isMixed(m_kind)) ? &currentElm()->data
+                                      : m_iterPacked;
    }
 
    Elm* currentElm() const {
-     assert(m_kind == kMixedKind);
+     assert(isMixed(m_kind));
      return m_iterMixed;
    }
 
    bool empty() const {
-     return m_kind == kMixedKind ? m_iterMixed == m_stopMixed
-                                 : m_iterPacked == m_stopPacked;
+     return isMixed(m_kind) ? m_iterMixed == m_stopMixed
+                            : m_iterPacked == m_stopPacked;
    }
 
    void advance() {
-     if (UNLIKELY(m_kind == kMixedKind)) {
+     if (UNLIKELY(isMixed(m_kind))) {
        do {
          ++m_iterMixed;
        } while (!empty() && MixedArray::isTombstone(m_iterMixed->data.m_type));
@@ -274,15 +349,26 @@ struct MixedArray::ValIter {
   }
 
   ssize_t currentPos() const {
-    if (m_kind == kMixedKind) return m_iterMixed - asMixed(m_arr)->data();
+    if (isMixed(m_kind)) return m_iterMixed - asMixed(m_arr)->data();
+    if (m_kind == kStructKind) {
+      return m_iterStruct - StructArray::asStructArray(m_arr)->data();
+    }
     return m_iterPacked - reinterpret_cast<TypedValue*>(m_arr + 1);
   }
 
 private:
   ArrayData* const m_arr;
   ArrayData::ArrayKind const m_kind;
-  union { Elm* m_iterMixed; TypedValue* m_iterPacked; };
-  union { Elm* m_stopMixed; TypedValue* m_stopPacked; };
+  union {
+    Elm* m_iterMixed;
+    TypedValue* m_iterPacked;
+    TypedValue* m_iterStruct;
+  };
+  union {
+    Elm* m_stopMixed;
+    TypedValue* m_stopPacked;
+    TypedValue* m_stopStruct;
+  };
 };
 
 //////////////////////////////////////////////////////////////////////
@@ -342,6 +428,11 @@ ALWAYS_INLINE
 MixedArray* mallocArray(uint32_t cap, uint32_t mask) {
   auto const allocBytes = computeAllocBytes(cap, mask);
   return static_cast<MixedArray*>(std::malloc(allocBytes));
+}
+
+ALWAYS_INLINE
+size_t MixedArray::heapSize() const {
+  return computeAllocBytes(m_cap, m_tableMask);
 }
 
 //////////////////////////////////////////////////////////////////////

@@ -29,6 +29,7 @@ namespace HPHP {
 struct MemoryManager;
 struct Profiler;
 struct CodeCoverage;
+struct DebugHookHandler;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -66,6 +67,7 @@ struct ThreadInfo {
   // This pointer is set by ProfilerFactory
   Profiler *m_profiler;
   CodeCoverage *m_coverage;
+  DebugHookHandler *m_debugHookHandler; // set by DebugHookHandler::attach()
 
   Executing m_executing;
 
@@ -74,6 +76,12 @@ struct ThreadInfo {
 
   ThreadInfo();
   ~ThreadInfo();
+
+  /**
+   * Since this is often used as a static global, we want to do anything that
+   * might try to access ThreadInfo::s_threadInfo here instead of in the
+   * constructor */
+  void init();
 
   void onSessionInit();
   void onSessionExit();
@@ -90,12 +98,11 @@ inline void* stack_top_ptr() {
   return sp;
 }
 
-inline bool stack_in_bounds(ThreadInfo*& info) {
+inline bool stack_in_bounds(const ThreadInfo* info) {
   return stack_top_ptr() >= info->m_stacklimit;
 }
 
-// The ThreadInfo pointer itself must be from the current stack frame.
-inline void check_recursion(ThreadInfo*& info) {
+inline void check_recursion(const ThreadInfo* info) {
   extern void throw_infinite_recursion_exception();
   if (!stack_in_bounds(info)) {
     throw_infinite_recursion_exception();
@@ -103,6 +110,21 @@ inline void check_recursion(ThreadInfo*& info) {
 }
 
 ssize_t check_request_surprise(ThreadInfo *info);
+ssize_t check_request_surprise_unlikely();
+
+inline void check_native_recursion() {
+  char marker;
+  if (UNLIKELY(uintptr_t(&marker) < s_stackLimit + ThreadInfo::StackSlack)) {
+    throw Exception("Maximum stack size reached");
+  }
+}
+///////////////////////////////////////////////////////////////////////////////
+// code instrumentation or injections
+
+#define DECLARE_THREAD_INFO                     \
+  ThreadInfo *info ATTRIBUTE_UNUSED =           \
+    ThreadInfo::s_threadInfo.getNoCheck();      \
+  int lc ATTRIBUTE_UNUSED = 0;
 
 //////////////////////////////////////////////////////////////////////
 

@@ -1,0 +1,36 @@
+string(11) "5.6.99-hhvm"
+string(11) "PHP_VERSION"
+string(1) "c"
+string(1) "B"
+array(1) {
+  [0]=>
+  string(11) "5.6.99-hhvm"
+}
+string(31) "array (
+  0 => "5.6.99-hhvm",
+)"
+array(1) {
+  [0]=>
+  string(1) "c"
+}
+string(21) "array (
+  0 => "c",
+)"
+string(11) "5.6.99-hhvm"
+string(11) "PHP_VERSION"
+string(1) "c"
+string(1) "B"
+array(1) {
+  [0]=>
+  string(11) "5.6.99-hhvm"
+}
+string(31) "array (
+  0 => "5.6.99-hhvm",
+)"
+array(1) {
+  [0]=>
+  string(1) "c"
+}
+string(21) "array (
+  0 => "c",
+)"

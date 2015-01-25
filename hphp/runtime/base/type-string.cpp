@@ -29,7 +29,7 @@
 namespace HPHP {
 
 const String null_string = String();
-const StaticString empty_string("");
+const StaticString empty_string_ref("");
 
 ///////////////////////////////////////////////////////////////////////////////
 // statics
@@ -125,12 +125,23 @@ String::String(int64_t n) {
   m_px->setRefCount(1);
 }
 
-StringData* buildStringData(double n) {
-  char *buf;
-
+void formatPhpDblStr(char **pbuf, double n) {
   if (n == 0.0) n = 0.0; // so to avoid "-0" output
-  vspprintf(&buf, 0, "%.*G", 14, n);
+  vspprintf(pbuf, 0, "%.*G", 14, n);
+}
+
+StringData* buildStringData(double n) {
+  char *buf = nullptr;
+  formatPhpDblStr(&buf, n);
   return StringData::Make(buf, AttachString);
+}
+
+std::string convDblToStrWithPhpFormat(double n) {
+  char *buf = nullptr;
+  formatPhpDblStr(&buf, n);
+  std::string retVal(buf);
+  free(buf);
+  return retVal;
 }
 
 String::String(double n) {
@@ -149,14 +160,6 @@ String String::substr(int start, int length /* = 0x7FFFFFFF */,
     return String(r.ptr + start, length, CopyString);
   }
   return nullable ? String() : String("", 0, CopyString);
-}
-
-String String::lastToken(char delimiter) {
-  int pos = rfind(delimiter);
-  if (pos >= 0) {
-    return substr(pos + 1);
-  }
-  return *this;
 }
 
 int String::find(char ch, int pos /* = 0 */,
@@ -267,6 +270,12 @@ String &String::operator=(const String& str) {
   return *this;
 }
 
+String &String::operator=(const StaticString& str) {
+  if (m_px) decRefStr(m_px);
+  m_px = str.m_px;
+  return *this;
+}
+
 String &String::operator=(const Variant& var) {
   return operator=(var.toString());
 }
@@ -368,7 +377,7 @@ String operator+(const String & lhs, const String & rhs) {
 // conversions
 
 VarNR String::toKey() const {
-  if (!m_px) return VarNR(empty_string);
+  if (!m_px) return VarNR(staticEmptyString());
   int64_t n = 0;
   if (m_px->isStrictlyInteger(n)) {
     return VarNR(n);
@@ -460,6 +469,22 @@ bool String::more(const Resource& v2) const {
   return HPHP::more(m_px, v2);
 }
 
+int String::compare(litstr v2) const {
+  int lengthDiff = length() - strlen(v2);
+  if(lengthDiff == 0)
+    return memcmp(data(), v2, length());
+  else
+    return lengthDiff;
+}
+
+int String::compare(const String& v2) const {
+  int lengthDiff = length() - v2.length();
+  if(lengthDiff == 0)
+    return memcmp(data(), v2.data(), length());
+  else
+    return lengthDiff;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // comparison operators
 
@@ -518,14 +543,9 @@ void String::unserialize(VariableUnserializer *uns,
                     int(size));
   }
 
-  char ch = uns->readChar();
-  if (ch != ':') {
-    throw Exception("Expected ':' but got '%c'", ch);
-  }
-  ch = uns->readChar();
-  if (ch != delimiter0) {
-    throw Exception("Expected '%c' but got '%c'", delimiter0, ch);
-  }
+  uns->expectChar(':');
+  uns->expectChar(delimiter0);
+
   StringData *px = StringData::Make(int(size));
   auto const buf = px->bufferSlice();
   assert(size <= buf.len);
@@ -535,10 +555,7 @@ void String::unserialize(VariableUnserializer *uns,
   m_px = px;
   px->setRefCount(1);
 
-  ch = uns->readChar();
-  if (ch != delimiter1) {
-    throw Exception("Expected '%c' but got '%c'", delimiter1, ch);
-  }
+  uns->expectChar(delimiter1);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -567,11 +584,6 @@ StaticString::StaticString(std::string s) {
   m_px = makeStaticString(s.c_str(), s.size());
 }
 
-StaticString::StaticString(const StaticString &str) {
-  assert(str.m_px->isStatic());
-  m_px = str.m_px;
-}
-
 StaticString& StaticString::operator=(const StaticString &str) {
   // Assignment to a StaticString is ignored. Generated code
   // should never use a StaticString on the left-hand side of
@@ -597,7 +609,6 @@ const StaticString
   s_array("array"),
   s_object("object"),
   s_resource("resource"),
-  s_namedlocal("namedlocal"),
   s_ref("reference");
 
 String getDataTypeString(DataType t) {
@@ -613,13 +624,11 @@ String getDataTypeString(DataType t) {
     case KindOfObject:     return s_object;
     case KindOfResource:   return s_resource;
     case KindOfRef:        return s_ref;
-    case KindOfNamedLocal: return s_namedlocal;
 
-    default:
-      assert(false);
+    case KindOfClass:
       break;
   }
-  return empty_string;
+  not_reached();
 }
 
 //////////////////////////////////////////////////////////////////////////////

@@ -25,6 +25,7 @@
 #include "hphp/runtime/base/complex-types.h"
 
 #include "hphp/util/trace.h"
+#include "hphp/util/dataflow-worklist.h"
 
 #include "hphp/hhbbc/interp-state.h"
 #include "hphp/hhbbc/interp.h"
@@ -33,6 +34,8 @@
 #include "hphp/hhbbc/cfg.h"
 #include "hphp/hhbbc/unit-util.h"
 #include "hphp/hhbbc/class-util.h"
+#include "hphp/hhbbc/func-util.h"
+#include "hphp/hhbbc/options-util.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -44,31 +47,60 @@ TRACE_SET_MOD(hhbbc);
 
 const StaticString s_86pinit("86pinit");
 const StaticString s_86sinit("86sinit");
-const StaticString s_Continuation("Continuation");
-const StaticString s_http_response_header("http_response_header");
+const StaticString s_AsyncGenerator("HH\\AsyncGenerator");
+const StaticString s_Generator("Generator");
 
 //////////////////////////////////////////////////////////////////////
 
+/*
+ * Short-hand to get the rpoId of a block in a given FuncAnalysis.  (The RPO
+ * ids are re-assigned per analysis.)
+ */
+uint32_t rpoId(const FuncAnalysis& ai, borrowed_ptr<php::Block> blk) {
+  return ai.bdata[blk->id].rpoId;
+}
+
+State pseudomain_entry_state(borrowed_ptr<const php::Func> func) {
+  auto ret = State{};
+  ret.initialized = true;
+  ret.thisAvailable = false;
+  ret.locals.resize(func->locals.size());
+  ret.iters.resize(func->iters.size());
+  for (auto& l : ret.locals) l = TGen;
+  return ret;
+}
+
 State entry_state(const Index& index,
                   Context const ctx,
-                  ClassAnalysis* clsAnalysis) {
+                  ClassAnalysis* clsAnalysis,
+                  const std::vector<Type>* knownArgs) {
   auto ret = State{};
   ret.initialized = true;
   ret.thisAvailable = index.lookup_this_available(ctx.func);
   ret.locals.resize(ctx.func->locals.size());
   ret.iters.resize(ctx.func->iters.size());
 
+  // TODO(#3788877): when we're doing a context sensitive analyze_func_inline,
+  // thisAvailable and specific type of $this should be able to come from the
+  // call context.
+
   auto locId = uint32_t{0};
   for (; locId < ctx.func->params.size(); ++locId) {
     // Parameters may be Uninit (i.e. no InitCell).  Also note that if
     // a function takes a param by ref, it might come in as a Cell
     // still if FPassC was used.
+    if (knownArgs) {
+      ret.locals[locId] = locId < knownArgs->size() ? (*knownArgs)[locId]
+                                                    : TUninit;
+      continue;
+    }
     ret.locals[locId] = ctx.func->params[locId].byRef ? TGen : TCell;
   }
 
   /*
-   * Closures have a hidden local that's always the first local, which
-   * stores the closure itself.
+   * Closures have a hidden local that's always the first (non-parameter)
+   * local, which stores the closure itself, and we also need to look up the
+   * types of use vars from the index.
    */
   if (ctx.func->isClosureBody) {
     assert(locId < ret.locals.size());
@@ -77,31 +109,109 @@ State entry_state(const Index& index,
     assert(rcls && "Closure classes must always be unique and must resolve");
     ret.locals[locId++] = objExact(*rcls);
   }
+  auto const useVars = ctx.func->isClosureBody
+    ? index.lookup_closure_use_vars(ctx.func)
+    : std::vector<Type>{};
 
-  for (; locId < ctx.func->locals.size(); ++locId) {
+  auto afterParamsLocId = uint32_t{0};
+  for (; locId < ctx.func->locals.size(); ++locId, ++afterParamsLocId) {
     /*
-     * - http_response_header can be set unpredictably. Don't try to guess
-     *   its' type
-     *
-     *  - Closures don't (necessarily) start with the frame locals
-     *    uninitialized.
-     *
-     * Ideas:
-     *
-     *  - for closures, since they are all unique to their creation
-     *    sites and in the same unit, looking at the CreateCl could
-     *    tell the types of used vars, even in single unit mode.
+     * Some of the closure locals are mapped to used variables or static
+     * locals.  The types of use vars are looked up from the index, but we
+     * don't currently do anything to try to track closure static local types.
      */
-    auto name = ctx.func->locals[locId]->name;
-    if (ctx.func->isClosureBody
-        || (name && name->isame(s_http_response_header.get()))) {
+    if (ctx.func->isClosureBody) {
+      if (afterParamsLocId < useVars.size()) {
+        ret.locals[locId] = useVars[afterParamsLocId];
+        continue;
+      }
+      if (afterParamsLocId < ctx.func->staticLocals.size()) {
+        ret.locals[locId] = TGen;
+        continue;
+      }
+    }
+
+    // Otherwise the local will start uninitialized, like normal.
+    ret.locals[locId] = TUninit;
+  }
+
+  // Finally, make sure any volatile locals are set to Gen, even if they are
+  // parameters.
+  for (auto locId = uint32_t{0}; locId < ctx.func->locals.size(); ++locId) {
+    if (is_volatile_local(ctx.func, borrow(ctx.func->locals[locId]))) {
       ret.locals[locId] = TGen;
-    } else {
-      ret.locals[locId] = TUninit;
     }
   }
 
   return ret;
+}
+
+/*
+ * Helper for do_analyze to initialize the states for all function entries
+ * (i.e. each dv init and the main entry), and all of them count as places the
+ * function could be entered, so they all must be visited at least once.
+ *
+ * If we're entering at a DV-init, all higher parameter locals must be Uninit.
+ * It is also possible that the DV-init is reachable from within the function
+ * with these parameter locals already initialized (although the normal php
+ * emitter can't do this), but that case will be discovered when iterating.
+ */
+dataflow_worklist<uint32_t>
+prepare_incompleteQ(const Index& index,
+                    FuncAnalysis& ai,
+                    ClassAnalysis* clsAnalysis,
+                    const std::vector<Type>* knownArgs) {
+  auto incompleteQ     = dataflow_worklist<uint32_t>(ai.rpoBlocks.size());
+  auto const ctx       = ai.ctx;
+  auto const numParams = ctx.func->params.size();
+
+  auto const entryState = [&] {
+    if (!is_pseudomain(ctx.func)) {
+      return entry_state(index, ctx, clsAnalysis, knownArgs);
+    }
+
+    assert(!knownArgs && !clsAnalysis);
+    assert(numParams == 0);
+    return pseudomain_entry_state(ctx.func);
+  }();
+
+  if (knownArgs) {
+    // When we have known args, we only need to add one of the entry points to
+    // the initial state, since we know how many arguments were passed.
+    auto const useDvInit = [&] {
+      if (knownArgs->size() >= numParams) return false;
+      for (auto i = knownArgs->size(); i < numParams; ++i) {
+        if (auto const dv = ctx.func->params[i].dvEntryPoint) {
+          ai.bdata[dv->id].stateIn = entryState;
+          incompleteQ.push(rpoId(ai, dv));
+          return true;
+        }
+      }
+      return false;
+    }();
+
+    if (!useDvInit) {
+      ai.bdata[ctx.func->mainEntry->id].stateIn = entryState;
+      incompleteQ.push(rpoId(ai, ctx.func->mainEntry));
+    }
+
+    return incompleteQ;
+  }
+
+  for (auto paramId = uint32_t{0}; paramId < numParams; ++paramId) {
+    if (auto const dv = ctx.func->params[paramId].dvEntryPoint) {
+      ai.bdata[dv->id].stateIn = entryState;
+      incompleteQ.push(rpoId(ai, dv));
+      for (auto locId = paramId; locId < numParams; ++locId) {
+        ai.bdata[dv->id].stateIn.locals[locId] = TUninit;
+      }
+    }
+  }
+
+  ai.bdata[ctx.func->mainEntry->id].stateIn = entryState;
+  incompleteQ.push(rpoId(ai, ctx.func->mainEntry));
+
+  return incompleteQ;
 }
 
 /*
@@ -119,19 +229,17 @@ Context adjust_closure_context(Context ctx) {
   return ctx;
 }
 
-FuncAnalysis do_analyze(const Index& index,
-                        Context const inputCtx,
-                        ClassAnalysis* clsAnalysis) {
-  assert(inputCtx.func != inputCtx.unit->pseudomain.get() &&
-         "pseudomains not supported");
-  FTRACE(2, "{:-^70}\n", "Analyze");
-
+FuncAnalysis do_analyze_collect(const Index& index,
+                                Context const inputCtx,
+                                CollectedInfo& collect,
+                                ClassAnalysis* clsAnalysis,
+                                const std::vector<Type>* knownArgs) {
   auto const ctx = adjust_closure_context(inputCtx);
   FuncAnalysis ai(ctx);
 
-  auto rpoId = [&] (borrowed_ptr<php::Block> blk) {
-    return ai.bdata[blk->id].rpoId;
-  };
+  Trace::Bump bumper{Trace::hhbbc, kTraceFuncBump,
+    is_trace_function(ctx.cls, ctx.func)};
+  FTRACE(2, "{:-^70}\n-- {}\n", "Analyze", show(ctx));
 
   /*
    * Set of RPO ids that still need to be visited.
@@ -141,25 +249,7 @@ FuncAnalysis do_analyze(const Index& index,
    * back edges---when state merges cause a change to the block
    * stateIn, we will add it to this queue so it gets visited again.
    */
-  std::set<uint32_t> incompleteQ;
-
-  /*
-   * We need to initialize the states for all function entries
-   * (i.e. each dv init and the main entry), and all of them count as
-   * places the function could be entered, so they all must be visited
-   * at least once (add them to incompleteQ).
-   */
-  {
-    auto const entryState = entry_state(index, ctx, clsAnalysis);
-    for (auto& param : ctx.func->params) {
-      if (auto const dv = param.dvEntryPoint) {
-        ai.bdata[dv->id].stateIn = entryState;
-        incompleteQ.insert(rpoId(dv));
-      }
-    }
-    ai.bdata[ctx.func->mainEntry->id].stateIn = entryState;
-    incompleteQ.insert(rpoId(ctx.func->mainEntry));
-  }
+  auto incompleteQ = prepare_incompleteQ(index, ai, clsAnalysis, knownArgs);
 
   /*
    * There are potentially infinitely growing types when we're using
@@ -189,9 +279,7 @@ FuncAnalysis do_analyze(const Index& index,
    * means less iterations.
    */
   while (!incompleteQ.empty()) {
-    auto const blk = ai.rpoBlocks[*begin(incompleteQ)];
-    incompleteQ.erase(begin(incompleteQ));
-    PropertiesInfo props(index, inputCtx, clsAnalysis);
+    auto const blk = ai.rpoBlocks[incompleteQ.pop()];
 
     if (nonWideVisits[blk->id]++ > options.analyzeFuncWideningLimit) {
       nonWideVisits[blk->id] = 0;
@@ -199,7 +287,7 @@ FuncAnalysis do_analyze(const Index& index,
 
     FTRACE(2, "block #{}\nin {}{}", blk->id,
       state_string(*ctx.func, ai.bdata[blk->id].stateIn),
-      property_state_string(props));
+      property_state_string(collect.props));
     ++interp_counter;
 
     auto propagate = [&] (php::Block& target, const State& st) {
@@ -223,14 +311,14 @@ FuncAnalysis do_analyze(const Index& index,
         needsWiden ? widen_into(ai.bdata[target.id].stateIn, st)
                    : merge_into(ai.bdata[target.id].stateIn, st);
       if (changed) {
-        incompleteQ.insert(rpoId(&target));
+        incompleteQ.push(rpoId(ai, &target));
       }
       FTRACE(4, "target new {}",
         state_string(*ctx.func, ai.bdata[target.id].stateIn));
     };
 
     auto stateOut = ai.bdata[blk->id].stateIn;
-    auto interp   = Interp { index, ctx, props, blk, stateOut };
+    auto interp   = Interp { index, ctx, collect, blk, stateOut };
     auto flags    = run(interp, propagate);
     if (flags.returned) {
       ai.inferredReturn = union_of(std::move(ai.inferredReturn),
@@ -238,19 +326,20 @@ FuncAnalysis do_analyze(const Index& index,
     }
   }
 
-  /**
-   * Async functions always return WaitH<T>, where T is the type returned
-   * internally.
-   */
-  if (ctx.func->isAsync) {
-    ai.inferredReturn = wait_handle(index, ai.inferredReturn);
-  }
+  ai.closureUseTypes = std::move(collect.closureUseTypes);
 
-  /**
-   * Generators always return Continuation object.
-   */
   if (ctx.func->isGenerator) {
-    ai.inferredReturn = objExact(index.builtin_class(s_Continuation.get()));
+    if (ctx.func->isAsync) {
+      // Async generators always return AsyncGenerator object.
+      ai.inferredReturn = objExact(index.builtin_class(s_AsyncGenerator.get()));
+    } else {
+      // Non-async generators always return Generator object.
+      ai.inferredReturn = objExact(index.builtin_class(s_Generator.get()));
+    }
+  } else if (ctx.func->isAsync) {
+    // Async functions always return WaitH<T>, where T is the type returned
+    // internally.
+    ai.inferredReturn = wait_handle(index, ai.inferredReturn);
   }
 
   /*
@@ -292,6 +381,14 @@ FuncAnalysis do_analyze(const Index& index,
   return ai;
 }
 
+FuncAnalysis do_analyze(const Index& index,
+                        Context const ctx,
+                        ClassAnalysis* clsAnalysis,
+                        const std::vector<Type>* knownArgs) {
+  CollectedInfo collect { index, ctx, clsAnalysis, nullptr };
+  return do_analyze_collect(index, ctx, collect, clsAnalysis, knownArgs);
+}
+
 //////////////////////////////////////////////////////////////////////
 
 /*
@@ -312,13 +409,23 @@ void expand_hni_prop_types(ClassAnalysis& clsAnalysis) {
     if (it == end(propState)) return;
 
     /*
-     * When HardTypeHints isn't on, we don't require the constraints
-     * to actually match, and relax all the HNI types to Gen.  (This
-     * is because extensions may wish to assign to properties after a
-     * typehint guard, which is going to fail without this flag on.)
+     * When HardTypeHints isn't on, AllFuncsInterceptable is on, or any
+     * InterceptableFunctions are listed, we don't require the constraints to
+     * actually match, and relax all the HNI types to Gen.
+     *
+     * This is because extensions may wish to assign to properties after a
+     * typehint guard, which is going to fail without HardTypeHints.  Or, with
+     * AllFuncsInterceptable or InterceptableFunctions, it's quite possible
+     * that some function calls in systemlib might not be known to return
+     * things matching the property type hints for some properties, or not to
+     * take their arguments by reference.
      */
     auto const hniTy =
-      !options.HardTypeHints ? TGen : from_hni_constraint(prop.typeConstraint);
+      !options.HardTypeHints ||
+          options.AllFuncsInterceptable ||
+          !options.InterceptableFunctions.empty()
+        ? TGen
+        : from_hni_constraint(prop.typeConstraint);
     if (it->second.subtypeOf(hniTy)) {
       it->second = hniTy;
       return;
@@ -362,7 +469,24 @@ FuncAnalysis::FuncAnalysis(Context ctx)
 FuncAnalysis analyze_func(const Index& index, Context const ctx) {
   Trace::Bump bumper{Trace::hhbbc, kSystemLibBump,
     is_systemlib_part(*ctx.unit)};
-  return do_analyze(index, ctx, nullptr);
+  return do_analyze(index, ctx, nullptr, nullptr);
+}
+
+FuncAnalysis analyze_func_collect(const Index& index,
+                                  Context const ctx,
+                                  CollectedInfo& collect) {
+  Trace::Bump bumper{Trace::hhbbc, kSystemLibBump,
+    is_systemlib_part(*ctx.unit)};
+  return do_analyze_collect(index, ctx, collect, nullptr, nullptr);
+}
+
+FuncAnalysis analyze_func_inline(const Index& index,
+                                 Context const ctx,
+                                 std::vector<Type> args) {
+  FTRACE(2, "{:.^70}\n", "Inline Interp");
+  SCOPE_EXIT { FTRACE(2, "{:.^70}\n", "End Inline Interp"); };
+  assert(!ctx.func->isClosureBody);
+  return do_analyze(index, ctx, nullptr, &args);
 }
 
 ClassAnalysis analyze_class(const Index& index, Context const ctx) {
@@ -448,14 +572,16 @@ ClassAnalysis analyze_class(const Index& index, Context const ctx) {
     do_analyze(
       index,
       Context { ctx.unit, f, ctx.cls },
-      &clsAnalysis
+      &clsAnalysis,
+      nullptr
     );
   }
   if (auto f = find_method(ctx.cls, s_86sinit.get())) {
     do_analyze(
       index,
       Context { ctx.unit, f, ctx.cls },
-      &clsAnalysis
+      &clsAnalysis,
+      nullptr
     );
   }
 
@@ -511,7 +637,8 @@ ClassAnalysis analyze_class(const Index& index, Context const ctx) {
         do_analyze(
           index,
           Context { ctx.unit, borrow(f), ctx.cls },
-          &clsAnalysis
+          &clsAnalysis,
+          nullptr
         )
       );
     }
@@ -522,7 +649,8 @@ ClassAnalysis analyze_class(const Index& index, Context const ctx) {
         do_analyze(
           index,
           Context { ctx.unit, invoke, c },
-          &clsAnalysis
+          &clsAnalysis,
+          nullptr
         )
       );
     }
@@ -587,8 +715,8 @@ locally_propagated_states(const Index& index,
   std::vector<std::pair<State,StepFlags>> ret;
   ret.reserve(blk->hhbcs.size() + 1);
 
-  PropertiesInfo props { index, ctx, nullptr };
-  auto interp = Interp { index, ctx, props, blk, state };
+  CollectedInfo collect { index, ctx, nullptr, nullptr };
+  auto interp = Interp { index, ctx, collect, blk, state };
   for (auto& op : blk->hhbcs) {
     ret.emplace_back(state, StepFlags{});
     ret.back().second = step(interp, op);

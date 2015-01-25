@@ -1,6 +1,6 @@
 <?hh
 require_once __DIR__.'/../Framework.php';
-
+require_once __DIR__.'/../utils.php';
 class Yii extends Framework {
   public function __construct(string $name) {
     $env_vars = Map { "PHP_BINARY" =>  get_runtime_build(true) };
@@ -11,15 +11,14 @@ class Yii extends Framework {
     $files = glob($this->getInstallRoot().
                   "/tests/assets/*/CAssetManagerTest.php");
     foreach ($files as $file) {
-      verbose("Removing $file\n", Options::$verbose);
-      unlink($file);
+      verbose("Removing $file\n");
+      delete_file($file);
     }
   }
 
-  protected function install(): void {
-    parent::install();
-    verbose("Creating a new phpunit.xml for running the yii tests.\n",
-            Options::$verbose);
+  <<Override>>
+  protected function extraPostComposer(): void {
+    verbose("Creating a new phpunit.xml for running the yii tests.\n");
     $phpunit_xml = <<<XML
 <phpunit bootstrap="bootstrap.php"
     colors="false"
@@ -28,14 +27,14 @@ class Yii extends Framework {
     convertWarningsToExceptions="true"
     stopOnFailure="false">
 <testsuites>
-  <testsuite name="yii">
+  <testsuite name="yiitestsuite">
     <directory suffix="Test.php">./</directory>
   </testsuite>
 </testsuites>
 </phpunit>
 XML;
     file_put_contents($this->getTestPath()."/phpunit.xml.dist", $phpunit_xml);
-    unlink($this->getTestPath()."/phpunit.xml");
+    delete_file($this->getTestPath()."/phpunit.xml");
   }
 
   protected function isInstalled(): bool {
@@ -48,7 +47,7 @@ XML;
       // are there; otherwise we need a redownload.
       foreach ($extra_files as $file) {
         if (!file_exists($file)) {
-          remove_dir_recursive($this->getInstallRoot());
+          remove_dir_recursive(nullthrows($this->getInstallRoot()));
           return false;
         }
       }

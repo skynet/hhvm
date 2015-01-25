@@ -21,6 +21,13 @@ function gd_info(): array;
 function getimagesize(string $filename,
                       mixed &$imageinfo = null): mixed;
 
+/* Identical to getimagesize() except that getimagesizefromstring() accepts
+ * a string instead of a file name as the first parameter.
+ */
+<<__Native>>
+function getimagesizefromstring(string $filename,
+                      mixed &$imageinfo = null): mixed;
+
 /* Returns the extension for the given IMAGETYPE_XXX constant.
  */
 <<__Native>>
@@ -434,6 +441,9 @@ function imagecreatefromjpeg(string $filename): mixed;
 <<__Native>>
 function imagecreatefrompng(string $filename): mixed;
 
+<<__Native>>
+function imagecreatefromwebp(string $filename): mixed;
+
 /* imagecreatefromstring() returns an image identifier representing the image
  * obtained from the given data. These types will be automatically detected if
  * your build of PHP supports them: JPEG, PNG, GIF, WBMP, and GD2.
@@ -697,6 +707,13 @@ function imagepng(resource $image,
                   int $quality = -1,
                   int $filters = -1): bool;
 
+/* Outputs or saves a webp image from the given image.
+ */
+<<__Native>>
+function imagewebp(resource $image,
+                  string $filename = "",
+                  int $quality = 80): bool;
+
 /* imagepolygon() creates a polygon in the given image.
  */
 <<__Native>>
@@ -893,3 +910,20 @@ function png2wbmp(string $pngname,
                   int $dest_height,
                   int $dest_width,
                   int $threshold): bool;
+
+/**
+ * imagepalettecopy() copies the palette from the source image
+ * to the destination image.
+ */
+<<__Native>>
+function imagepalettecopy(resource $dst,
+                          resource $src): mixed;
+
+/**
+ * Sets the interpolation method, setting an interpolation method
+ * effects the rendering of various functions in GD,
+ * such as the imagerotate() function.
+ */
+<<__Native>>
+function imagesetinterpolation(resource $img,
+                               int $method = IMG_BILINEAR_FIXED): bool;

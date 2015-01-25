@@ -29,20 +29,27 @@ public:
 
 public:
   explicit AdminRequestHandler(int timeout);
+
   // implementing RequestHandler
-  virtual void handleRequest(Transport *transport);
-  virtual void abortRequest(Transport *transport);
+  void setupRequest(Transport* transport) override;
+  void teardownRequest(Transport* transport) noexcept override;
+  void handleRequest(Transport *transport) override;
+  void abortRequest(Transport *transport) override;
+  void logToAccessLog(Transport* transport) override;
 
 private:
   bool handleCheckRequest  (const std::string &cmd, Transport *transport);
   bool handleStatusRequest (const std::string &cmd, Transport *transport);
+  bool handleMemoryRequest (const std::string &cmd, Transport *transport);
   bool handleStatsRequest  (const std::string &cmd, Transport *transport);
   bool handleProfileRequest(const std::string &cmd, Transport *transport);
   bool handleDumpCacheRequest (const std::string &cmd, Transport *transport);
   bool handleConstSizeRequest (const std::string &cmd, Transport *transport);
   bool handleStaticStringsRequest(const std::string &cmd,
                                   Transport *transport);
-  bool handleVMRequest      (const std::string &cnd, Transport *transport);
+  bool handleVMRequest      (const std::string &cmd, Transport *transport);
+  void handleProxyRequest(const std::string& cmd, Transport *transport);
+  bool handleRandomApcRequest (const std::string &cmd, Transport *transport);
 
 #ifdef GOOGLE_CPU_PROFILER
   bool handleCPUProfilerRequest (const std::string &cmd, Transport *transport);

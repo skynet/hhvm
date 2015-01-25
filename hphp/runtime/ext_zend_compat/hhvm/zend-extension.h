@@ -6,17 +6,21 @@
 typedef struct _zend_module_entry zend_module_entry;
 struct _zend_module_entry;
 
-class ZendExtension : public HPHP::Extension {
+namespace HPHP {
+
+class ZendExtension final : public Extension {
 private:
   zend_module_entry *getEntry();
 public:
   /* implicit */ ZendExtension(const char* name);
-  virtual void moduleInit() override;
-  virtual void moduleShutdown() override;
-  virtual void threadShutdown() override;
-  virtual void requestInit() override;
-  virtual void requestShutdown() override;
+  void moduleInit() override;
+  void moduleShutdown() override;
+  void threadShutdown() override;
+  void requestInit() override;
+  void requestShutdown() override;
+  bool moduleEnabled() const override;
   static ZendExtension* GetByModuleNumber(int module_number);
 };
 
+}
 #endif

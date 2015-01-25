@@ -23,10 +23,10 @@
 #include <string>
 #include <vector>
 
-#include "folly/RWSpinLock.h"
-#include "folly/Synchronized.h"
-#include "folly/stats/Histogram.h"
-#include "folly/stats/MultiLevelTimeSeries.h"
+#include <folly/RWSpinLock.h>
+#include <folly/Synchronized.h>
+#include <folly/stats/Histogram.h>
+#include <folly/stats/MultiLevelTimeSeries.h>
 
 namespace HPHP {
 
@@ -197,6 +197,8 @@ class ExportedTimeSeries {
   void addValue(int64_t value);
   void addValue(int64_t value, int64_t times);
   void addValueAggregated(int64_t sum, int64_t nsamples);
+
+  int64_t getSum();
 
   void exportAll(const std::string& prefix,
                  std::map<std::string, int64_t>& statsMap);

@@ -17,13 +17,16 @@
 #ifndef incl_HPHP_JIT_CODE_GEN_H_
 #define incl_HPHP_JIT_CODE_GEN_H_
 
+#include "hphp/runtime/vm/jit/asm-info.h"
 #include "hphp/runtime/vm/jit/types.h"
 #include "hphp/runtime/vm/jit/state-vector.h"
 #include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/util/code-cache.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
-namespace HPHP { namespace JIT {
-
-struct RegAllocInfo;
+namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
 
 enum class SyncOptions {
   kNoSyncPoint,
@@ -32,86 +35,48 @@ enum class SyncOptions {
   kSmashableAndSyncPoint,
 };
 
-// Returned information from cgCallHelper
-struct CallHelperInfo {
-  TCA returnAddress;
-};
-
-// Information about where code was generated, for pretty-printing.
-struct AsmInfo {
-  explicit AsmInfo(const IRUnit& unit)
-    : instRanges(unit, TcaRange(nullptr, nullptr))
-    , asmRanges(unit, TcaRange(nullptr, nullptr))
-    , astubRanges(unit, TcaRange(nullptr, nullptr))
-  {}
-
-  // Asm address info for each instruction and block
-  StateVector<IRInstruction,TcaRange> instRanges;
-  StateVector<Block,TcaRange> asmRanges;
-  StateVector<Block,TcaRange> astubRanges;
-
-  void updateForInstruction(IRInstruction* inst, TCA start, TCA end);
-};
-
-typedef StateVector<IRInstruction, RegSet> LiveRegs;
-
 // Stuff we need to preserve between blocks while generating code,
 // and address information produced during codegen.
 struct CodegenState {
-  CodegenState(const IRUnit& unit, const RegAllocInfo& regs,
-               const LiveRegs& liveRegs, AsmInfo* asmInfo)
-    : patches(unit, nullptr)
-    , addresses(unit, nullptr)
-    , regs(regs)
-    , liveRegs(liveRegs)
+  CodegenState(const IRUnit& unit, AsmInfo* asmInfo, CodeBlock& frozen)
+    : unit(unit)
     , asmInfo(asmInfo)
-    , catches(unit, CatchInfo())
+    , frozen(frozen)
+    , catch_offsets(unit, 0)
+    , labels(unit, Vlabel())
+    , locs(unit, Vloc{})
   {}
 
-  // Each block has a list of addresses to patch, and an address if
-  // it's already been emitted.
-  StateVector<Block,void*> patches;
-  StateVector<Block,TCA> addresses;
-
-  // True if this block's terminal Jmp has a desination equal to the
-  // next block in the same assmbler.
-  bool noTerminalJmp;
-
-  // output from register allocator
-  const RegAllocInfo& regs;
-
-  // for each instruction, holds the RegSet of registers that must be
-  // preserved across that instruction.  This is for push/pop of caller-saved
-  // registers.
-  const LiveRegs& liveRegs;
+  const IRUnit& unit;
 
   // Output: start/end ranges of machine code addresses of each instruction.
   AsmInfo* asmInfo;
 
-  // Used to pass information about the state of the world at native
-  // calls between cgCallHelper and cgBeginCatch.
-  StateVector<Block, CatchInfo> catches;
+  // Frozen code section, when we need to eagerly generate stubs
+  CodeBlock& frozen;
+
+  // Each catch block needs to know the number of bytes pushed at the
+  // callsite so it can fix rsp before executing the catch block.
+  StateVector<Block, Offset> catch_offsets;
+
+  // Have we progressed past the guards? Used to suppress TransBCMappings until
+  // we're translating code that can properly be attributed to specific
+  // bytecode.
+  bool pastGuards{false};
+
+  // vasm block labels, one for each hhir block
+  StateVector<Block,Vlabel> labels;
+
+  // vlocs for each SSATmp used or defined in reachable blocks
+  StateVector<SSATmp,Vloc> locs;
 };
 
-const Func* loadClassCtor(Class* cls);
+// Generate machine code; converts to vasm or llvm, further optimizes,
+// emits code into main/cold/frozen sections, allocates rds and global
+// data, and adds fixup metadata.
+void genCode(IRUnit&);
 
-ObjectData* createClHelper(Class*, int, ActRec*, TypedValue*);
-
-LiveRegs computeLiveRegs(const IRUnit& unit, const RegAllocInfo& regs);
-
-void genCode(CodeBlock&              mainCode,
-             CodeBlock&              stubsCode,
-             IRUnit&                 unit,
-             std::vector<TransBCMapping>* bcMap,
-             MCGenerator*            mcg,
-             const RegAllocInfo&     regs);
-
-struct CodeGenerator {
-  virtual ~CodeGenerator() {
-  }
-  virtual Address cgInst(IRInstruction* inst) = 0;
-};
-
+///////////////////////////////////////////////////////////////////////////////
 }}
 
 #endif

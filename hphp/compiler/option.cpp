@@ -19,9 +19,9 @@
 #include "hphp/compiler/analysis/file_scope.h"
 #include "hphp/compiler/analysis/class_scope.h"
 #include "hphp/compiler/analysis/variable_table.h"
+#include "hphp/runtime/base/ini-setting.h"
 #include "hphp/parser/scanner.h"
 #include "hphp/util/logger.h"
-#include "hphp/util/db-query.h"
 #include "hphp/util/text-util.h"
 #include "hphp/util/process.h"
 #include "hphp/hhbbc/hhbbc.h"
@@ -30,6 +30,7 @@
 #include <set>
 #include <vector>
 #include "hphp/runtime/base/preg.h"
+#include "hphp/runtime/base/config.h"
 
 namespace HPHP {
 
@@ -61,7 +62,6 @@ map<string, int> Option::DynamicFunctionCalls;
 bool Option::GeneratePickledPHP = false;
 bool Option::GenerateInlinedPHP = false;
 bool Option::GenerateTrimmedPHP = false;
-bool Option::GenerateInferredTypes = false;
 bool Option::ConvertSuperGlobals = false;
 bool Option::ConvertQOpExpressions = false;
 string Option::ProgramPrologue;
@@ -99,6 +99,7 @@ bool Option::SeparateCompilation = false;
 bool Option::SeparateCompLib = false;
 bool Option::AnalyzePerfectVirtuals = true;
 bool Option::HardTypeHints = true;
+bool Option::HardReturnTypeHints = false;
 bool Option::HardConstProp = true;
 
 bool Option::KeepStatementsWithNoEffect = false;
@@ -121,6 +122,9 @@ bool Option::EnableShortTags = true;
 bool Option::EnableAspTags = false;
 bool Option::EnableXHP = false;
 bool Option::IntsOverflowToInts = false;
+HackStrictOption
+  Option::StrictArrayFillKeys = HackStrictOption::OFF,
+  Option::DisallowDynamicVarEnvFuncs = HackStrictOption::OFF;
 int Option::ParserThreadCount = 0;
 
 int Option::GetScannerType() {
@@ -135,11 +139,8 @@ int Option::GetScannerType() {
 int Option::InvokeFewArgsCount = 6;
 int Option::InlineFunctionThreshold = -1;
 bool Option::EliminateDeadCode = true;
-bool Option::CopyProp = false;
 bool Option::LocalCopyProp = true;
-bool Option::StringLoopOpts = true;
 int Option::AutoInline = 0;
-bool Option::ControlFlow = true;
 bool Option::VariableCoalescing = false;
 bool Option::ArrayAccessIdempotent = false;
 bool Option::DumpAst = false;
@@ -155,50 +156,53 @@ StringBag Option::OptionStrings;
 
 bool Option::GenerateDocComments = true;
 
-bool (*Option::PersistenceHook)(BlockScopeRawPtr scope, FileScopeRawPtr file);
-
 ///////////////////////////////////////////////////////////////////////////////
 // load from HDF file
 
-void Option::LoadRootHdf(const Hdf &roots, map<string, string> &map) {
+void Option::LoadRootHdf(const IniSetting::Map& ini, const Hdf &roots,
+                         map<string, string> &map) {
   if (roots.exists()) {
     for (Hdf hdf = roots.firstChild(); hdf.exists(); hdf = hdf.next()) {
-      map[hdf["root"].get()] = hdf["path"].get();
+      map[Config::Get(ini, hdf["root"])] = Config::Get(ini, hdf["path"]);
     }
   }
 }
 
-void Option::LoadRootHdf(const Hdf &roots, vector<string> &vec) {
+void Option::LoadRootHdf(const IniSetting::Map& ini, const Hdf &roots,
+                         vector<string> &vec) {
   if (roots.exists()) {
     for (Hdf hdf = roots.firstChild(); hdf.exists(); hdf = hdf.next()) {
-      vec.push_back(hdf.getString(""));
+      vec.push_back(Config::GetString(ini, hdf,""));
     }
   }
 }
 
-void Option::Load(Hdf &config) {
-  LoadRootHdf(config["IncludeRoots"], IncludeRoots);
-  LoadRootHdf(config["AutoloadRoots"], AutoloadRoots);
+void Option::Load(const IniSetting::Map& ini, Hdf &config) {
+  LoadRootHdf(ini, config["IncludeRoots"], IncludeRoots);
+  LoadRootHdf(ini, config["AutoloadRoots"], AutoloadRoots);
 
-  config["PackageFiles"].get(PackageFiles);
-  config["IncludeSearchPaths"].get(IncludeSearchPaths);
-  config["PackageDirectories"].get(PackageDirectories);
-  config["PackageExcludeDirs"].get(PackageExcludeDirs);
-  config["PackageExcludeFiles"].get(PackageExcludeFiles);
-  config["PackageExcludePatterns"].get(PackageExcludePatterns);
-  config["PackageExcludeStaticDirs"].get(PackageExcludeStaticDirs);
-  config["PackageExcludeStaticFiles"].get(PackageExcludeStaticFiles);
-  config["PackageExcludeStaticPatterns"].get(PackageExcludeStaticPatterns);
-  CachePHPFile = config["CachePHPFile"].getBool();
+  Config::Get(ini, config["PackageFiles"], PackageFiles);
+  Config::Get(ini, config["IncludeSearchPaths"], IncludeSearchPaths);
+  Config::Get(ini, config["PackageDirectories"], PackageDirectories);
+  Config::Get(ini, config["PackageExcludeDirs"], PackageExcludeDirs);
+  Config::Get(ini, config["PackageExcludeFiles"], PackageExcludeFiles);
+  Config::Get(ini, config["PackageExcludePatterns"], PackageExcludePatterns);
+  Config::Get(ini, config["PackageExcludeStaticDirs"],
+              PackageExcludeStaticDirs);
+  Config::Get(ini, config["PackageExcludeStaticFiles"],
+              PackageExcludeStaticFiles);
+  Config::Get(ini, config["PackageExcludeStaticPatterns"],
+              PackageExcludeStaticPatterns);
+  Config::Bind(CachePHPFile, ini, config["CachePHPFile"]);
 
-  config["ParseOnDemandDirs"].get(ParseOnDemandDirs);
+  Config::Get(ini, config["ParseOnDemandDirs"], ParseOnDemandDirs);
 
   {
     Hdf cg = config["CodeGeneration"];
     string tmp;
 
 #define READ_CG_OPTION(name)                    \
-    tmp = cg[#name].getString();                \
+    tmp = Config::GetString(ini, cg[#name]);         \
     if (!tmp.empty()) {                         \
       name = OptionStrings.add(tmp.c_str());    \
     }
@@ -207,18 +211,18 @@ void Option::Load(Hdf &config) {
     READ_CG_OPTION(LambdaPrefix);
   }
 
-  config["DynamicFunctionPrefix"].get(DynamicFunctionPrefixes);
-  config["DynamicFunctionPostfix"].get(DynamicFunctionPostfixes);
-  config["DynamicMethodPrefix"].get(DynamicMethodPrefixes);
-  config["DynamicInvokeFunctions"].get(DynamicInvokeFunctions);
-  config["VolatileClasses"].get(VolatileClasses);
+  Config::Get(ini, config["DynamicFunctionPrefix"], DynamicFunctionPrefixes);
+  Config::Get(ini, config["DynamicFunctionPostfix"], DynamicFunctionPostfixes);
+  Config::Get(ini, config["DynamicMethodPrefix"], DynamicMethodPrefixes);
+  Config::Get(ini, config["DynamicInvokeFunctions"], DynamicInvokeFunctions);
+  Config::Get(ini, config["VolatileClasses"], VolatileClasses);
 
   // build map from function names to sections
   for (Hdf hdf = config["FunctionSections"].firstChild(); hdf.exists();
        hdf = hdf.next()) {
     for (Hdf hdfFunc = hdf.firstChild(); hdfFunc.exists();
          hdfFunc = hdfFunc.next()) {
-           FunctionSections[hdfFunc.getString()] = hdf.getName();
+           FunctionSections[Config::GetString(ini, hdfFunc)] = hdf.getName();
     }
   }
 
@@ -226,35 +230,42 @@ void Option::Load(Hdf &config) {
     Hdf repo = config["Repo"];
     {
       Hdf repoCentral = repo["Central"];
-      RepoCentralPath = repoCentral["Path"].getString();
+      Config::Bind(RepoCentralPath, ini, repoCentral["Path"]);
     }
-    RepoDebugInfo = repo["DebugInfo"].getBool(false);
+    Config::Bind(RepoDebugInfo, ini, repo["DebugInfo"], false);
   }
 
   {
     Hdf autoloadMap = config["AutoloadMap"];
-    autoloadMap["class"].get(AutoloadClassMap);
-    autoloadMap["function"].get(AutoloadFuncMap);
-    autoloadMap["constant"].get(AutoloadConstMap);
-    AutoloadRoot = autoloadMap["root"].getString();
+    Config::Get(ini, autoloadMap["class"], AutoloadClassMap);
+    Config::Get(ini, autoloadMap["function"], AutoloadFuncMap);
+    Config::Get(ini, autoloadMap["constant"], AutoloadConstMap);
+    Config::Bind(AutoloadRoot, ini, autoloadMap["root"]);
   }
 
-  HardTypeHints = config["HardTypeHints"].getBool(true);
-  HardConstProp = config["HardConstProp"].getBool(true);
+  Config::Bind(HardTypeHints, ini, config["HardTypeHints"], true);
+  Config::Bind(HardReturnTypeHints, ini, config["HardReturnTypeHints"], false);
+  Config::Bind(HardConstProp, ini, config["HardConstProp"], true);
 
-  EnableHipHopSyntax = config["EnableHipHopSyntax"].getBool();
-  EnableZendCompat = config["EnableZendCompat"].getBool();
-  JitEnableRenameFunction = config["JitEnableRenameFunction"].getBool();
-  EnableHipHopExperimentalSyntax =
-    config["EnableHipHopExperimentalSyntax"].getBool();
-  EnableShortTags = config["EnableShortTags"].getBool(true);
+  Config::Bind(EnableHipHopSyntax, ini, config["EnableHipHopSyntax"]);
+  Config::Bind(EnableZendCompat, ini, config["EnableZendCompat"]);
+  Config::Bind(JitEnableRenameFunction, ini, config["JitEnableRenameFunction"]);
+  Config::Bind(EnableHipHopExperimentalSyntax, ini,
+               config["EnableHipHopExperimentalSyntax"]);
+  Config::Bind(EnableShortTags, ini, config["EnableShortTags"], true);
 
-  IntsOverflowToInts =
-    config["Hack"]["Lang"]["IntsOverflowToInts"].getBool(EnableHipHopSyntax);
+  {
+    const Hdf& lang = config["Hack"]["Lang"];
+    Config::Bind(IntsOverflowToInts, ini, lang["IntsOverflowToInts"],
+                 EnableHipHopSyntax);
+    Config::Bind(StrictArrayFillKeys, ini, lang["StrictArrayFillKeys"]);
+    Config::Bind(DisallowDynamicVarEnvFuncs, ini,
+                 lang["DisallowDynamicVarEnvFuncs"]);
+  }
 
-  EnableAspTags = config["EnableAspTags"].getBool();
+  Config::Bind(EnableAspTags, ini, config["EnableAspTags"]);
 
-  EnableXHP = config["EnableXHP"].getBool(false);
+  Config::Bind(EnableXHP, ini, config["EnableXHP"], false);
 
   if (EnableHipHopSyntax) {
     // If EnableHipHopSyntax is true, it forces EnableXHP to true
@@ -262,30 +273,28 @@ void Option::Load(Hdf &config) {
     EnableXHP = true;
   }
 
-  ParserThreadCount = config["ParserThreadCount"].getInt32(0);
+  Config::Bind(ParserThreadCount, ini, config["ParserThreadCount"], 0);
   if (ParserThreadCount <= 0) {
     ParserThreadCount = Process::GetCPUCount();
   }
 
-  EnableEval = (EvalLevel)config["EnableEval"].getByte(0);
-  AllDynamic = config["AllDynamic"].getBool(true);
-  AllVolatile = config["AllVolatile"].getBool();
+  EnableEval = (EvalLevel) Config::GetByte(ini, config["EnableEval"], 0);
+  Config::Bind(AllDynamic, ini, config["AllDynamic"], true);
+  Config::Bind(AllVolatile, ini, config["AllVolatile"]);
 
-  GenerateDocComments      = config["GenerateDocComments"].getBool(true);
-  EliminateDeadCode        = config["EliminateDeadCode"].getBool(true);
-  CopyProp                 = config["CopyProp"].getBool(false);
-  LocalCopyProp            = config["LocalCopyProp"].getBool(true);
-  StringLoopOpts           = config["StringLoopOpts"].getBool(true);
-  AutoInline               = config["AutoInline"].getInt32(0);
-  ControlFlow              = config["ControlFlow"].getBool(true);
-  VariableCoalescing       = config["VariableCoalescing"].getBool(false);
-  ArrayAccessIdempotent    = config["ArrayAccessIdempotent"].getBool(false);
-  DumpAst                  = config["DumpAst"].getBool(false);
-  WholeProgram             = config["WholeProgram"].getBool(true);
-  UseHHBBC                 = config["UseHHBBC"].getBool(UseHHBBC);
+  Config::Bind(GenerateDocComments, ini, config["GenerateDocComments"], true);
+  Config::Bind(EliminateDeadCode, ini, config["EliminateDeadCode"], true);
+  Config::Bind(LocalCopyProp, ini, config["LocalCopyProp"], true);
+  Config::Bind(AutoInline, ini, config["AutoInline"], 0);
+  Config::Bind(VariableCoalescing, ini, config["VariableCoalescing"], false);
+  Config::Bind(ArrayAccessIdempotent, ini, config["ArrayAccessIdempotent"],
+               false);
+  Config::Bind(DumpAst, ini, config["DumpAst"], false);
+  Config::Bind(WholeProgram, ini, config["WholeProgram"], true);
+  Config::Bind(UseHHBBC, ini, config["UseHHBBC"], UseHHBBC);
 
   // Temporary, during file-cache migration.
-  FileCache::UseNewCache   = config["UseNewCache"].getBool(false);
+  Config::Bind(FileCache::UseNewCache, ini, config["UseNewCache"], false);
 
   OnLoad();
 }
@@ -386,9 +395,14 @@ void Option::FilterFiles(std::vector<std::string> &files,
 
 void initialize_hhbbc_options() {
   if (!Option::UseHHBBC) return;
-  HHBBC::options.InterceptableFunctions = Option::DynamicInvokeFunctions;
+  HHBBC::options.AllFuncsInterceptable  = Option::JitEnableRenameFunction;
+  HHBBC::options.InterceptableFunctions = HHBBC::make_method_map(
+                                            Option::DynamicInvokeFunctions);
   HHBBC::options.HardConstProp          = Option::HardConstProp;
   HHBBC::options.HardTypeHints          = Option::HardTypeHints;
+  HHBBC::options.HardReturnTypeHints    = Option::HardReturnTypeHints;
+  HHBBC::options.DisallowDynamicVarEnvFuncs =
+    (Option::DisallowDynamicVarEnvFuncs == HackStrictOption::ON);
 }
 
 //////////////////////////////////////////////////////////////////////

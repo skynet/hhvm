@@ -67,9 +67,18 @@ struct FuncAnalysis {
   // Block data is indexed by Block::id.
   std::vector<BlockData> bdata;
 
-  // The inferred function return type.  May be TBottom if the
-  // function never returns.
+  /*
+   * The inferred function return type.  May be TBottom if the
+   * function never returns.
+   */
   Type inferredReturn;
+
+  /*
+   * If this function allocates closures, this maps each of those
+   * closure classes to the types of its used variables, in their
+   * declared order.
+   */
+  ClosureUseVarMap closureUseTypes;
 };
 
 /*
@@ -104,6 +113,28 @@ struct ClassAnalysis {
  * This routine makes no changes to the php::Func.
  */
 FuncAnalysis analyze_func(const Index&, Context);
+
+/*
+ * Analyze a function like analyze_func, but exposing gathered CollectedInfo
+ * results.  The CollectedInfo structure can be initialized by the caller to
+ * enable collecting some pass-specific types of information (e.g. public
+ * static property types).
+ */
+FuncAnalysis analyze_func_collect(const Index&, Context, CollectedInfo&);
+
+/*
+ * Perform a flow-sensitive type analysis on a function, using the
+ * given Index and Context when we need information about things
+ * outside of this function, and assuming that the arguments to the
+ * function have the supplied types.
+ *
+ * This function is used to perform callsite-sensitive type inference.
+ *
+ * Currently this is not supported for closure bodies.
+ */
+FuncAnalysis analyze_func_inline(const Index&,
+                                 Context,
+                                 std::vector<Type> args);
 
 /*
  * Perform an analysis for a whole php::Class at a time.

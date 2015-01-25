@@ -16,7 +16,7 @@
 */
 #include "hphp/runtime/ext/icu/ext_icu_timezone.h"
 #include "hphp/runtime/ext/icu/ext_icu_iterator.h"
-#include "hphp/runtime/ext/ext_datetime.h"
+#include "hphp/runtime/ext/datetime/ext_datetime.h"
 
 #include <unicode/locid.h>
 
@@ -51,10 +51,11 @@ icu::TimeZone* IntlTimeZone::ParseArg(const Variant& arg,
     auto IntlTimeZone_Class = Unit::lookupClass(s_IntlTimeZone.get());
     if (IntlTimeZone_Class &&
         ((cls == IntlTimeZone_Class) || cls->classof(IntlTimeZone_Class))) {
-      return IntlTimeZone::Get(objarg)->timezone()->clone();
+      return IntlTimeZone::Get(objarg.get())->timezone()->clone();
     }
-    if (auto dtz = objarg.getTyped<c_DateTimeZone>(true, true)) {
-      tzstr = dtz->t_getname();
+    if (objarg.instanceof(DateTimeZoneData::getClass())) {
+      auto* dtz = Native::data<DateTimeZoneData>(objarg.get());
+      tzstr = dtz->getName();
     } else {
       tzstr = arg.toString();
     }
@@ -142,7 +143,7 @@ static Object HHVM_STATIC_METHOD(IntlTimeZone, createTimeZone,
   if (!ustring_from_char(id, zoneId, error)) {
     s_intl_error->setError(error, "intltz_count_equivalent_ids: could not "
                                   "convert time zone id to UTF-16");
-    return null_object;
+    return Object();
   }
   return IntlTimeZone::newInstance(icu::TimeZone::createTimeZone(id));
 }
@@ -233,7 +234,7 @@ static int64_t HHVM_METHOD(IntlTimeZone, getErrorCode) {
 }
 
 static String HHVM_METHOD(IntlTimeZone, getErrorMessage) {
-  TZ_GET(data, this_, null_string);
+  TZ_GET(data, this_, String());
   return data->getErrorMessage();
 }
 
@@ -290,7 +291,7 @@ static Variant HHVM_STATIC_METHOD(IntlTimeZone, getTZDataVersion) {
 
 static bool HHVM_METHOD(IntlTimeZone, hasSameRules, const Object& otherTimeZone) {
   TZ_GET(obj1, this_, false);
-  TZ_GET(obj2, otherTimeZone, false);
+  TZ_GET(obj2, otherTimeZone.get(), false);
   return obj1->timezone()->hasSameRules(*obj2->timezone());
 }
 

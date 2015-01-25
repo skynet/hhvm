@@ -50,6 +50,8 @@ public:
     QS(FBUtf8, 32768)     \
     /* Order of the fields matters here if we're
      * matching on what flags are set */  \
+    QS(Xhtml, 32) /* k_ENT_XHTML */ \
+    QS(Xml1, 16)  /* k_ENT_XML1 */ \
     QS(Substitute, 8) /* k_ENT_SUBSTITUTE: replace invalid chars with FFFD */ \
     QS(Ignore, 4) /* k_ENT_IGNORE:   silently discard invalid chars */ \
     QS(Both, 3)   /* k_ENT_QUOTES:   escape both double and single quotes */  \
@@ -109,7 +111,7 @@ public:
   static Variant Explode(const String& input, const String& delimiter,
                          int limit = 0x7FFFFFFF);
   static String  Implode(const Variant& items, const String& delim); // == Join()
-  static Variant Split(const String& str, int split_length = 1);
+  static Variant Split(const String& str, int64_t split_length = 1);
   static Variant ChunkSplit(
     const String& body, int chunklen = 76,
     const String& end = "\r\n"); // for email (rfc822/2822)
@@ -135,6 +137,17 @@ public:
   static String UrlDecode(const String& input, bool decodePlus = true);
 
   /**
+   * Determine if a string looks like a file URL. Does not check for validity.
+   */
+  static bool IsFileUrl(const String& input);
+
+  /**
+   * Determine if a string is a valid local file URL. If it is, the decoded
+   * path part is returned. If it is not, an empty string is returned.
+   */
+  static String DecodeFileUrl(const String& input);
+
+  /**
    * Formatting.
    */
   static String MoneyFormat(const char *format, double value);
@@ -148,6 +161,7 @@ public:
   static int64_t CRC32(const String& input);
   static String Crypt(const String& input, const char *salt = "");
   static String MD5(const String& input, bool raw = false);
+  static String MD5(const char *data, uint32_t size, bool raw = false);
   static String SHA1(const String& input, bool raw = false);
 };
 

@@ -1,8 +1,8 @@
 <?php
 
-gzopen('someFile', 'c');?>
+gzopen('someFile', 'c');
+?>
+<?php error_reporting(0); ?>
 <?php 
 	unlink('someFile'); 
-?>
-unlink('someFile');
 ?>

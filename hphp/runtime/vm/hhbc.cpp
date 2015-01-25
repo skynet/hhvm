@@ -25,6 +25,9 @@
 #include "hphp/runtime/vm/unit.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/stats.h"
+#include "hphp/runtime/base/repo-auth-type-array.h"
+#include "hphp/runtime/base/repo-auth-type-codec.h"
+#include "hphp/runtime/vm/repo-global-data.h"
 #include "hphp/util/text-util.h"
 
 namespace HPHP {
@@ -138,17 +141,28 @@ int immSize(const Op* opcode, int idx) {
 #undef ARGTYPE
 #undef ARGTYPEVEC
   };
-  if (immType(*opcode, idx) == IVA || immType(*opcode, idx) == LA ||
+
+  if (immType(*opcode, idx) == IVA ||
+      immType(*opcode, idx) == LA ||
       immType(*opcode, idx) == IA) {
     intptr_t offset = 1;
     if (idx >= 1) offset += immSize(opcode, 0);
     if (idx >= 2) offset += immSize(opcode, 1);
     if (idx >= 3) offset += immSize(opcode, 2);
-    // variable size
-    unsigned char imm = *(unsigned char*)(opcode + offset);
+    unsigned char imm = *(const unsigned char*)(opcode + offset);
     // Low order bit set => 4-byte.
     return (imm & 0x1 ? sizeof(int32_t) : sizeof(unsigned char));
-  } else if (immIsVector(*opcode, idx)) {
+  }
+
+  if (immType(*opcode, idx) == RATA) {
+    intptr_t offset = 1;
+    if (idx >= 1) offset += immSize(opcode, 0);
+    if (idx >= 2) offset += immSize(opcode, 1);
+    if (idx >= 3) offset += immSize(opcode, 2);
+    return encodedRATSize(reinterpret_cast<PC>(opcode) + offset);
+  }
+
+  if (immIsVector(*opcode, idx)) {
     intptr_t offset = 1;
     if (idx >= 1) offset += immSize(opcode, 0);
     if (idx >= 2) offset += immSize(opcode, 1);
@@ -174,10 +188,10 @@ int immSize(const Op* opcode, int idx) {
     }
     return prefixes * sizeof(int32_t) +
       vecElemSz * *(int32_t*)((int8_t*)opcode + offset);
-  } else {
-    ArgType type = immType(*opcode, idx);
-    return (type >= 0) ? argTypeToSizes[type] : 0;
   }
+
+  ArgType type = immType(*opcode, idx);
+  return (type >= 0) ? argTypeToSizes[type] : 0;
 }
 
 bool immIsVector(Op opcode, int idx) {
@@ -205,10 +219,11 @@ ArgUnion getImm(const Op* opcode, int idx) {
     p += immSize(opcode, cursor);
   }
   always_assert(cursor == idx);
-  ArgType type = immType(*opcode, idx);
+  auto const type = immType(*opcode, idx);
   if (type == IVA || type == LA || type == IA) {
     retval.u_IVA = decodeVariableSizeImm((const uint8_t**)&p);
   } else if (!immIsVector(*opcode, cursor)) {
+    always_assert(type != RATA);  // Decode RATAs with a different function.
     memcpy(&retval.bytes, p, immSize(opcode, idx));
   }
   always_assert(numImmediates(*opcode) > idx);
@@ -219,6 +234,7 @@ ArgUnion* getImmPtr(const Op* opcode, int idx) {
   assert(immType(*opcode, idx) != IVA);
   assert(immType(*opcode, idx) != LA);
   assert(immType(*opcode, idx) != IA);
+  assert(immType(*opcode, idx) != RATA);
   const Op* ptr = opcode + 1;
   for (int i = 0; i < idx; i++) {
     ptr += immSize(opcode, i);
@@ -287,6 +303,7 @@ Offset* instrJumpOffset(const Op* instr) {
 #define IMM_DA 0
 #define IMM_SA 0
 #define IMM_AA 0
+#define IMM_RATA 0
 #define IMM_BA 1
 #define IMM_BLA 0  // these are jump offsets, but must be handled specially
 #define IMM_ILA 0
@@ -308,6 +325,7 @@ Offset* instrJumpOffset(const Op* instr) {
 #undef IMM_DA
 #undef IMM_SA
 #undef IMM_AA
+#undef IMM_RATA
 #undef IMM_LA
 #undef IMM_IA
 #undef IMM_BA
@@ -362,6 +380,34 @@ Offset instrJumpTarget(const Op* instrs, Offset pos) {
   } else {
     return *offset + pos;
   }
+}
+
+OffsetSet instrSuccOffsets(Op* opc, const Unit* unit) {
+  OffsetSet succBcOffs;
+  Op* bcStart = (Op*)(unit->entry());
+
+  if (!instrIsControlFlow(*opc)) {
+    Offset succOff = opc + instrLen(opc) - bcStart;
+    succBcOffs.insert(succOff);
+    return succBcOffs;
+  }
+
+  if (instrAllowsFallThru(*opc)) {
+    Offset succOff = opc + instrLen(opc) - bcStart;
+    succBcOffs.insert(succOff);
+  }
+
+  if (isSwitch(*opc)) {
+    foreachSwitchTarget(opc, [&](Offset& offset) {
+        succBcOffs.insert(offset);
+      });
+  } else {
+    Offset target = instrJumpTarget(bcStart, opc - bcStart);
+    if (target != InvalidAbsoluteOffset) {
+      succBcOffs.insert(target);
+    }
+  }
+  return succBcOffs;
 }
 
 /**
@@ -618,9 +664,8 @@ StackTransInfo instrStackTransInfo(const Op* opcode) {
     ret.numPushes = 0;
     ret.pos = peekPokeType[uint8_t(*opcode)];
     return ret;
-  default:
-    not_reached();
   }
+  not_reached();
 }
 
 bool pushesActRec(Op opcode) {
@@ -656,57 +701,56 @@ void staticArrayStreamer(ArrayData* ad, std::ostream& out) {
         comma = true;
       }
       Variant key = it.first();
+
       // Key.
-      switch (key.getType()) {
-      case KindOfInt64: {
+      if (IS_INT_TYPE(key.getType())) {
         out << *key.getInt64Data();
-        break;
-      }
-      case KindOfStaticString:
-      case KindOfString: {
+      } else if (IS_STRING_TYPE(key.getType())) {
         out << "\""
             << escapeStringForCPP(key.getStringData()->data(),
                                   key.getStringData()->size())
             << "\"";
-        break;
+      } else {
+        assert(false);
       }
-      default: assert(false);
-      }
+
       out << "=>";
-      // Value.
+
       Variant val = it.second();
-      switch (val.getType()) {
-      case KindOfUninit:
-      case KindOfNull: {
-        out << "null";
-        break;
-      }
-      case KindOfBoolean: {
-        out << (val.toBoolean() ? "true" : "false");
-        break;
-      }
-      case KindOfStaticString:
-      case KindOfString: {
-        out << "\""
-            << escapeStringForCPP(val.getStringData()->data(),
-                                  val.getStringData()->size())
-            << "\"";
-        break;
-      }
-      case KindOfInt64: {
-        out << *val.getInt64Data();
-        break;
-      }
-      case KindOfDouble: {
-        out << *val.getDoubleData();
-        break;
-      }
-      case KindOfArray: {
-        staticArrayStreamer(val.getArrayData(), out);
-        break;
-      }
-      default: assert(false);
-      }
+
+      // Value.
+      [&] {
+        switch (val.getType()) {
+          case KindOfUninit:
+          case KindOfNull:
+            out << "null";
+            return;
+          case KindOfBoolean:
+            out << (val.toBoolean() ? "true" : "false");
+            return;
+          case KindOfInt64:
+            out << *val.getInt64Data();
+            return;
+          case KindOfDouble:
+            out << *val.getDoubleData();
+            return;
+          case KindOfStaticString:
+          case KindOfString:
+            out << "\""
+                << escapeStringForCPP(val.getStringData()->data(),
+                                      val.getStringData()->size())
+                << "\"";
+            return;
+          case KindOfArray:
+            staticArrayStreamer(val.getArrayData(), out);
+            return;
+          case KindOfObject:
+          case KindOfResource:
+          case KindOfRef:
+          case KindOfClass:
+            not_reached();
+        }
+      }();
     }
   }
   out << ")";
@@ -714,34 +758,33 @@ void staticArrayStreamer(ArrayData* ad, std::ostream& out) {
 
 void staticStreamer(const TypedValue* tv, std::stringstream& out) {
   switch (tv->m_type) {
-  case KindOfUninit:
-  case KindOfNull: {
-    out << "null";
-    break;
+    case KindOfUninit:
+    case KindOfNull:
+      out << "null";
+      return;
+    case KindOfBoolean:
+      out << (tv->m_data.num ? "true" : "false");
+      return;
+    case KindOfInt64:
+      out << tv->m_data.num;
+      return;
+    case KindOfDouble:
+      out << tv->m_data.dbl;
+      return;
+    case KindOfStaticString:
+    case KindOfString:
+      out << "\"" << tv->m_data.pstr->data() << "\"";
+      return;
+    case KindOfArray:
+      staticArrayStreamer(tv->m_data.parr, out);
+      return;
+    case KindOfObject:
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
-  case KindOfBoolean: {
-    out << (tv->m_data.num ? "true" : "false");
-    break;
-  }
-  case KindOfStaticString:
-  case KindOfString: {
-    out << "\"" << tv->m_data.pstr->data() << "\"";
-    break;
-  }
-  case KindOfInt64: {
-    out << tv->m_data.num;
-    break;
-  }
-  case KindOfDouble: {
-    out << tv->m_data.dbl;
-    break;
-  }
-  case KindOfArray: {
-    staticArrayStreamer(tv->m_data.parr, out);
-    break;
-  }
-  default: assert(false);
-  }
+  not_reached();
 }
 
 const char* const locationNames[] = { "L", "C", "H",
@@ -813,6 +856,20 @@ std::string instrToString(const Op* it, const Unit* u /* = NULL */) {
   PC iStart = reinterpret_cast<PC>(it);
   Op op = *it;
   ++it;
+
+  auto readRATA = [&] {
+    if (!u) {
+      auto const pc = reinterpret_cast<const unsigned char*>(it);
+      it += encodedRATSize(pc);
+      out << " <RepoAuthType>";
+      return;
+    }
+    auto pc = reinterpret_cast<const unsigned char*>(it);
+    auto const rat = decodeRAT(u, pc);
+    it = reinterpret_cast<const Op*>(pc);
+    out << ' ' << show(rat);
+  };
+
   switch (op) {
 
 #define READ(t) out << " " << *((t*)&*it); it += sizeof(t)
@@ -820,7 +877,7 @@ std::string instrToString(const Op* it, const Unit* u /* = NULL */) {
 #define READOFF() do {                                              \
   Offset _value = *(Offset*)it;                                     \
   out << " " << _value;                                             \
-  if (u != nullptr && _value >= 0) {                                \
+  if (u != nullptr) {                                               \
     out << " (" << u->offsetOf(iStart + _value) << ")";             \
   }                                                                 \
   it += sizeof(Offset);                                             \
@@ -873,9 +930,8 @@ std::string instrToString(const Op* it, const Unit* u /* = NULL */) {
         if (memberCodeImmIsString(MemberCode(immVal)) && u) {           \
           const StringData* str = u->lookupLitstrId(imm);               \
           int len = str->size();                                        \
-          char* escaped = string_addslashes(str->data(), len);          \
-          out << '"' << escaped << '"';                                 \
-          free(escaped);                                                \
+          String escaped = string_addslashes(str->data(), len);         \
+          out << '"' << escaped.data() << '"';                          \
         } else {                                                        \
           out << imm;                                                   \
         }                                                               \
@@ -960,6 +1016,7 @@ std::string instrToString(const Op* it, const Unit* u /* = NULL */) {
 #define H_BA READOFF()
 #define H_OA(type) READOA(type)
 #define H_SA READLITSTR(" ")
+#define H_RATA readRATA()
 #define H_AA                                                  \
   if (u) {                                                    \
     out << " ";                                               \
@@ -1012,7 +1069,7 @@ OPCODES
 }
 
 const char* opcodeToName(Op op) {
-  const char* namesArr[] = {
+  static const char* namesArr[] = {
 #define O(name, imm, inputs, outputs, flags) \
     #name ,
     OPCODES
@@ -1038,18 +1095,6 @@ static const char* InitPropOp_names[] = {
 #undef INITPROP_OP
 };
 
-static const char* AssertTOp_names[] = {
-#define ASSERTT_OP(op) #op,
-  ASSERTT_OPS
-#undef ASSERTT_OP
-};
-
-static const char* AssertObjOp_names[] = {
-#define ASSERTOBJ_OP(op) #op,
-  ASSERTOBJ_OPS
-#undef ASSERTOBJ_OP
-};
-
 static const char* FatalOp_names[] = {
 #define FATAL_OP(op) #op,
   FATAL_OPS
@@ -1072,6 +1117,24 @@ static const char* BareThisOp_names[] = {
 #define BARETHIS_OP(x) #x,
   BARETHIS_OPS
 #undef BARETHIS_OP
+};
+
+static const char* SilenceOp_names[] = {
+#define SILENCE_OP(x) #x,
+  SILENCE_OPS
+#undef SILENCE_OP
+};
+
+static const char* OODeclExistsOp_names[] = {
+#define OO_DECL_EXISTS_OP(x) #x,
+  OO_DECL_EXISTS_OPS
+#undef OO_DECL_EXISTS_OP
+};
+
+static const char* ObjMethodOp_names[] = {
+#define OBJMETHOD_OP(x) #x,
+  OBJMETHOD_OPS
+#undef OBJMETHOD_OP
 };
 
 template<class T, size_t Sz>
@@ -1116,12 +1179,13 @@ template<class T> folly::Optional<T> nameToSubop(const char* str) {
 
 X(InitPropOp)
 X(IsTypeOp)
-X(AssertTOp)
-X(AssertObjOp)
 X(FatalOp)
 X(SetOpOp)
 X(IncDecOp)
 X(BareThisOp)
+X(SilenceOp)
+X(OODeclExistsOp)
+X(ObjMethodOp)
 
 #undef X
 
@@ -1129,8 +1193,10 @@ X(BareThisOp)
 
 bool instrIsNonCallControlFlow(Op opcode) {
   if (!instrIsControlFlow(opcode) || isFCallStar(opcode)) return false;
+
   switch (opcode) {
     case OpContEnter:
+    case OpContRaise:
     case OpFCallBuiltin:
     case OpIncl:
     case OpInclOnce:
@@ -1141,6 +1207,29 @@ bool instrIsNonCallControlFlow(Op opcode) {
 
     default:
       return true;
+  }
+}
+
+bool instrHasConditionalBranch(Op opcode) {
+  switch (opcode) {
+    case OpJmpZ:
+    case OpJmpNZ:
+    case OpIterInit:
+    case OpMIterInit:
+    case OpWIterInit:
+    case OpIterInitK:
+    case OpMIterInitK:
+    case OpWIterInitK:
+    case OpIterNext:
+    case OpMIterNext:
+    case OpWIterNext:
+    case OpIterNextK:
+    case OpMIterNextK:
+    case OpWIterNextK:
+    case OpDecodeCufIter:
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -1237,7 +1326,7 @@ const uint8_t* ImmVector::findLastMember() const {
     assert(vec - m_start < m_length);
   }
 
-  NOT_REACHED();
+  not_reached();
 }
 
 bool ImmVector::decodeLastMember(const Unit* u,
@@ -1314,4 +1403,3 @@ const MInstrInfo& getMInstrInfo(Op op) {
 
 ///////////////////////////////////////////////////////////////////////////////
 }
-

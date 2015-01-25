@@ -8,8 +8,9 @@
  *
  *)
 
-open Utils
 open Nast
+
+module SN = Naming_special_names
 
 (* Module coded with an exception, if we find a terminal statement we
  * throw the exception Exit.
@@ -24,22 +25,27 @@ end = struct
     List.iter (terminal_ inside_case) stl
 
   and terminal_ inside_case = function
-    | Break -> if inside_case then () else raise Exit
-    | Continue
+    | Break _ -> if inside_case then () else raise Exit
+    | Continue _
     | Throw _
     | Return _
     | Expr (_, Yield_break)
     | Expr (_, Assert (
             AE_assert (_, False) |
             AE_invariant ((_, False), _, _) |
-            AE_invariant_violation _)) -> raise Exit
-    | Expr (_, Yield (_, Special_func sf)) -> special_func sf
+            AE_invariant_violation _))
+      -> raise Exit
+    | Expr (_, Call (Cnormal, (_, Id (_, fun_name)), _, _))
+        when
+        (fun_name = SN.PseudoFunctions.exit_ ||
+         fun_name = SN.PseudoFunctions.die)
+        -> raise Exit
     | If (_, b1, b2) ->
       (try terminal inside_case b1; () with Exit ->
         terminal inside_case b2)
     | Switch (_, cl) ->
       terminal_cl cl
-    | Try (b, catch_list, fb) ->
+    | Try (b, catch_list, _) ->
       (* Note: return inside a finally block is allowed in PHP and
        * overrides any return in try or catch. It is an error in <?hh,
        * however. The only way that a finally block can thus be
@@ -49,6 +55,10 @@ end = struct
        *)
       (try terminal inside_case b; () with Exit ->
         terminal_catchl inside_case catch_list)
+    | While ((_, True), b)
+    | Do (b, (_, True))
+    | For ((_, Expr_list []), (_, Expr_list []), (_, Expr_list []), b) ->
+        if not (NastVisitor.HasBreak.block b) then raise Exit
     | Do _
     | While _
     | For _
@@ -57,12 +67,6 @@ end = struct
     | Fallthrough
     | Expr _
     | Static_var _ -> ()
-
-  and special_func = function
-    | Gena _
-    | Genva _
-    | Gen_array_rec _
-    | Gen_array_va_rec _ -> ()
 
   and terminal_catchl inside_case = function
     | [] -> raise Exit
@@ -82,7 +86,7 @@ end = struct
       (try
          terminal true b;
           (* TODO check this *)
-         if List.exists (function Break -> true | _ -> false) b
+         if List.exists (function Break _ -> true | _ -> false) b
          then ()
          else raise Exit
        with Exit -> terminal_cl rl)
@@ -111,24 +115,24 @@ end = struct
 
   and terminal_ = function
     | Fallthrough
-    | Break
-    | Continue
+    | Break _
+    | Continue _
     | Throw _
     | Return _
     | Expr (_, Yield_break)
     | Expr (_, Assert (
             AE_assert (_, False) |
             AE_invariant ((_, False), _, _) |
-            AE_invariant_violation _)) -> raise Exit
-    | Expr (_, Yield (_, Special_func sf)) -> special_func sf
+            AE_invariant_violation _))
+    | Expr (_, Call (Cnormal, (_, Id (_, "exit")), _, _)) -> raise Exit
     | If (_, b1, b2) ->
       (try terminal b1; () with Exit ->
         terminal b2)
     | Switch (_, cl) ->
       terminal_cl cl
-    | Try (b, catches, fb) ->
-      (* NOTE: contents of fb are not executed in normal flow, so they
-       * cannot contribute to terminality *)
+    | Try (b, catches, _) ->
+      (* NOTE: contents of finally block are not executed in normal flow, so
+       * they cannot contribute to terminality *)
       (try terminal b; () with Exit -> terminal_catchl catches)
     | Do _
     | While _
@@ -137,12 +141,6 @@ end = struct
     | Noop
     | Expr _
     | Static_var _ -> ()
-
-  and special_func = function
-    | Gena _
-    | Genva _
-    | Gen_array_rec _
-    | Gen_array_va_rec _ -> ()
 
   and terminal_catchl = function
     | [] -> raise Exit
@@ -162,7 +160,7 @@ end = struct
       (try
          terminal b;
           (* TODO check this *)
-         if List.exists (function Break -> true | _ -> false) b
+         if List.exists (function Break _ -> true | _ -> false) b
          then ()
          else raise Exit
        with Exit -> terminal_cl rl)
@@ -178,16 +176,11 @@ end = struct
         | Default [] -> ()
         | Case (e, b) -> begin
           terminal b;
-          error_l [
-            p, ("This switch has a case that implicitly falls through and is "^
-                "not annotated with // FALLTHROUGH");
-            fst e, "This case implicitly falls through"
-          ]
+          Errors.case_fallthrough p (fst e)
         end
         | Default b -> begin
           terminal b;
-          error p ("This switch has a default case that implicitly falls "^
-                   "through and is not annotated with // FALLTHROUGH")
+          Errors.default_fallthrough p
         end
       with Exit -> ()
     end (List.tl (List.rev cl)) (* Skip the last case *)

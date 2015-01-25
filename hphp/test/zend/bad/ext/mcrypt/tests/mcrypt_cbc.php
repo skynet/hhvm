@@ -1,5 +1,5 @@
 <?php
-$key      = "FooBar";
+$key      = "0123456789012345";
 $secret   = "PHP Testfest 2008";
 $cipher   = MCRYPT_RIJNDAEL_128;
 
@@ -10,4 +10,6 @@ $enc_data = mcrypt_cbc($cipher, $key, $secret, MCRYPT_ENCRYPT, $iv);
 echo trim(mcrypt_cbc($cipher, $key, $enc_data, MCRYPT_DECRYPT, $iv)) . "\n";
 
 // a warning must be issued if we don't use a IV on a AES cipher, that usually requires an IV
-mcrypt_cbc($cipher, $key, $enc_data, MCRYPT_DECRYPT);
+var_dump(mcrypt_cbc($cipher, $key, $enc_data, MCRYPT_DECRYPT));
+
+?>

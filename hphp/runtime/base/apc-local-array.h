@@ -22,7 +22,6 @@
 #include <sys/types.h>
 
 #include "hphp/runtime/base/array-data.h"
-#include "hphp/runtime/base/sweepable.h"
 #include "hphp/runtime/base/apc-array.h"
 
 namespace HPHP {
@@ -41,11 +40,9 @@ struct MArrayIter;
  * via APC. It has a pointer to the APCArray that it represents and it may
  * cache values locally depending on the type accessed and/or the operation.
  */
-struct APCLocalArray : private ArrayData
-                     , private Sweepable {
+struct APCLocalArray : private ArrayData {
   template<class... Args> static APCLocalArray* Make(Args&&...);
 
-  static APCHandle* GetAPCHandle(const ArrayData* ad);
   static size_t Vsize(const ArrayData*);
   static const Variant& GetValueRef(const ArrayData* ad, ssize_t pos);
   static bool ExistsInt(const ArrayData* ad, int64_t k);
@@ -55,10 +52,8 @@ struct APCLocalArray : private ArrayData
   static ArrayData* LvalStr(ArrayData*, StringData* k, Variant *&ret,
                             bool copy);
   static ArrayData* LvalNew(ArrayData*, Variant *&ret, bool copy);
-
-  static ArrayData* SetInt(ArrayData*, int64_t k, const Variant& v, bool copy);
-  static ArrayData* SetStr(ArrayData*, StringData* k, const Variant& v,
-                           bool copy);
+  static ArrayData* SetInt(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* SetStr(ArrayData*, StringData* k, Cell v, bool copy);
   static ArrayData* SetRefInt(ArrayData*, int64_t k, Variant& v, bool copy);
   static ArrayData* SetRefStr(ArrayData*, StringData* k, Variant& v,
                               bool copy);
@@ -79,6 +74,7 @@ struct APCLocalArray : private ArrayData
   static void NvGetKey(const ArrayData*, TypedValue* out, ssize_t pos);
   static bool IsVectorData(const ArrayData* ad);
   static ssize_t IterBegin(const ArrayData*);
+  static ssize_t IterLast(const ArrayData*);
   static ssize_t IterEnd(const ArrayData*);
   static ssize_t IterAdvance(const ArrayData*, ssize_t prev);
   static ssize_t IterRewind(const ArrayData*, ssize_t prev);
@@ -108,44 +104,33 @@ public:
   ssize_t iterAdvanceImpl(ssize_t prev) const {
     assert(prev >= 0 && prev < m_size);
     ssize_t next = prev + 1;
-    return next < m_size ? next : invalid_index;
+    return next < m_size ? next : m_size;
   }
 
   // Only explicit conversions are allowed to and from ArrayData*.
   ArrayData* asArrayData() { return this; }
   const ArrayData* asArrayData() const { return this; }
 
-  // Pre: ad->isSharedArray()
-  static APCLocalArray* asSharedArray(ArrayData*);
-  static const APCLocalArray* asSharedArray(const ArrayData*);
+  // Pre: ad->isApcArray()
+  static APCLocalArray* asApcArray(ArrayData*);
+  static const APCLocalArray* asApcArray(const ArrayData*);
 
 private:
-  explicit APCLocalArray(APCArray* source)
-    : ArrayData(kSharedKind)
-    , m_arr(source)
-    , m_localCache(nullptr)
-  {
-    m_size = m_arr->size();
-    source->getHandle()->reference();
-  }
-
+  explicit APCLocalArray(const APCArray* source);
   ~APCLocalArray();
 
-private:
   static bool checkInvariants(const ArrayData*);
   ssize_t getIndex(int64_t k) const;
   ssize_t getIndex(const StringData* k) const;
-
-private: // implements Sweepable
-  void sweep() override;
-
-private:
   ArrayData* loadElems() const;
   Variant getKey(ssize_t pos) const;
+  void sweep();
 
 private:
-  APCArray* m_arr;
+  const APCArray* m_arr;
   mutable TypedValue* m_localCache;
+  unsigned m_sweep_index;
+  friend struct MemoryManager; // access to m_sweep_index
 };
 
 //////////////////////////////////////////////////////////////////////

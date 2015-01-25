@@ -17,22 +17,22 @@
 #ifndef incl_HPHP_RUNTIME_SERVER_FASTCGI_SOCKET_CONNECTION_H_
 #define incl_HPHP_RUNTIME_SERVER_FASTCGI_SOCKET_CONNECTION_H_
 
-#include "folly/io/IOBuf.h"
+#include <folly/io/IOBuf.h>
+#include <folly/wangle/acceptor/ManagedConnection.h>
 #include "thrift/lib/cpp/async/TAsyncTransport.h"
-#include "thrift/lib/cpp/transport/TSocketAddress.h"
+#include <folly/SocketAddress.h>
 #include "thrift/lib/cpp/transport/TTransportException.h"
-#include "ti/proxygen/lib/services/ManagedConnection.h"
 
 namespace HPHP {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-class SocketConnection : public facebook::proxygen::ManagedConnection {
+class SocketConnection : public ::folly::wangle::ManagedConnection {
 public:
   SocketConnection(
-    apache::thrift::async::TAsyncTransport::UniquePtr sock,
-    const apache::thrift::transport::TSocketAddress& localAddr,
-    const apache::thrift::transport::TSocketAddress& peerAddr);
+    folly::AsyncSocket::UniquePtr sock,
+    const folly::SocketAddress& localAddr,
+    const folly::SocketAddress& peerAddr);
   virtual ~SocketConnection();
 
   // ManagedConnection
@@ -40,21 +40,21 @@ public:
   virtual void describe(std::ostream& os) const;
   virtual bool isBusy() const;
   virtual void notifyPendingShutdown();
+  virtual void closeWhenIdle();
   virtual void dropConnection();
   virtual void dumpConnectionState(uint8_t loglevel);
 
   virtual bool shouldShutdown() { return false; }
-  void shutdownTransport();
+  void close();
 
 protected:
-  apache::thrift::transport::TSocketAddress m_localAddr;
-  apache::thrift::transport::TSocketAddress m_peerAddr;
+  folly::SocketAddress m_localAddr;
+  folly::SocketAddress m_peerAddr;
 
-  apache::thrift::async::TAsyncTransport::UniquePtr m_sock;
+  folly::AsyncSocket::UniquePtr m_sock;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
 }
 
 #endif // incl_HPHP_RUNTIME_SERVER_FASTCGI_SOCKET_CONNECTION_H_
-

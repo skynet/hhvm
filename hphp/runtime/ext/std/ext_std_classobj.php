@@ -26,11 +26,9 @@ function call_user_method_array(string $method_name,
  * @return mixed -
  */
 function call_user_method(Stringish $method_name,
-                          mixed &$obj, ...): mixed {
-  $args = func_get_args();
-  array_shift($args);
-  array_shift($args);
-  return call_user_method_array($method_name, $obj, $args);
+                          mixed &$obj,
+                          ...$args): mixed {
+  return call_user_method_array((string)$method_name, $obj, $args);
 }
 
 /**
@@ -239,7 +237,6 @@ function method_exists(mixed $object,
 
 /**
  * Checks if the object or class has a property
- *  
  *
  * @param mixed $class - The class name or an object of the class to test
  *   for
@@ -263,4 +260,16 @@ function property_exists(mixed $class,
  */
 <<__Native>>
 function trait_exists(string $traitname,
+                      bool $autoload = true): bool;
+
+/**
+ * Checks if the enum exists
+ *
+ * @param string $enumname -
+ * @param bool $autoload -
+ *
+ * @return bool - Returns TRUE if enum exists, FALSE if not
+ */
+<<__Native>>
+function enum_exists(string $enumname,
                       bool $autoload = true): bool;

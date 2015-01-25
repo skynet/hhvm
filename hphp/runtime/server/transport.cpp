@@ -15,17 +15,23 @@
 */
 
 #include "hphp/runtime/server/transport.h"
+
+#include <boost/algorithm/string.hpp>
+
 #include "hphp/runtime/server/server.h"
 #include "hphp/runtime/server/upload.h"
 #include "hphp/runtime/server/server-stats.h"
+#include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/file.h"
 #include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/base/datetime.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/url.h"
 #include "hphp/runtime/base/zend-url.h"
+#include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/server/access-log.h"
-#include "hphp/runtime/ext/ext_openssl.h"
+#include "hphp/runtime/server/http-protocol.h"
+#include "hphp/runtime/ext/openssl/ext_openssl.h"
 #include "hphp/system/constants.h"
 #include "hphp/util/compression.h"
 #include "hphp/util/text-util.h"
@@ -33,14 +39,9 @@
 #include "hphp/util/logger.h"
 #include "hphp/util/compatibility.h"
 #include "hphp/util/timer.h"
-#ifdef FACEBOOK
-#include "hphp/util/channeled-json-compressor.h"
-#include <memory>
-#endif
 #include "hphp/runtime/base/hardware-counter.h"
-#include "folly/String.h"
-#include <stdio.h>
-#include <fstream>
+#include "hphp/runtime/ext/string/ext_string.h"
+#include <folly/String.h>
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -52,10 +53,10 @@ Transport::Transport()
     m_nsleepTimeS(0), m_nsleepTimeN(0), m_url(nullptr),
     m_postData(nullptr), m_postDataParsed(false),
     m_chunkedEncoding(false), m_headerSent(false),
-    m_headerCallback(uninit_null()), m_headerCallbackDone(false),
+    m_headerCallbackDone(false),
     m_responseCode(-1), m_firstHeaderSet(false), m_firstHeaderLine(0),
     m_responseSize(0), m_responseTotalSize(0), m_responseSentSize(0),
-    m_flushTimeUs(0), m_sendContentType(true),
+    m_flushTimeUs(0), m_sendEnded(false), m_sendContentType(true),
     m_compression(true), m_compressor(nullptr), m_isSSL(false),
     m_compressionDecision(CompressionDecision::NotDecidedYet),
     m_threadType(ThreadType::RequestThread) {
@@ -63,6 +64,7 @@ Transport::Transport()
   memset(&m_wallTime, 0, sizeof(m_wallTime));
   memset(&m_cpuTime, 0, sizeof(m_cpuTime));
   m_chunksSentSizes.clear();
+  tvWriteUninit(&m_headerCallback);
 }
 
 Transport::~Transport() {
@@ -331,15 +333,14 @@ bool Transport::splitHeader(const String& header, String &name, const char *&val
       if (pos2 == String::npos) pos2 = header.size();
       if (pos2 - pos1 > 1) {
         setResponse(atoi(header.data() + pos1),
-                    getResponseInfo().empty() ? "splitHeader"
-                                              : getResponseInfo().c_str()
-                   );
+                    header.size() - pos2 > 1 ? header.data() + pos2 : nullptr);
         return false;
       }
     }
   }
 
-  throw InvalidArgumentException("header", header.c_str());
+  throw ExtendedException(
+    "Invalid argument \"header\": [%s]", header.c_str());
 }
 
 void Transport::addHeaderNoLock(const char *name, const char *value) {
@@ -348,7 +349,7 @@ void Transport::addHeaderNoLock(const char *name, const char *value) {
 
   if (!m_firstHeaderSet) {
     m_firstHeaderSet = true;
-    m_firstHeaderFile = g_context->getContainingFileName().data();
+    m_firstHeaderFile = g_context->getContainingFileName()->data();
     m_firstHeaderLine = g_context->getLine();
   }
 
@@ -367,7 +368,7 @@ void Transport::addHeaderNoLock(const char *name, const char *value) {
       setResponse(302);
     }
     */
-    setResponse(302, "forced.302");
+    setResponse(302);
   }
 }
 
@@ -404,34 +405,59 @@ void Transport::removeHeader(const char *name) {
   if (name && *name) {
     m_responseHeaders.erase(name);
     if (strcasecmp(name, "Set-Cookie") == 0) {
-      m_responseCookies.clear();
+      m_responseCookiesList.clear();
     }
   }
 }
 
 void Transport::removeAllHeaders() {
   m_responseHeaders.clear();
-  m_responseCookies.clear();
+  m_responseCookiesList.clear();
 }
 
 void Transport::getResponseHeaders(HeaderMap &headers) {
   headers = m_responseHeaders;
 
   std::vector<std::string> &cookies = headers["Set-Cookie"];
-  for (auto iter = m_responseCookies.begin();
-       iter != m_responseCookies.end();
-       ++iter) {
-    cookies.push_back(iter->second);
-  }
+  std::list<std::string> cookies_existing = getCookieLines();
+  cookies.insert(cookies.end(), cookies_existing.begin(),
+     cookies_existing.end());
 }
 
 bool Transport::acceptEncoding(const char *encoding) {
+  // Examples of valid encodings that we want to accept
+  // gzip;q=1.0, identity; q=0.5, *;q=0
+  // compress;q=0.5, gzip;q=1.0
+  // For now, we don't care about the qvalue
+
   assert(encoding && *encoding);
   std::string header = getHeader("Accept-Encoding");
 
-  // This is testing a substring than a word match, but in practice, this
-  // always works.
-  return strcasestr(header.c_str(), encoding) != nullptr;
+  // Handle leading and trailing quotes
+  size_t len = header.length();
+  if (len >= 2
+      && ((header[0] == '"' && header[len-1] == '"')
+      || (header[0] == '\'' && header[len-1] == '\''))) {
+    header = header.substr(1, len - 2);
+  }
+
+ // Split the header by ','
+  std::vector<std::string> cTokens;
+  split(',', header.c_str(), cTokens);
+  for (size_t i = 0; i < cTokens.size(); ++i) {
+    // Then split by ';'
+    std::string& cToken = cTokens[i];
+    std::vector<std::string> scTokens;
+    split(';', cToken.c_str(), scTokens);
+    assert(scTokens.size() > 0);
+    // lhs contains the encoding
+    // rhs, if it exists, contains the qvalue
+    std::string lhs = boost::trim_copy(scTokens[0]);
+    if (strcasecmp(lhs.c_str(), encoding) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Transport::cookieExists(const char *name) {
@@ -492,6 +518,11 @@ bool Transport::decideCompression() {
   return false;
 }
 
+void Transport::setResponse(int code, const char *info) {
+  m_responseCode = code;
+  m_responseCodeInfo = info ? info : HttpProtocol::GetReasonString(code);
+}
+
 std::string Transport::getHTTPVersion() const {
   return "1.1";
 }
@@ -511,33 +542,39 @@ String Transport::getMimeType() {
 ///////////////////////////////////////////////////////////////////////////////
 // cookies
 
+namespace {
+
+// Make sure a component (name, path, value) of a cookie does not
+// contain any illegal characters.  Throw a fatal exception if it
+// does.
+void validateCookieString(const String& str, const char* component) {
+  if(!str.empty() && strpbrk(str.data(), "=,; \t\r\n\013\014")) {
+    raise_error("Cookie %s can not contain any of the following "
+                "'=,; \\t\\r\\n\\013\\014'", component);
+  }
+}
+
+}
+
 bool Transport::setCookie(const String& name, const String& value, int64_t expire /* = 0 */,
                           const String& path /* = "" */, const String& domain /* = "" */,
                           bool secure /* = false */,
                           bool httponly /* = false */,
                           bool encode_url /* = true */) {
-  if (!name.empty() && strpbrk(name.data(), "=,; \t\r\n\013\014")) {
-    Logger::Warning("Cookie names can not contain any of the following "
-                    "'=,; \\t\\r\\n\\013\\014'");
-    return false;
+  validateCookieString(name, "names");
+
+  if (!encode_url) {
+    validateCookieString(value, "values");
   }
 
-  if (!encode_url &&
-      !value.empty() && strpbrk(value.data(), ",; \t\r\n\013\014")) {
-    Logger::Warning("Cookie values can not contain any of the following "
-                    "',; \\t\\r\\n\\013\\014'");
-    return false;
-  }
+  validateCookieString(path, "paths");
 
-  char *encoded_value = nullptr;
+  String encoded_value;
   int len = 0;
-  if (!value.empty() && encode_url) {
-    int encoded_value_len = value.size();
-    encoded_value = url_encode(value.data(), encoded_value_len);
-    len += encoded_value_len;
-  } else if (!value.empty()) {
-    encoded_value = strdup(value.data());
-    len += value.size();
+  if (!value.empty()) {
+    encoded_value = encode_url ? url_encode(value.data(), value.size())
+                               : value;
+    len += encoded_value.size();
   }
   len += path.size();
   len += domain.size();
@@ -554,10 +591,11 @@ bool Transport::setCookie(const String& name, const String& value, int64_t expir
     cookie += name.data();
     cookie += "=deleted; expires=";
     cookie += sdt.data();
+    cookie += "; Max-Age=0";
   } else {
     cookie += name.data();
     cookie += "=";
-    cookie += encoded_value ? encoded_value : "";
+    cookie += encoded_value.isNull() ? "" : encoded_value.data();
     if (expire > 0) {
       if (expire > 253402300799LL) {
         raise_warning("Expiry date cannot have a year greater than 9999");
@@ -567,11 +605,10 @@ bool Transport::setCookie(const String& name, const String& value, int64_t expir
       String sdt =
         DateTime(expire, true).toString(DateTime::DateFormat::Cookie);
       cookie += sdt.data();
+      cookie += "; Max-Age=";
+      String sdelta = toString( expire - time(0) );
+      cookie += sdelta.data();
     }
-  }
-
-  if (encoded_value) {
-    free(encoded_value);
   }
 
   if (!path.empty()) {
@@ -589,14 +626,45 @@ bool Transport::setCookie(const String& name, const String& value, int64_t expir
     cookie += "; httponly";
   }
 
-  m_responseCookies[name.data()] = cookie;
+  // PHP5 does not deduplicate cookies. That behavior is preserved when
+  // CookieDeduplicate is not enabled. Otherwise, we will only keep the
+  // last cookie for a given name-domain-path triplet.
+  String dedup_key = name + "\n" + domain + "\n" + path;
+
+  m_responseCookiesList.emplace(m_responseCookiesList.end(),
+    dedup_key.data(), cookie);
+
   return true;
 }
+
+std::list<std::string> Transport::getCookieLines() {
+  std::list<std::string> ret;
+  if (RuntimeOption::AllowDuplicateCookies) {
+    for(CookieList::const_iterator iter = m_responseCookiesList.begin();
+        iter != m_responseCookiesList.end(); ++iter) {
+      ret.push_back(iter->second);
+    }
+  } else {
+    // We will dedupe with last-one-wins semantics by walking backwards and
+    // including only those whose dedupe key we have not seen yet, then
+    // reversing the list
+    std::unordered_set<std::string> already_seen;
+    for(auto iter = m_responseCookiesList.crbegin();
+        iter != m_responseCookiesList.crend(); ++iter) {
+      if (already_seen.find(iter->first) == already_seen.end()) {
+        ret.push_front(iter->second);
+        already_seen.insert(iter->first);
+      }
+    }
+  }
+  return ret;
+}
+
 
 ///////////////////////////////////////////////////////////////////////////////
 
 void Transport::prepareHeaders(bool compressed, bool chunked,
-    const String &response, const String& orig_response) {
+    const StringHolder &response, const StringHolder& orig_response) {
   for (HeaderMap::const_iterator iter = m_responseHeaders.begin();
        iter != m_responseHeaders.end(); ++iter) {
     const std::vector<std::string> &values = iter->second;
@@ -605,9 +673,14 @@ void Transport::prepareHeaders(bool compressed, bool chunked,
     }
   }
 
-  for (CookieMap::const_iterator iter = m_responseCookies.begin();
-       iter != m_responseCookies.end(); ++iter) {
-    addHeaderImpl("Set-Cookie", iter->second.c_str());
+  const std::list<std::string> cookies = getCookieLines();
+  for (std::list<std::string>::const_iterator iter = cookies.begin();
+       iter != cookies.end(); ++iter) {
+    addHeaderImpl("Set-Cookie", iter->c_str());
+  }
+
+  if (isCompressionEnabled()) {
+    addHeaderImpl("Vary", "Accept-Encoding");
   }
 
   if (compressed) {
@@ -627,14 +700,14 @@ void Transport::prepareHeaders(bool compressed, bool chunked,
       } else {
         std::string cur_md5 = it->second[0];
         String expected_md5 = StringUtil::Base64Encode(StringUtil::MD5(
-          orig_response, true));
+          orig_response.data(), orig_response.size(), true));
         // Can never trust these PHP people...
         if (expected_md5.c_str() != cur_md5) {
           raise_warning("Content-MD5 mismatch. Expected: %s, Got: %s",
             expected_md5.c_str(), cur_md5.c_str());
         }
         addHeaderImpl("Content-MD5", StringUtil::Base64Encode(StringUtil::MD5(
-          response, true)).c_str());
+          response.data(), response.size(), true)).c_str());
       }
     }
   }
@@ -647,23 +720,24 @@ void Transport::prepareHeaders(bool compressed, bool chunked,
   }
 
   if (RuntimeOption::ExposeHPHP) {
-    addHeaderImpl("X-Powered-By", ("HHVM/" + k_HHVM_VERSION).c_str());
+    addHeaderImpl("X-Powered-By", (String("HHVM/") + HHVM_VERSION).c_str());
   }
 
   if ((RuntimeOption::ExposeXFBServer || RuntimeOption::ExposeXFBDebug) &&
       !RuntimeOption::XFBDebugSSLKey.empty() &&
       m_responseHeaders.find("X-FB-Debug") == m_responseHeaders.end()) {
-    String ip = RuntimeOption::ServerPrimaryIP;
+    String ip = this->getServerAddr();
     String key = RuntimeOption::XFBDebugSSLKey;
     String cipher("AES-256-CBC");
-    int iv_len = f_openssl_cipher_iv_length(cipher).toInt32();
-    String iv = f_openssl_random_pseudo_bytes(iv_len);
+    int iv_len = HHVM_FN(openssl_cipher_iv_length)(cipher).toInt32();
+    String iv = HHVM_FN(openssl_random_pseudo_bytes)(iv_len);
     String encrypted =
-      f_openssl_encrypt(ip, cipher, key, k_OPENSSL_RAW_DATA, iv);
+      HHVM_FN(openssl_encrypt)(ip, cipher, key, k_OPENSSL_RAW_DATA, iv);
     String output = StringUtil::Base64Encode(iv + encrypted);
     if (debug) {
-      String decrypted =
-        f_openssl_decrypt(encrypted, cipher, key, k_OPENSSL_RAW_DATA, iv);
+      String decrypted = HHVM_FN(openssl_decrypt)(
+        encrypted, cipher, key, k_OPENSSL_RAW_DATA, iv
+      );
       assert(decrypted.get()->same(ip.get()));
     }
     addHeaderImpl("X-FB-Debug", output.c_str());
@@ -679,9 +753,31 @@ void Transport::prepareHeaders(bool compressed, bool chunked,
   }
 }
 
-String Transport::prepareResponse(const void *data, int size, bool &compressed,
-                                  bool last) {
-  String response((const char *)data, size, CopyString);
+namespace {
+
+void LogException(const char* msg) {
+  try {
+    throw;
+  } catch (Exception& e) {
+    Logger::Error("%s: %s", msg, e.getMessage().c_str());
+  } catch (std::exception& e) {
+    Logger::Error("%s: %s", msg, e.what());
+  } catch (Object& e) {
+    try {
+      Logger::Error("%s: %s", msg, e.toString().c_str());
+    } catch (...) {
+      Logger::Error("%s: (e.toString() failed)", msg);
+    }
+  } catch (...) {
+    Logger::Error("%s: (unknown exception)", msg);
+  }
+}
+
+}
+
+StringHolder Transport::prepareResponse(const void *data, int size,
+                                        bool &compressed, bool last) {
+  StringHolder response((const char *)data, size);
 
   // we don't use chunk encoding to send anything pre-compressed
   assert(!compressed || !m_chunkedEncoding);
@@ -691,32 +787,23 @@ String Transport::prepareResponse(const void *data, int size, bool &compressed,
   }
   if (compressed || !isCompressionEnabled() ||
       m_compressionDecision == CompressionDecision::ShouldNot) {
-    return response;
+    return std::move(response);
   }
 
-#ifdef FACEBOOK
-  if ((strstr(getHeader("X-FB-Channeled-Json").c_str(), "true") != nullptr) &&
-      (size > ChanneledJsonCompressor::MIN_LENGTH_TO_CHANNEL_JSON) &&
-      (m_compressor == nullptr) && (last) && (!m_headerSent)) {
-
-      ChanneledJsonCompressor channeledJsonCompressor;
-      channeledJsonCompressor.processJson((const char*)data, size);
-      folly::IOBufQueue bufQueue;
-      channeledJsonCompressor.finalize(bufQueue);
-      std::unique_ptr<folly::IOBuf> output = bufQueue.move();
-      output->coalesce();
-
-      String concatenated((const char*)output->data(), output->length(),
-              CopyString);
-      response = concatenated;
-
-      // overriding the data pointer
-      data = response.data();
-      size = response.length();
-
-      replaceHeader("Content-Type", "application/channeled-json");
+  String compression;
+  int compressionLevel = RuntimeOption::GzipCompressionLevel;
+  IniSetting::Get("zlib.output_compression", compression);
+  String on = makeStaticString("on");
+  if (HHVM_FN(strtolower)(compression) == on) {
+    String compressionLevelStr;
+    IniSetting::Get("zlib.output_compression_level", compressionLevelStr);
+    int level = compressionLevelStr.toInt64();
+    if (level > compressionLevel
+        && level <= RuntimeOption::GzipMaxCompressionLevel) {
+      compressionLevel = level;
+    }
   }
-#endif
+
 
   // There isn't that much need to gzip response, when it can fit into one
   // Ethernet packet (1500 bytes), unless we are doing chunked encoding,
@@ -724,45 +811,59 @@ String Transport::prepareResponse(const void *data, int size, bool &compressed,
   if (m_chunkedEncoding || size > 1000 ||
       m_compressionDecision == CompressionDecision::HasTo) {
     if (m_compressor == nullptr) {
-      m_compressor = new StreamCompressor(RuntimeOption::GzipCompressionLevel,
+      m_compressor = new StreamCompressor(compressionLevel,
                                           CODING_GZIP, true);
     }
     int len = size;
     char *compressedData =
       m_compressor->compress((const char*)data, len, last);
     if (compressedData) {
-      String deleter(compressedData, len, AttachString);
+      StringHolder deleter(compressedData, len, true);
       if (m_chunkedEncoding || len < size ||
           m_compressionDecision == CompressionDecision::HasTo) {
-        response = deleter;
+        response = std::move(deleter);
         compressed = true;
       }
     } else {
       Logger::Error("Unable to compress response: level=%d len=%d",
-                    RuntimeOption::GzipCompressionLevel, len);
+                    compressionLevel, len);
     }
   }
 
-  return response;
+  return std::move(response);
 }
 
 bool Transport::setHeaderCallback(const Variant& callback) {
-  if (m_headerCallback.toBoolean()) {
+  if (cellAsVariant(m_headerCallback).toBoolean()) {
     // return false if a callback has already been set.
     return false;
   }
-  m_headerCallback = callback;
+  cellAsVariant(m_headerCallback) = callback;
   return true;
 }
 
-void Transport::sendRawLocked(void *data, int size, int code /* = 200 */,
-                              bool compressed /* = false */,
-                              bool chunked /* = false */,
-                              const char *codeInfo /* = "" */
-                              ) {
+void Transport::sendRaw(void *data, int size, int code /* = 200 */,
+                        bool compressed /* = false */,
+                        bool chunked /* = false */,
+                        const char *codeInfo /* = nullptr */
+                       ) {
+  // There are post-send functions that can run. Any output from them should
+  // be ignored as it doesn't make sense to try and send data after the
+  // request has ended.
+  if (m_sendEnded) {
+    return;
+  }
+
   if (!compressed && RuntimeOption::ForceChunkedEncoding) {
     chunked = true;
   }
+
+  // I don't think there is any need to send an empty chunk, other than sending
+  // out headers earlier, which seems to be a useless feature.
+  if (size == 0 && (chunked || m_chunkedEncoding)) {
+    return;
+  }
+
   if (m_chunkedEncoding) {
     chunked = true;
     assert(!compressed);
@@ -771,35 +872,42 @@ void Transport::sendRawLocked(void *data, int size, int code /* = 200 */,
     assert(!compressed);
   }
 
-  // I don't think there is any need to send an empty chunk, other than sending
-  // out headers earlier, which seems to be a useless feature.
-  if (chunked && size == 0) {
-    return;
-  }
+  sendRawInternal(data, size, code, compressed, codeInfo);
+}
 
-  if (!m_headerCallbackDone && !m_headerCallback.isNull()) {
+void Transport::sendRawInternal(const void *data, int size,
+                                int code /* = 200 */,
+                                bool compressed /* = false */,
+                                const char *codeInfo /* = nullptr */
+                               ) {
+
+  bool chunked = m_chunkedEncoding;
+
+  if (!m_headerCallbackDone && !cellIsNull(&m_headerCallback)) {
     // We could use m_headerSent here, however it seems we can still
     // end up in an infinite loop when:
     // m_headerCallback calls flush()
     // flush() triggers php's recursion guard
     // the recursion guard calls back into m_headerCallback
     m_headerCallbackDone = true;
-    vm_call_user_func(m_headerCallback, init_null_variant);
+    try {
+      vm_call_user_func(cellAsVariant(m_headerCallback), init_null_variant);
+    } catch (...) {
+      LogException("HeaderCallback");
+    }
   }
 
   // compression handling
   ServerStatsHelper ssh("send");
-  String response = prepareResponse(data, size, compressed, !chunked);
+  StringHolder response = prepareResponse(data, size, compressed, !chunked);
 
   if (m_responseCode < 0) {
-    m_responseCode = code;
-    m_responseCodeInfo = codeInfo ? codeInfo: "";
+    setResponse(code, codeInfo);
   }
 
   // HTTP header handling
   if (!m_headerSent) {
-    String orig_response((const char *)data, size, CopyString);
-    prepareHeaders(compressed, chunked, response, orig_response);
+    prepareHeaders(compressed, chunked, response, response);
     m_headerSent = true;
   }
 
@@ -815,32 +923,30 @@ void Transport::sendRawLocked(void *data, int size, int code /* = 200 */,
   }
 }
 
-void Transport::sendRaw(void *data, int size, int code /* = 200 */,
-                        bool compressed /* = false */,
-                        bool chunked /* = false */,
-                        const char *codeInfo /* = "" */
-                        ) {
-  sendRawLocked(data, size, code, compressed, chunked, codeInfo);
-}
-
 void Transport::onSendEnd() {
   if (m_compressor && m_chunkedEncoding) {
     bool compressed = false;
-    String response = prepareResponse("", 0, compressed, true);
+    StringHolder response = prepareResponse("", 0, compressed, true);
     sendImpl(response.data(), response.size(), m_responseCode, true);
+  }
+  if (!m_headerSent) {
+    m_compressionDecision = CompressionDecision::ShouldNot;
+    sendRawInternal("", 0);
   }
   auto httpResponseStats = ServiceData::createTimeseries(
     folly::to<std::string>(HTTP_RESPONSE_STATS_PREFIX, getResponseCode()),
     {ServiceData::StatsType::SUM});
   httpResponseStats->addValue(1);
   onSendEndImpl();
+  // Record that we have ended the request so any further output is discarded.
+  m_sendEnded = true;
 }
 
 void Transport::redirect(const char *location, int code /* = 302 */,
-                         const char *info) {
+                         const char *info /* = nullptr */) {
   addHeaderImpl("Location", location);
   setResponse(code, info);
-  sendStringLocked("Moved", code);
+  sendString("Moved", code);
 }
 
 void Transport::onFlushProgress(int writtenSize, int64_t delayUs) {

@@ -16,8 +16,8 @@
 */
 
 #include "hphp/runtime/ext/filter/sanitizing_filters.h"
-#include "hphp/runtime/ext/ext_filter.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/filter/ext_filter.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/system/constants.h"
@@ -33,7 +33,7 @@ static String php_filter_encode_html(const String& value,
   unsigned char *e = s + len;
 
   if (len == 0) {
-    return empty_string;
+    return empty_string();
   }
   StringBuffer str(len);
 
@@ -68,7 +68,7 @@ static Variant php_filter_encode_url(const String& value, const unsigned char* c
   unsigned char *e = s + char_len;
   int len = value.length();
   if (len == 0) {
-    return empty_string;
+    return empty_string_variant();
   }
 
   memset(tmp, 1, sizeof(tmp)-1);
@@ -98,7 +98,7 @@ static Variant php_filter_strip(const String& value, long flags) {
   int i;
   int len = value.length();
   if (len == 0) {
-    return empty_string;
+    return empty_string_variant();
   }
 
   /* Optimization for if no strip flags are set */
@@ -139,7 +139,7 @@ static Variant filter_map_apply(const String& value, filter_map *map) {
   int i;
   int len = value.length();
   if (len == 0) {
-    return empty_string;
+    return empty_string_variant();
   }
 
   str = (unsigned char *)value.data();
@@ -176,20 +176,18 @@ Variant php_filter_string(PHP_INPUT_FILTER_PARAM_DECL) {
 
   String encoded(php_filter_encode_html(stripped, enc));
   int len = encoded.length();
-  char *ret = string_strip_tags(
-    encoded.data(), len, empty_string.data(), empty_string.length(), true
+  auto const empty = staticEmptyString();
+  String ret = string_strip_tags(
+    encoded.data(), len, empty->data(), empty->size(), true
   );
 
   if (len == 0) {
     if (flags & k_FILTER_FLAG_EMPTY_STRING_NULL) {
-      free(ret);
-      return uninit_null();
+      return init_null();
     }
-    free(ret);
-    return empty_string;
+    return empty_string_variant();
   }
-  // string_strip_tags mallocs this string
-  return String(ret, AttachString);
+  return ret;
 }
 
 Variant php_filter_encoded(PHP_INPUT_FILTER_PARAM_DECL) {
@@ -231,7 +229,7 @@ Variant php_filter_full_special_chars(PHP_INPUT_FILTER_PARAM_DECL) {
   } else {
     quotes = k_ENT_NOQUOTES;
   }
-  return f_htmlentities(value, quotes);
+  return HHVM_FN(htmlentities)(value, quotes);
 }
 
 Variant php_filter_unsafe_raw(PHP_INPUT_FILTER_PARAM_DECL) {
@@ -239,7 +237,10 @@ Variant php_filter_unsafe_raw(PHP_INPUT_FILTER_PARAM_DECL) {
   if (flags != 0 && value.length() > 0) {
     unsigned char enc[256] = {0};
 
-    php_filter_strip(value, flags);
+    auto stripped = php_filter_strip(value, flags);
+    if (!stripped.isString()) {
+      return stripped;
+    }
 
     if (flags & k_FILTER_FLAG_ENCODE_AMP) {
       enc[uc('&')] = 1;
@@ -251,9 +252,9 @@ Variant php_filter_unsafe_raw(PHP_INPUT_FILTER_PARAM_DECL) {
       memset(enc + 127, 1, sizeof(enc) - 127);
     }
 
-    return php_filter_encode_html(value, enc);
+    return php_filter_encode_html(stripped.toString(), enc);
   } else if (flags & k_FILTER_FLAG_EMPTY_STRING_NULL && value.length() == 0) {
-    return uninit_null();
+    return init_null();
   }
   return value;
 }
@@ -322,7 +323,7 @@ Variant php_filter_number_float(PHP_INPUT_FILTER_PARAM_DECL) {
 
 Variant php_filter_magic_quotes(PHP_INPUT_FILTER_PARAM_DECL) {
   /* just call addslashes quotes */
-  return f_addslashes(value);
+  return HHVM_FN(addslashes)(value);
 }
 
 }

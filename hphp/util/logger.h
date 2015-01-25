@@ -41,8 +41,9 @@ public:
     LogVerbose
   };
 
-  Logger(): m_standardOut(stderr) {}
+  Logger(): m_standardOut(stderr) { ResetPid(); }
 
+  static bool AlwaysEscapeLog;
   static bool UseSyslog;
   static bool UseLogFile;
   static bool UseRequestLog;
@@ -76,6 +77,7 @@ public:
   static bool SetThreadLog(const char *file);
   static void ClearThreadLog();
   static void SetNewOutput(FILE *output);
+  static void UnlimitThreadMessages();
 
   typedef void (*PFUNC_LOG)(const char *header, const char *msg,
                             const char *ending, void *data);
@@ -94,6 +96,7 @@ public:
   static void SetStandardOut(FILE*);
 
   virtual ~Logger() { }
+  static void ResetPid();
 
 protected:
   class ThreadData {
@@ -138,6 +141,7 @@ protected:
   static std::string GetHeader();
 private:
   static Logger *s_logger;
+  static pid_t s_pid;
 
   FILE* m_standardOut;
 };

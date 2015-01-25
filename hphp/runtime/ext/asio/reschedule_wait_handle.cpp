@@ -17,6 +17,7 @@
 
 #include "hphp/runtime/ext/asio/reschedule_wait_handle.h"
 
+#include "hphp/runtime/ext/asio/asio_blockable.h"
 #include "hphp/runtime/ext/asio/asio_context.h"
 #include "hphp/runtime/ext/asio/asio_session.h"
 #include "hphp/runtime/ext/asio/blockable_wait_handle.h"
@@ -34,12 +35,6 @@ const int64_t q_RescheduleWaitHandle$$QUEUE_DEFAULT =
 const int64_t q_RescheduleWaitHandle$$QUEUE_NO_PENDING_IO =
   AsioContext::QUEUE_NO_PENDING_IO;
 
-void c_RescheduleWaitHandle::t___construct() {
-  Object e(SystemLib::AllocInvalidOperationExceptionObject(
-        "Use RescheduleWaitHandle::create() instead of constructor"));
-  throw e;
-}
-
 Object c_RescheduleWaitHandle::ti_create(int64_t queue, int priority) {
   if (UNLIKELY(
       queue != q_RescheduleWaitHandle$$QUEUE_DEFAULT &&
@@ -55,16 +50,16 @@ Object c_RescheduleWaitHandle::ti_create(int64_t queue, int priority) {
     throw e;
   }
 
-  c_RescheduleWaitHandle* wh = NEWOBJ(c_RescheduleWaitHandle);
+  c_RescheduleWaitHandle* wh = newobj<c_RescheduleWaitHandle>();
   wh->initialize(static_cast<uint32_t>(queue), static_cast<uint32_t>(priority));
   return wh;
 }
 
 void c_RescheduleWaitHandle::initialize(uint32_t queue, uint32_t priority) {
+  setState(STATE_SCHEDULED);
   m_queue = queue;
   m_priority = priority;
 
-  setState(STATE_SCHEDULED);
   if (isInContext()) {
     getContext()->schedule(this, m_queue, m_priority);
   }
@@ -76,7 +71,10 @@ void c_RescheduleWaitHandle::run() {
     return;
   }
 
-  setResult(make_tv<KindOfNull>());
+  auto parentChain = getParentChain();
+  setState(STATE_SUCCEEDED);
+  tvWriteNull(&m_resultOrException);
+  parentChain.unblock();
 }
 
 String c_RescheduleWaitHandle::getName() {
@@ -118,9 +116,7 @@ void c_RescheduleWaitHandle::exitContext(context_idx_t ctx_idx) {
   }
 
   // recursively move all wait handles blocked by us
-  for (auto pwh = getFirstParent(); pwh; pwh = pwh->getNextParent()) {
-    pwh->exitContextBlocked(ctx_idx);
-  }
+  getParentChain().exitContext(ctx_idx);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

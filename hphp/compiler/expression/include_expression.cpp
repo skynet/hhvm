@@ -28,7 +28,7 @@
 #include "hphp/compiler/parser/parser.h"
 #include "hphp/compiler/analysis/variable_table.h"
 #include "hphp/compiler/expression/scalar_expression.h"
-#include "hphp/util/file-util.h"
+#include "hphp/runtime/base/file-util.h"
 
 using namespace HPHP;
 
@@ -175,7 +175,7 @@ string IncludeExpression::CheckInclude(ConstructPtr includeExp,
     if (included == container) {
       Compiler::Error(Compiler::BadPHPIncludeFile, includeExp);
     }
-    included = FileUtil::canonicalize(included);
+    included = FileUtil::canonicalize(included).toCppString();
     if (!var.empty()) documentRoot = true;
   }
   return included;
@@ -256,32 +256,6 @@ ExpressionPtr IncludeExpression::preOptimize(AnalysisResultConstPtr ar) {
     }
   }
   return ExpressionPtr();
-}
-
-ExpressionPtr IncludeExpression::postOptimize(AnalysisResultConstPtr ar) {
-  if (!m_include.empty()) {
-    if (!m_depsSet) {
-      analyzeInclude(ar, m_include);
-      m_depsSet = true;
-    }
-    FileScopePtr fs = ar->findFileScope(m_include);
-    if (fs && fs->getPseudoMain()) {
-      if (!Option::KeepStatementsWithNoEffect) {
-        if (ExpressionPtr rep = fs->getEffectiveImpl(ar)) {
-          recomputeEffects();
-          return replaceValue(rep->clone());
-        }
-      }
-    } else {
-      m_include = "";
-    }
-  }
-  return ExpressionPtr();
-}
-
-TypePtr IncludeExpression::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                      bool coerce) {
-  return UnaryOpExpression::inferTypes(ar, type, coerce);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

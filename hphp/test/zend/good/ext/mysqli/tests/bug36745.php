@@ -13,6 +13,7 @@
 	$mysql->close();
 	printf("Done");
 ?>
+<?php error_reporting(0); ?>
 <?php
 require_once("connect.inc");
 if (!$link = my_mysqli_connect($host, $user, $passwd, $db, $port, $socket))

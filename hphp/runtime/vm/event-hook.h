@@ -20,6 +20,7 @@
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/base/rds.h"
+#include "hphp/runtime/base/rds-header.h"
 
 #include <atomic>
 
@@ -33,6 +34,15 @@ inline bool checkConditionFlags() {
 
 //////////////////////////////////////////////////////////////////////
 
+/**
+ * Event hooks.
+ *
+ * All hooks can throw because of multiple possible reasons, such as:
+ *  - user-defined signal handlers
+ *  - pending destructor exceptions
+ *  - pending out of memory exceptions
+ *  - pending timeout exceptions
+ */
 class EventHook {
  public:
   enum {
@@ -43,46 +53,60 @@ class EventHook {
 
   static void Enable();
   static void Disable();
+  static void EnableAsync();
+  static void DisableAsync();
+  static void EnableDebug();
+  static void DisableDebug();
   static void EnableIntercept();
   static void DisableIntercept();
   static ssize_t CheckSurprise();
+  static ssize_t GetConditionFlags();
 
-  /*
-   * Can throw from user-defined signal handlers, or OOM or timeout
-   * exceptions.
+  /**
+   * Event hooks -- interpreter entry points.
    */
-  static bool onFunctionEnter(const ActRec* ar, int funcType);
-  static inline bool FunctionEnter(const ActRec* ar, int funcType) {
-    if (Trace::moduleEnabled(Trace::ringbuffer, 1)) {
-      auto name = ar->m_func->fullName();
-      Trace::ringbufferMsg(name->data(), name->size(), Trace::RBTypeFuncEntry);
-    }
+  static inline bool FunctionCall(const ActRec* ar, int funcType) {
+    ringbufferEnter(ar);
+    return UNLIKELY(checkConditionFlags())
+      ? onFunctionCall(ar, funcType) : true;
+  }
+  static inline void FunctionResumeAwait(const ActRec* ar) {
+    ringbufferEnter(ar);
+    if (UNLIKELY(checkConditionFlags())) { onFunctionResumeAwait(ar); }
+  }
+  static inline void FunctionResumeYield(const ActRec* ar) {
+    ringbufferEnter(ar);
+    if (UNLIKELY(checkConditionFlags())) { onFunctionResumeYield(ar); }
+  }
+  static void FunctionSuspendE(ActRec* suspending, const ActRec* resumableAR) {
+    ringbufferExit(resumableAR);
     if (UNLIKELY(checkConditionFlags())) {
-      return onFunctionEnter(ar, funcType);
+      onFunctionSuspendE(suspending, resumableAR);
     }
-    return true;
+  }
+  static void FunctionSuspendR(ActRec* suspending, ObjectData* child) {
+    ringbufferExit(suspending);
+    if (UNLIKELY(checkConditionFlags())) {
+      onFunctionSuspendR(suspending, child);
+    }
+  }
+  static inline void FunctionReturn(ActRec* ar, const TypedValue& retval) {
+    ringbufferExit(ar);
+    if (UNLIKELY(checkConditionFlags())) { onFunctionReturn(ar, retval); }
+  }
+  static inline void FunctionUnwind(const ActRec* ar, const Fault& fault) {
+    ringbufferExit(ar);
+    if (UNLIKELY(checkConditionFlags())) { onFunctionUnwind(ar, fault); }
   }
 
-  /*
-   * FunctionExit may throw.
-   *
-   * This means we have to be extra careful when tearing down frames
-   * (which might be because an exception is propagating).  The
-   * unwinder itself will call the function exit hooks and swallow
-   * exceptions.
+  /**
+   * Event hooks -- JIT entry points.
    */
-  static void onFunctionExit(const ActRec* ar, TypedValue* retval);
-  static void onFunctionExitJit(const ActRec* ar, TypedValue retval) {
-    onFunctionExit(ar, retval.m_type == KindOfUninit ? nullptr : &retval);
-  }
-  static inline void FunctionExit(const ActRec* ar, TypedValue* retval) {
-    if (Trace::moduleEnabled(Trace::ringbuffer, 1)) {
-      auto name = ar->m_func->fullName();
-      Trace::ringbufferMsg(name->data(), name->size(), Trace::RBTypeFuncExit);
-    }
-    if (UNLIKELY(checkConditionFlags())) {
-      onFunctionExit(ar, retval);
-    }
+  static bool onFunctionCall(const ActRec* ar, int funcType);
+  static void onFunctionSuspendE(ActRec*, const ActRec*);
+  static void onFunctionSuspendR(ActRec*, ObjectData*);
+  static void onFunctionReturnJit(ActRec* ar, const TypedValue retval) {
+    onFunctionReturn(ar, retval);
   }
 
 private:
@@ -91,9 +115,31 @@ private:
     ProfileExit,
   };
 
+  static void onFunctionResumeAwait(const ActRec* ar);
+  static void onFunctionResumeYield(const ActRec* ar);
+  static void onFunctionReturn(ActRec* ar, const TypedValue& retval);
+  static void onFunctionUnwind(const ActRec* ar, const Fault& fault);
+
+  static void onFunctionEnter(const ActRec* ar, int funcType, ssize_t flags);
+  static void onFunctionExit(const ActRec* ar, const TypedValue* retval,
+                             const Fault* fault, ssize_t flags);
+
   static bool RunInterceptHandler(ActRec* ar);
   static const char* GetFunctionNameForProfiler(const Func* func,
                                                 int funcType);
+
+  static inline void ringbufferEnter(const ActRec* ar) {
+    if (Trace::moduleEnabled(Trace::ringbuffer, 1)) {
+      auto name = ar->m_func->fullName();
+      Trace::ringbufferMsg(name->data(), name->size(), Trace::RBTypeFuncEntry);
+    }
+  }
+  static inline void ringbufferExit(const ActRec* ar) {
+    if (Trace::moduleEnabled(Trace::ringbuffer, 1)) {
+      auto name = ar->m_func->fullName();
+      Trace::ringbufferMsg(name->data(), name->size(), Trace::RBTypeFuncExit);
+    }
+  }
 };
 
 //////////////////////////////////////////////////////////////////////

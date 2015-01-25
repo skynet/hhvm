@@ -17,13 +17,14 @@
 #ifndef incl_HPHP_VM_BLOCK_H_
 #define incl_HPHP_VM_BLOCK_H_
 
-#include "hphp/runtime/base/smart-containers.h"
 #include <algorithm>
-#include "hphp/runtime/vm/jit/ir.h"
+
+#include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/edge.h"
 #include "hphp/runtime/vm/jit/ir-instruction.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 /*
  * A Block refers to a basic block: single-entry, single-exit, list of
@@ -41,20 +42,42 @@ struct Block : boost::noncopyable {
   typedef InstructionList::reference reference;
   typedef InstructionList::const_reference const_reference;
 
-  // Execution frequency hint; codegen will put Unlikely blocks in astubs.
-  enum class Hint { Neither, Likely, Unlikely };
+  /*
+   * Execution frequency hint; codegen will put Unlikely blocks in acold,
+   * and Unused blocks in afrozen.
+   *
+   * 'Main' code, or code that executes most frequently, should have either
+   * the 'Likely' or 'Neither' Block::Hint. Code for these blocks is
+   * emitted into the 'a' section.
+   *
+   * Code that handles infrequent cases should have the 'Unlikely'
+   * Block::Hint. Example of such code are decref helpers that free objects
+   * when the ref-count goes to zero. Code for these blocks is emitted into
+   * the 'acold' section.
+   *
+   * Code that is either executed once, or is highly unlikely to be ever
+   * executed, or code that will become dead in the future should have
+   * the 'Unlikely' Hint. Examples of these include Service Request stubs
+   * (executed once), Catch blocks (highly unlikely), and cold code
+   * emitted in profiling mode (which become dead after optimized code is
+   * emitted). Code for these blocks is emitted into the 'afrozen' section.
+   *
+   * See also util/code-cache.h for comment on the 'ahot' and 'aprof' sections.
+   */
+
+  enum class Hint { Neither, Likely, Unlikely, Unused };
 
   explicit Block(unsigned id)
     : m_id(id)
     , m_hint(Hint::Neither)
   {}
 
-  uint32_t    id() const           { return m_id; }
+  unsigned    id() const           { return m_id; }
   Hint        hint() const         { return m_hint; }
   void        setHint(Hint hint)   { m_hint = hint; }
 
   // Returns true if this block has no successors.
-  bool isExit() const { return !taken() && !next(); }
+  bool isExit() const { return !empty() && !taken() && !next(); }
 
   // Returns whether this block is the initial entry block for the tracelet.
   bool isEntry() const { return id() == 0; }
@@ -98,6 +121,7 @@ struct Block : boost::noncopyable {
   // which is the instruction in the predecessor block.
   EdgeList& preds()             { return m_preds; }
   const EdgeList& preds() const { return m_preds; }
+
   size_t numPreds() const { return m_preds.size(); }
 
   // Remove edge from its destination's predecessor list and insert it in
@@ -118,6 +142,8 @@ struct Block : boost::noncopyable {
   // list-compatible interface; these delegate to m_instrs but also update
   // inst.m_block
   InstructionList& instrs()      { return m_instrs; }
+  const InstructionList&
+                   instrs() const{ return m_instrs; }
   bool             empty() const { return m_instrs.empty(); }
   iterator         begin()       { return m_instrs.begin(); }
   iterator         end()         { return m_instrs.end(); }
@@ -151,7 +177,8 @@ struct Block : boost::noncopyable {
   Hint m_hint;              // execution frequency hint
 };
 
-typedef smart::vector<Block*> BlockList;
+using BlockList = jit::vector<Block*>;
+using BlockSet = jit::flat_set<Block*>;
 
 inline Block::reference Block::front() {
   assert(!m_instrs.empty());
@@ -269,8 +296,8 @@ inline void Block::push_back(IRInstruction* inst) {
   return m_instrs.push_back(*inst);
 }
 
-template <class Predicate> inline
-void Block::remove_if(Predicate p) {
+template <class Predicate>
+inline void Block::remove_if(Predicate p) {
   m_instrs.remove_if(p);
 }
 
@@ -297,6 +324,10 @@ inline BCMarker Block::catchMarker() const {
 // defined here to avoid circular dependencies
 inline void Edge::setTo(Block* to) {
   m_to = Block::updatePreds(this, to);
+}
+
+inline Block* Edge::from() const {
+  return inst() != nullptr ? inst()->block() : nullptr;
 }
 
 }}

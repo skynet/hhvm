@@ -32,13 +32,14 @@ LibEventTransport::LibEventTransport(LibEventServer *server,
                                      evhttp_request *request,
                                      int workerId)
   : m_server(server), m_request(request), m_eventBasePostData(nullptr),
-    m_workerId(workerId), m_sendStarted(false), m_sendEnded(false) {
+    m_workerId(workerId), m_sendStarted(false) {
   // HttpProtocol::PrepareSystemVariables needs this
   evbuffer *buf = m_request->input_buffer;
   assert(buf);
   m_requestSize = EVBUFFER_LENGTH(buf);
   m_remote_host = m_request->remote_host;
   m_remote_port = m_request->remote_port;
+  m_remote_ip = folly::IPAddress(m_remote_host);
 
   {
     char buf[6];
@@ -92,6 +93,12 @@ const char *LibEventTransport::getRemoteHost() {
 
 uint16_t LibEventTransport::getRemotePort() {
   return m_remote_port;
+}
+
+const char *LibEventTransport::getServerAddr() {
+  return m_remote_ip.isV6() ?
+    RuntimeOption::ServerPrimaryIPv6.c_str() :
+    RuntimeOption::ServerPrimaryIPv4.c_str();
 }
 
 const void *LibEventTransport::getPostData(int &size) {

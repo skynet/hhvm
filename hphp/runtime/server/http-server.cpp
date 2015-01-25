@@ -16,10 +16,9 @@
 
 #include "hphp/runtime/server/http-server.h"
 
-#include <boost/lexical_cast.hpp>
-
 #include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/base/externals.h"
+#include "hphp/runtime/base/file-util.h"
 #include "hphp/runtime/base/http-client.h"
 #include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/pprof-server.h"
@@ -27,7 +26,6 @@
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/thread-init-fini.h"
 #include "hphp/runtime/debugger/debugger.h"
-#include "hphp/runtime/ext/ext_apc.h"
 #include "hphp/runtime/server/admin-request-handler.h"
 #include "hphp/runtime/server/http-request-handler.h"
 #include "hphp/runtime/server/replay-transport.h"
@@ -35,11 +33,13 @@
 #include "hphp/runtime/server/static-content-cache.h"
 #include "hphp/runtime/server/warmup-request-handler.h"
 #include "hphp/runtime/server/xbox-server.h"
-#include "hphp/util/db-conn.h"
+
 #include "hphp/util/logger.h"
 #include "hphp/util/process.h"
 #include "hphp/util/ssl-init.h"
-#include "hphp/util/file-util.h"
+
+#include <folly/Conv.h>
+#include <folly/Format.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -47,7 +47,6 @@
 namespace HPHP {
 extern InitFiniNode *extra_server_init, *extra_server_exit;
 
-using boost::lexical_cast;
 using std::string;
 
 
@@ -60,21 +59,21 @@ time_t HttpServer::StartTime;
 const int kNumProcessors = sysconf(_SC_NPROCESSORS_ONLN);
 
 static void on_kill(int sig) {
-  signal(sig, SIG_DFL);
   // There is a small race condition here with HttpServer::reset in
   // program-functions.cpp, but it can only happen if we get a signal while
   // shutting down.  The fix is to add a lock to HttpServer::Server but it seems
   // like overkill.
   if (HttpServer::Server) {
-    HttpServer::Server->stopOnSignal();
+    HttpServer::Server->stopOnSignal(sig);
   }
+  signal(sig, SIG_DFL);
   raise(sig);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
 HttpServer::HttpServer()
-  : m_stopped(false), m_stopReason(nullptr),
+  : m_stopped(false), m_killed(false), m_stopReason(nullptr),
     m_watchDog(this, &HttpServer::watchDog) {
 
   // enabling mutex profiling, but it's not turned on
@@ -100,6 +99,7 @@ HttpServer::HttpServer()
   options.m_takeoverFilename = RuntimeOption::TakeoverFilename;
   m_pageServer = std::move(serverFactory->createServer(options));
   m_pageServer->addTakeoverListener(this);
+  m_pageServer->addServerEventListener(this);
 
   if (additionalThreads) {
     auto handlerFactory = std::make_shared<WarmupRequestHandlerFactory>(
@@ -140,7 +140,7 @@ HttpServer::HttpServer()
   }
 
   if (RuntimeOption::XboxServerPort != 0) {
-    std::shared_ptr<SatelliteServerInfo> xboxInfo(new XboxServerInfo());
+    auto xboxInfo = std::make_shared<XboxServerInfo>();
     auto satellite = SatelliteServer::Create(xboxInfo);
     if (satellite) {
       m_satellites.push_back(std::move(satellite));
@@ -152,6 +152,7 @@ HttpServer::HttpServer()
 
   signal(SIGTERM, on_kill);
   signal(SIGUSR1, on_kill);
+  signal(SIGHUP, on_kill);
 
   if (!RuntimeOption::StartupDocument.empty()) {
     Hdf hdf;
@@ -162,7 +163,7 @@ HttpServer::HttpServer()
     ReplayTransport rt;
     rt.replayInput(hdf);
     HttpRequestHandler handler(0);
-    handler.handleRequest(&rt);
+    handler.run(&rt);
     int code = rt.getResponseCode();
     if (code == 200) {
       Logger::Info("StartupDocument %s returned 200 OK: %s",
@@ -174,17 +175,6 @@ HttpServer::HttpServer()
                     code, rt.getResponse().data());
       return;
     }
-  }
-
-  for (unsigned int i = 0; i < RuntimeOption::ThreadDocuments.size(); i++) {
-    m_serviceThreads.push_back(
-      std::make_shared<ServiceThread>(RuntimeOption::ThreadDocuments[i]));
-  }
-
-  for (unsigned int i = 0; i < RuntimeOption::ThreadLoopDocuments.size(); i++) {
-    m_serviceThreads.push_back(
-      std::make_shared<ServiceThread>(
-        RuntimeOption::ThreadLoopDocuments[i], true));
   }
 }
 
@@ -235,6 +225,17 @@ void HttpServer::takeoverShutdown() {
   stop();
 }
 
+void HttpServer::serverStopped(HPHP::Server* server) {
+  Logger::Info("Page server stopped");
+  assert(server == m_pageServer.get());
+  removePid();
+
+  auto sockFile = RuntimeOption::ServerFileSocket;
+  if (!sockFile.empty()) {
+    unlink(sockFile.c_str());
+  }
+}
+
 HttpServer::~HttpServer() {
   // XXX: why should we have to call stop here?  If we haven't already
   // stopped (and joined all the threads), watchDog could still be
@@ -243,30 +244,23 @@ HttpServer::~HttpServer() {
   stop();
 }
 
-void HttpServer::startupFailure() {
-  Logger::Error("Shutting down due to failure(s) to bind in "
-                "HttpServer::run");
-  // Logger flushes itself---we don't need to run any atexit handlers
-  // (historically we've mostly just SEGV'd while trying) ...
-  _Exit(1);
-}
-
 void HttpServer::runOrExitProcess() {
   StartTime = time(0);
 
-  m_watchDog.start();
+  auto startupFailure = [] (const std::string& msg) {
+    Logger::Error(msg);
+    Logger::Error("Shutting down due to failure(s) to bind in "
+                  "HttpServer::runAndExitProcess");
+    // Logger flushes itself---we don't need to run any atexit handlers
+    // (historically we've mostly just SEGV'd while trying) ...
+    _Exit(1);
+  };
 
-  for (unsigned int i = 0; i < m_serviceThreads.size(); i++) {
-    m_serviceThreads[i]->start();
-  }
-  for (unsigned int i = 0; i < m_serviceThreads.size(); i++) {
-    m_serviceThreads[i]->waitForStarted();
-  }
+  m_watchDog.start();
 
   if (RuntimeOption::ServerPort) {
     if (!startServer(true)) {
-      Logger::Error("Unable to start page server");
-      startupFailure();
+      startupFailure("Unable to start page server");
       not_reached();
     }
     Logger::Info("page server started");
@@ -274,8 +268,7 @@ void HttpServer::runOrExitProcess() {
 
   if (RuntimeOption::AdminServerPort) {
     if (!startServer(false)) {
-      Logger::Error("Unable to start admin server");
-      startupFailure();
+      startupFailure("Unable to start admin server");
       not_reached();
     }
     Logger::Info("admin server started");
@@ -287,21 +280,26 @@ void HttpServer::runOrExitProcess() {
       m_satellites[i]->start();
       Logger::Info("satellite server %s started", name.c_str());
     } catch (Exception &e) {
-      Logger::Error("Unable to start satellite server %s: %s",
-                    name.c_str(), e.getMessage().c_str());
-      startupFailure();
+      startupFailure(
+        folly::format("Unable to start satellite server {}: {}",
+                      name, e.getMessage()).str()
+      );
       not_reached();
     }
   }
 
   if (RuntimeOption::HHProfServerEnabled) {
-    Logger::Info("Starting up profiling server");
-    HeapProfileServer::Server = std::make_shared<HeapProfileServer>();
+    try {
+      HeapProfileServer::Server = std::make_shared<HeapProfileServer>();
+    } catch (FailedToListenException &e) {
+      startupFailure("Unable to start profiling server");
+      not_reached();
+    }
+    Logger::Info("profiling server started");
   }
 
   if (!Eval::Debugger::StartServer()) {
-    Logger::Error("Unable to start debugger server");
-    startupFailure();
+    startupFailure("Unable to start debugger server");
     not_reached();
   } else if (RuntimeOption::EnableDebuggerServer) {
     Logger::Info("debugger server started");
@@ -322,7 +320,11 @@ void HttpServer::runOrExitProcess() {
     if (m_stopReason) {
       Logger::Warning("Server stopping with reason: %s\n", m_stopReason);
     }
-    removePid();
+    // if we were killed, bail out immediately
+    if (m_killed) {
+      Logger::Info("page server killed");
+      return;
+    }
     Logger::Info("page server stopped");
   }
 
@@ -345,16 +347,9 @@ void HttpServer::runOrExitProcess() {
                  m_danglings[i]->getName().c_str());
   }
 
-  for (unsigned int i = 0; i < m_serviceThreads.size(); i++) {
-    m_serviceThreads[i]->notifyStopped();
-  }
-  for (unsigned int i = 0; i < m_serviceThreads.size(); i++) {
-    m_serviceThreads[i]->waitForEnd();
-  }
-
   waitForServers();
-  hphp_process_exit();
   m_watchDog.waitForEnd();
+  hphp_process_exit();
   Logger::Info("all servers stopped");
 }
 
@@ -389,25 +384,32 @@ void HttpServer::stop(const char* stopReason) {
   notify();
 }
 
-void HttpServer::abortServers() {
-  for (unsigned int i = 0; i < m_satellites.size(); i++) {
-    m_satellites[i]->stop();
+void HttpServer::stopOnSignal(int sig) {
+  // Signal to the main server thread to exit immediately if
+  // we want to die on SIGTERM
+  if (RuntimeOption::ServerKillOnSIGTERM && sig == SIGTERM) {
+    Lock lock(this);
+    m_stopped = true;
+    m_killed = true;
+    m_stopReason = "SIGTERM received";
+    notify();
+    return;
   }
-  if (RuntimeOption::AdminServerPort) {
-    m_adminServer->stop();
-  }
-  if (RuntimeOption::ServerPort) {
-    m_pageServer->stop();
-  }
-}
 
-void HttpServer::stopOnSignal() {
+  if (RuntimeOption::ServerGracefulShutdownWait) {
+    signal(SIGALRM, exit_on_timeout);
+    alarm(RuntimeOption::ServerGracefulShutdownWait);
+  }
+
+  // NOTE: Server->stop does a graceful stop by design.
   if (m_pageServer) {
     m_pageServer->stop();
   }
   if (m_adminServer) {
     m_adminServer->stop();
   }
+
+  waitForServers();
 }
 
 void HttpServer::createPid() {
@@ -486,9 +488,10 @@ void HttpServer::dropCache() {
 }
 
 void HttpServer::checkMemory() {
-  if (RuntimeOption::MaxRSS > 0 &&
-      Process::GetProcessRSS(Process::GetProcessId()) * 1024 * 1024 >
-      RuntimeOption::MaxRSS) {
+  int64_t used = Process::GetProcessRSS(Process::GetProcessId()) * 1024 * 1024;
+  if (RuntimeOption::MaxRSS > 0 && used > RuntimeOption::MaxRSS) {
+    Logger::Error("ResourceLimit.MaxRSS %ld reached %ld used, exiting",
+                  RuntimeOption::MaxRSS, used);
     stop();
   }
 }
@@ -538,15 +541,34 @@ bool HttpServer::startServer(bool pageServer) {
         return false;
       }
 
-      // TODO: fix /stop (t3725397)
       HttpClient http;
       std::string url = "http://";
-      url += RuntimeOption::ServerIP;
+      std::string serverIp = (RuntimeOption::ServerIP.empty()) ? "localhost" :
+        RuntimeOption::ServerIP;
+      url += serverIp;
       url += ":";
-      url += boost::lexical_cast<std::string>(RuntimeOption::AdminServerPort);
+      url += folly::to<std::string>(RuntimeOption::AdminServerPort);
       url += "/stop";
-      StringBuffer response;
-      http.get(url.c_str(), response);
+      std::string auth;
+
+      auto passwords = RuntimeOption::AdminPasswords;
+      if (passwords.empty() && !RuntimeOption::AdminPassword.empty()) {
+        passwords.insert(RuntimeOption::AdminPassword);
+      }
+      auto passwordIter = passwords.begin();
+      int statusCode = 401;
+      do {
+        std::string auth_url;
+        if (passwordIter != passwords.end()) {
+          auth_url = url + "?auth=";
+          auth_url += *passwordIter;
+          passwordIter++;
+        } else {
+          auth_url = url;
+        }
+        StringBuffer response;
+        statusCode = http.get(auth_url.c_str(), response);
+      } while (statusCode == 401 && passwordIter != passwords.end());
 
       if (pageServer && !RuntimeOption::ServerFileSocket.empty()) {
         if (i == 0) {
@@ -616,7 +638,7 @@ bool HttpServer::startServer(bool pageServer) {
           }
 
           std::string cmd = "lsof -t -i :";
-          cmd += lexical_cast<std::string>(port);
+          cmd += folly::to<std::string>(port);
           cmd += " | xargs kill -9";
           FileUtil::ssystem(cmd.c_str());
         }

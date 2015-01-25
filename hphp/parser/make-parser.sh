@@ -6,6 +6,7 @@ if [ ! -x "$SED" ]; then
   exit 1
 fi
 
+unset CDPATH
 DIR="$( cd "$( dirname "$0" )" && pwd )"
 
 if [ -z "${INSTALL_DIR}" ]; then
@@ -23,11 +24,9 @@ else
   OUTFILE=${INSTALL_DIR}/hphp.tab.cpp
   OUTHEADER=${INSTALL_DIR}/hphp.tab.hpp
 
-  EXTERNAL_TOOLS_ROOT=`readlink -f ${FBCODE_DIR}/third-party/centos5.2-native/`
-  BISON_DIR=${EXTERNAL_TOOLS_ROOT}/bison/bison-2.4.1/da39a3e/
+  BISON=$(readlink -f $(ls -t ${FBCODE_DIR}/third-party2/bison/2.4.1/centos5.2-native/*/bin/bison | head -1))
+  BISON_DIR=$(dirname $(dirname $BISON))
   export BISON_PKGDATADIR=${BISON_DIR}/share/bison
-
-  BISON=${BISON_DIR}/bin/bison
 fi
 
 $BISON -pCompiler --verbose --locations -d -o${OUTFILE} ${INFILE}
@@ -35,18 +34,30 @@ if [ $? -ne 0 ] ; then
   exit 1
 fi
 
-# Do a bunch of replacements on the generated files. We need to find the min and
-# max token numbers and define them in the header, so we convert the yytokentype
-# enum to a series of macro invocations, and then find the first and last macro
-# invocations.
-$SED -i -r -e 's/(T_\w+) = ([0-9]+)\s*,?/YYTOKEN(\2, \1)/g' \
-     -e "s/   enum yytokentype/#ifndef YYTOKEN_MAP\n#define YYTOKEN_MAP enum yytokentype\n#define YYTOKEN(num, name) name = num,\n#endif\n   YYTOKEN_MAP/" \
+# Lots of our logic relies on knowing the shape of the token table. Sadly it is
+# an enum without introspection, so instead make it macros so we can control its
+# shape on re-requires of the .hpp file
+$SED -i -r \
+     -e 's/(T_\w+)\s+=\s+([0-9]+)\s*,?/YYTOKEN(\2, \1)/g' \
+     -e "s/\s+enum\s+yytokentype/#ifndef YYTOKEN_MAP\n#define YYTOKEN_MAP enum yytokentype\n#define YYTOKEN(num, name) name = num,\n#endif\n   YYTOKEN_MAP/" \
+     -e "s/#ifndef YY_COMPILER_.*//g" \
+     -e "s/# define YY_COMPILER_.*//g" \
     ${OUTHEADER}
 
-cat ${OUTHEADER} | grep "     YYTOKEN(" | head -n 1 | \
-    $SED -r -e 's/     YYTOKEN.([0-9]+).*/#ifndef YYTOKEN_MIN\n#define YYTOKEN_MIN \1\n#endif/' >> ${OUTHEADER}
-cat ${OUTHEADER} | grep "     YYTOKEN(" | tail -n 1 | \
-    $SED -r -e 's/     YYTOKEN.([0-9]+).*/#ifndef YYTOKEN_MAX\n#define YYTOKEN_MAX \1\n#endif/' >> ${OUTHEADER}
+# remove the include guard's #endif (-e doesn't work for this)
+$SED -i '$ d' ${OUTHEADER}
+
+# We don't want to rely on the grammar to have a fixed start and end token, so
+# lets parse the file and make two macros for the min and max
+cat ${OUTHEADER} | grep "^\s\+YYTOKEN(" | head -n 1 | \
+    $SED -r -e 's/\s+YYTOKEN.([0-9]+).*/#ifndef YYTOKEN_MIN\n#define YYTOKEN_MIN \1\n#endif/' >> ${OUTHEADER}
+cat ${OUTHEADER} | grep "^\s\+YYTOKEN(" | tail -n 1 | \
+    $SED -r -e 's/\s+YYTOKEN.([0-9]+).*/#ifndef YYTOKEN_MAX\n#define YYTOKEN_MAX \1\n#endif/' >> ${OUTHEADER}
+
+# Why this is in the .hpp in bison 3 is anybody's guess...
+$SED -i \
+     -e 's@int Compilerparse.*@@' \
+     ${OUTHEADER}
 
 # Renaming some stuff in the cpp file
 $SED -i \

@@ -35,14 +35,14 @@
 #include <type_traits>
 
 namespace HPHP {
+struct Resumable;
 
 /**
  * These macros allow us to easily change the arguments to iop*() opcode
  * implementations.
  */
-#define IOP_ARGS        PC& pc
-#define IOP_PASS_ARGS   pc
-#define IOP_PASS(pc)    pc
+
+#define EVAL_FILENAME_SUFFIX ") : eval()'d code"
 
 ALWAYS_INLINE
 void SETOP_BODY_CELL(Cell* lhs, SetOpOp op, Cell* rhs) {
@@ -54,6 +54,7 @@ void SETOP_BODY_CELL(Cell* lhs, SetOpOp op, Cell* rhs) {
   case SetOpOp::MinusEqual:     cellSubEq(*lhs, *rhs); return;
   case SetOpOp::MulEqual:       cellMulEq(*lhs, *rhs); return;
   case SetOpOp::DivEqual:       cellDivEq(*lhs, *rhs); return;
+  case SetOpOp::PowEqual:       cellPowEq(*lhs, *rhs); return;
   case SetOpOp::ModEqual:       cellModEq(*lhs, *rhs); return;
   case SetOpOp::ConcatEqual:
     concat_assign(tvAsVariant(lhs), cellAsCVarRef(*rhs).toString());
@@ -61,15 +62,8 @@ void SETOP_BODY_CELL(Cell* lhs, SetOpOp op, Cell* rhs) {
   case SetOpOp::AndEqual:       cellBitAndEq(*lhs, *rhs); return;
   case SetOpOp::OrEqual:        cellBitOrEq(*lhs, *rhs);  return;
   case SetOpOp::XorEqual:       cellBitXorEq(*lhs, *rhs); return;
-
-  case SetOpOp::SlEqual:
-    cellCastToInt64InPlace(lhs);
-    lhs->m_data.num <<= cellToInt(*rhs);
-    return;
-  case SetOpOp::SrEqual:
-    cellCastToInt64InPlace(lhs);
-    lhs->m_data.num >>= cellToInt(*rhs);
-    return;
+  case SetOpOp::SlEqual:        cellShlEq(*lhs, *rhs); return;
+  case SetOpOp::SrEqual:        cellShrEq(*lhs, *rhs); return;
   case SetOpOp::PlusEqualO:     cellAddEqO(*lhs, *rhs); return;
   case SetOpOp::MinusEqualO:    cellSubEqO(*lhs, *rhs); return;
   case SetOpOp::MulEqualO:      cellMulEqO(*lhs, *rhs); return;
@@ -167,7 +161,7 @@ class VarEnv {
 
   VarEnv* clone(ActRec* fp) const;
 
-  void suspend(ActRec* oldFP, ActRec* newFP);
+  void suspend(const ActRec* oldFP, ActRec* newFP);
   void enterFP(ActRec* oldFP, ActRec* newFP);
   void exitFP(ActRec* fp);
 
@@ -215,11 +209,8 @@ struct ActRec {
     // dependency.
     TypedValue _dummyA;
     struct {
-      union {
-        ActRec* m_sfp;         // Previous hardware frame pointer/ActRec.
-        uint64_t m_savedRbp;   // TODO: Remove. Used by debugger macros.
-      };
-      uint64_t m_savedRip;     // In-TC address to return to.
+      ActRec* m_sfp;         // Previous hardware frame pointer/ActRec.
+      uint64_t m_savedRip;   // In-TC address to return to.
     };
   };
   union {
@@ -229,10 +220,11 @@ struct ActRec {
       uint32_t m_soff;         // Saved offset of caller from beginning of
                                //   caller's Func's bytecode.
 
-      // Bits 0-29 are the number of function args.
-      // Bit 30 is whether this ActRec embedded in a Continuation object.
+      // Bits 0-28 are the number of function args.
+      // Bit 29 is whether the locals were already decrefd (used by unwinder)
+      // Bit 30 is whether this ActRec is embedded in a Resumable object.
       // Bit 31 is whether this ActRec came from FPushCtor*.
-      uint32_t m_numArgsAndGenCtorFlags;
+      uint32_t m_numArgsAndFlags;
     };
   };
   union {
@@ -265,45 +257,77 @@ struct ActRec {
   bool skipFrame() const;
 
   /**
-   * Accessors for the packed m_numArgsAndGenCtorFlags field. We track
+   * Accessors for the packed m_numArgsAndFlags field. We track
    * whether ActRecs came from FPushCtor* so that during unwinding we
    * can set the flag not to call destructors for objects whose
    * constructors exit via an exception.
    */
 
+  static constexpr int kNumArgsBits = 29;
+  static constexpr int kNumArgsMask = (1 << kNumArgsBits) - 1;
+  static constexpr int kFlagsMask   = ~kNumArgsMask;
+
+  static constexpr int kLocalsDecRefdShift = kNumArgsBits;
+  static constexpr int kResumedShift       = kNumArgsBits + 1;
+  static constexpr int kFPushCtorShift     = kNumArgsBits + 2;
+
+  static_assert(kFPushCtorShift <= 8 * sizeof(int32_t) - 1,
+                "Out of bits in ActRec");
+
+  static constexpr int kLocalsDecRefdMask = 1 << kLocalsDecRefdShift;
+  static constexpr int kResumedMask       = 1 << kResumedShift;
+  static constexpr int kFPushCtorMask     = 1 << kFPushCtorShift;
+
   int32_t numArgs() const {
-    return m_numArgsAndGenCtorFlags & ~(3u << 30);
+    return m_numArgsAndFlags & kNumArgsMask;
+  }
+
+  bool localsDecRefd() const {
+    return m_numArgsAndFlags & kLocalsDecRefdMask;
   }
 
   bool resumed() const {
-    return m_numArgsAndGenCtorFlags & (1u << 30);
+    return m_numArgsAndFlags & kResumedMask;
+  }
+
+  void setResumed() {
+    m_numArgsAndFlags |= kResumedMask;
   }
 
   bool isFromFPushCtor() const {
-    return m_numArgsAndGenCtorFlags & (1u << 31);
+    return m_numArgsAndFlags & kFPushCtorMask;
   }
 
   static inline uint32_t
-  encodeNumArgs(uint32_t numArgs, bool resumed, bool isFPushCtor) {
-    assert((numArgs & (1u << 30)) == 0);
-    return numArgs | (resumed << 30) | (isFPushCtor << 31);
+  encodeNumArgs(uint32_t numArgs, bool localsDecRefd, bool resumed,
+                bool isFPushCtor) {
+    assert((numArgs & kFlagsMask) == 0);
+    return numArgs |
+      (localsDecRefd << kLocalsDecRefdShift) |
+      (resumed       << kResumedShift) |
+      (isFPushCtor   << kFPushCtorShift);
   }
 
   void initNumArgs(uint32_t numArgs) {
-    m_numArgsAndGenCtorFlags = encodeNumArgs(numArgs, false, false);
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, false);
   }
 
   void initNumArgsFromResumable(uint32_t numArgs) {
-    m_numArgsAndGenCtorFlags = encodeNumArgs(numArgs, true, false);
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, true, false);
   }
 
   void initNumArgsFromFPushCtor(uint32_t numArgs) {
-    m_numArgsAndGenCtorFlags = encodeNumArgs(numArgs, false, true);
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, true);
   }
 
   void setNumArgs(uint32_t numArgs) {
-    m_numArgsAndGenCtorFlags = encodeNumArgs(numArgs, resumed(),
-                                             isFromFPushCtor());
+    m_numArgsAndFlags = encodeNumArgs(numArgs, localsDecRefd(), resumed(),
+                                      isFromFPushCtor());
+  }
+
+  void setLocalsDecRefd() {
+    assert(!localsDecRefd());
+    m_numArgsAndFlags |= kLocalsDecRefdMask;
   }
 
   static void* encodeThis(ObjectData* obj, Class* cls) {
@@ -358,71 +382,72 @@ struct ActRec {
    * accessors.
    */
 
-#define UNION_FIELD_ACCESSORS2(name1, type1, field1, name2, type2, field2) \
-  inline bool has##name1() const { \
-    return field1 && !(intptr_t(field1) & 1LL); \
-  } \
-  inline bool has##name2() const { \
-    return bool(intptr_t(field2) & 1LL); \
-  } \
-  inline type1 get##name1() const { \
-    assert(has##name1()); \
-    return field1; \
-  } \
-  inline type2 get##name2() const { \
-    assert(has##name2()); \
-    return (type2)(intptr_t(field2) & ~1LL); \
-  } \
-  inline void set##name1(type1 val) { \
-    field1 = val; \
-  } \
-  inline void set##name2(type2 val) { \
-    field2 = (type2)(intptr_t(val) | 1LL); \
-  } \
+  static constexpr int8_t kHasClassBit = 0x1;
+  static constexpr int8_t kClassMask   = ~kHasClassBit;
 
-#define UNION_FIELD_ACCESSORS3(name1, type1, field1, name2, type2, field2, name3, type3, field3) \
-  inline bool has##name1() const { \
-    return field1 && !(intptr_t(field1) & 3LL); \
-  } \
-  inline bool has##name2() const { \
-    return bool(intptr_t(field2) & 1LL); \
-  } \
-  inline bool has##name3() const { \
-    return bool(intptr_t(field3) & 2LL); \
-  } \
-  inline type1 get##name1() const { \
-    assert(has##name1()); \
-    return field1; \
-  } \
-  inline type2 get##name2() const { \
-    assert(has##name2()); \
-    return (type2)(intptr_t(field2) & ~1LL); \
-  } \
-  inline type3 get##name3() const { \
-    return (type3)(intptr_t(field3) & ~2LL); \
-  } \
-  inline void set##name1(type1 val) { \
-    field1 = val; \
-  } \
-  inline void set##name2(type2 val) { \
-    field2 = (type2)(intptr_t(val) | 1LL); \
-  } \
-  inline void set##name3(type3 val) { \
-    field3 = (type3)(intptr_t(val) | 2LL); \
+  inline bool hasThis() const {
+    return m_this && !(reinterpret_cast<intptr_t>(m_this) & kHasClassBit);
+  }
+  inline ObjectData* getThis() const {
+    assert(hasThis());
+    return m_this;
+  }
+  inline void setThis(ObjectData* val) {
+    m_this = val;
+  }
+  inline bool hasClass() const {
+    return reinterpret_cast<intptr_t>(m_cls) & kHasClassBit;
+  }
+  inline Class* getClass() const {
+    assert(hasClass());
+    return reinterpret_cast<Class*>(
+      reinterpret_cast<intptr_t>(m_cls) & kClassMask);
+  }
+  inline void setClass(Class* val) {
+    m_cls = reinterpret_cast<Class*>(
+      reinterpret_cast<intptr_t>(val) | kHasClassBit);
   }
 
-  // Note that reordering these is likely to require changes to the
-  // translator.
-  UNION_FIELD_ACCESSORS2(This, ObjectData*, m_this, \
-                         Class, Class*, m_cls)
-  static const int8_t kInvNameBit   = 0x1;
-  static const int8_t kExtraArgsBit = 0x2;
-  UNION_FIELD_ACCESSORS3(VarEnv, VarEnv*, m_varEnv, \
-                         InvName, StringData*, m_invName, \
-                         ExtraArgs, ExtraArgs*, m_extraArgs)
+  // Note that reordering these is likely to require changes to the translator.
+  static constexpr int8_t kInvNameBit    = 0x1;
+  static constexpr int8_t kInvNameMask   = ~kInvNameBit;
+  static constexpr int8_t kExtraArgsBit  = 0x2;
+  static constexpr int8_t kExtraArgsMask = ~kExtraArgsBit;
 
-#undef UNION_FIELD_ACCESSORS2
-#undef UNION_FIELD_ACCESSORS3
+  inline bool hasVarEnv() const {
+    return m_varEnv &&
+      !(reinterpret_cast<intptr_t>(m_varEnv) & (kInvNameBit | kExtraArgsBit));
+  }
+  inline bool hasInvName() const {
+    return reinterpret_cast<intptr_t>(m_invName) & kInvNameBit;
+  }
+  inline bool hasExtraArgs() const {
+    return reinterpret_cast<intptr_t>(m_extraArgs) & kExtraArgsBit;
+  }
+  inline VarEnv* getVarEnv() const {
+    assert(hasVarEnv());
+    return m_varEnv;
+  }
+  inline StringData* getInvName() const {
+    assert(hasInvName());
+    return reinterpret_cast<StringData*>(
+      reinterpret_cast<intptr_t>(m_invName) & kInvNameMask);
+  }
+  inline ExtraArgs* getExtraArgs() const {
+    return reinterpret_cast<ExtraArgs*>(
+      reinterpret_cast<intptr_t>(m_extraArgs) & kExtraArgsMask);
+  }
+  inline void setVarEnv(VarEnv* val) {
+    m_varEnv = val;
+  }
+  inline void setInvName(StringData* val) {
+    m_invName = reinterpret_cast<StringData*>(
+      reinterpret_cast<intptr_t>(val) | kInvNameBit);
+  }
+  inline void setExtraArgs(ExtraArgs* val) {
+    m_extraArgs = reinterpret_cast<ExtraArgs*>(
+      reinterpret_cast<intptr_t>(val) | kExtraArgsBit);
+  }
 
   // Accessors for extra arg queries.
   TypedValue* getExtraArg(unsigned ind) const {
@@ -448,8 +473,12 @@ inline ActRec* arFromSpOffset(const ActRec *sp, int32_t offset) {
   return arAtOffset(sp, offset);
 }
 
-inline TypedValue* arReturn(ActRec* ar, const Variant& value) {
+void frame_free_locals_no_hook(ActRec* fp);
+
+inline TypedValue* arReturn(ActRec* ar, Variant&& value) {
+  frame_free_locals_no_hook(ar);
   ar->m_r = *value.asTypedValue();
+  tvWriteNull(value.asTypedValue());
   return &ar->m_r;
 }
 
@@ -540,6 +569,7 @@ class Stack {
                       // m_elms.
 
 public:
+  bool isAllocated() { return m_elms != nullptr; }
   void* getStackLowAddress() const { return m_elms; }
   void* getStackHighAddress() const { return m_base; }
   bool isValidAddress(uintptr_t v) {
@@ -548,12 +578,6 @@ public:
   void requestInit();
   void requestExit();
 
-private:
-  void toStringFrame(std::ostream& os, const ActRec* fp,
-                     int offset, const TypedValue* ftop,
-                     const std::string& prefix) const;
-
-public:
   static const int sSurprisePageSize;
   static const unsigned sMinStackElms;
   static void ValidateStackSize();
@@ -575,9 +599,8 @@ public:
     return m_top;
   }
 
-  static inline size_t topOfStackOffset() {
-    Stack *that = 0;
-    return (size_t)&that->m_top;
+  static constexpr size_t topOfStackOffset() {
+    return offsetof(Stack, m_top);
   }
 
   static TypedValue* frameStackBase(const ActRec* fp);
@@ -602,7 +625,7 @@ public:
   void popC() {
     assert(m_top != m_base);
     assert(cellIsPlausible(*m_top));
-    tvRefcountedDecRefCell(m_top);
+    tvRefcountedDecRef(m_top);
     tvDebugTrash(m_top);
     m_top++;
   }
@@ -860,10 +883,10 @@ public:
   }
 
   ALWAYS_INLINE
-  void replaceC(const Cell& c) {
+  void replaceC(const Cell c) {
     assert(m_top != m_base);
     assert(m_top->m_type != KindOfRef);
-    tvRefcountedDecRefCell(m_top);
+    tvRefcountedDecRef(m_top);
     *m_top = c;
   }
 
@@ -872,7 +895,7 @@ public:
   void replaceC() {
     assert(m_top != m_base);
     assert(m_top->m_type != KindOfRef);
-    tvRefcountedDecRefCell(m_top);
+    tvRefcountedDecRef(m_top);
     *m_top = make_tv<DT>();
   }
 
@@ -881,7 +904,7 @@ public:
   void replaceC(T value) {
     assert(m_top != m_base);
     assert(m_top->m_type != KindOfRef);
-    tvRefcountedDecRefCell(m_top);
+    tvRefcountedDecRef(m_top);
     *m_top = make_tv<DT>(value);
   }
 
@@ -993,7 +1016,7 @@ visitStackElems(const ActRec* const fp,
       if (!fp->resumed()) {
         ar = arAtOffset(fp, -fe->m_fpOff);
       } else {
-        // fp is pointing into the continuation object. Since fpOff is
+        // fp is pointing into the Resumable struct. Since fpOff is
         // given as an offset from the frame pointer as if it were in
         // the normal place on the main stack, we have to reconstruct
         // that "normal place".
@@ -1019,6 +1042,17 @@ visitStackElems(const ActRec* const fp,
     tvFun(cursor++);
   }
 }
+
+void resetCoverageCounters();
+
+// The interpOne*() methods implement individual opcode handlers.
+using InterpOneFunc = void (*) (ActRec* ar, Cell* sp, Offset pcOff);
+extern InterpOneFunc interpOneEntryPoints[];
+
+bool doFCallArrayTC(PC pc);
+bool doFCall(ActRec* ar, PC& pc);
+void dispatchBB();
+void pushLocalsAndIterators(const Func* func, int nparams = 0);
 
 ///////////////////////////////////////////////////////////////////////////////
 

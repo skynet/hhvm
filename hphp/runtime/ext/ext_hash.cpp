@@ -18,8 +18,9 @@
 #include "hphp/runtime/ext/ext_hash.h"
 #include <algorithm>
 #include <memory>
-#include "hphp/runtime/ext/ext_file.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/ext/hash/hash_md.h"
 #include "hphp/runtime/ext/hash/hash_sha.h"
 #include "hphp/runtime/ext/hash/hash_ripemd.h"
@@ -38,15 +39,15 @@
 #if defined(HPHP_OSS)
 #define furc_hash furc_hash_internal
 #else
-#include "memcache/ch/hash.h" // @nolint
+#include "mcrouter/lib/fbi/hash.h" // @nolint
 #endif
 
 namespace HPHP {
 
-static class HashExtension : public Extension {
+static class HashExtension final : public Extension {
  public:
   HashExtension() : Extension("hash", "1.0") { }
-  virtual void moduleLoad(Hdf config) {
+  void moduleLoad(const IniSetting::Map& ini, Hdf config) override {
     HHVM_FE(hash);
     HHVM_FE(hash_algos);
     HHVM_FE(hash_file);
@@ -54,6 +55,7 @@ static class HashExtension : public Extension {
     HHVM_FE(hash_init);
     HHVM_FE(hash_update);
     HHVM_FE(hash_copy);
+    HHVM_FE(hash_equals);
     HHVM_FE(furchash_hphp_ext);
     HHVM_FE(hphp_murmurhash);
   }
@@ -97,14 +99,9 @@ public:
     HashEngines["snefru"]     = HashEnginePtr(new hash_snefru());
     HashEngines["gost"]       = HashEnginePtr(new hash_gost());
 #ifdef FACEBOOK
-    // Temporarily leave adler32 algo inverting its hash output
-    // to retain BC pending conversion of user code to correct endianness
-    // sgolemon(2014-01-30)
     HashEngines["adler32-fb"] = HashEnginePtr(new hash_adler32(true));
-    HashEngines["adler32"]    = HashEnginePtr(new hash_adler32(true));
-#else
-    HashEngines["adler32"]    = HashEnginePtr(new hash_adler32());
 #endif
+    HashEngines["adler32"]    = HashEnginePtr(new hash_adler32(false));
     HashEngines["crc32"]      = HashEnginePtr(new hash_crc32(false));
     HashEngines["crc32b"]     = HashEnginePtr(new hash_crc32(true));
     HashEngines["haval128,3"] = HashEnginePtr(new hash_haval(3,128));
@@ -134,12 +131,7 @@ static HashEngineMapInitializer s_engine_initializer;
 ///////////////////////////////////////////////////////////////////////////////
 // hash context
 
-class HashContext : public SweepableResourceData {
-public:
-  CLASSNAME_IS("Hash Context")
-  // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
-
+struct HashContext : SweepableResourceData {
   HashContext(HashEnginePtr ops_, void *context_, int options_)
     : ops(ops_), context(context_), options(options_), key(nullptr) {
   }
@@ -151,14 +143,15 @@ public:
     context = malloc(ops->context_size);
     ops->hash_copy(context, ctx->context);
     options = ctx->options;
-    key = ctx->key ? strdup(ctx->key) : nullptr;
+    if (ctx->key) {
+      key = static_cast<char*>(malloc(ops->block_size));
+      memcpy(key, ctx->key, ops->block_size);
+    } else {
+      key = nullptr;
+    }
   }
 
   ~HashContext() {
-    HashContext::sweep();
-  }
-
-  void sweep() FOLLY_OVERRIDE {
     /* Just in case the algo has internally allocated resources */
     if (context) {
       assert(ops->digest_size >= 0);
@@ -170,11 +163,19 @@ public:
     free(key);
   }
 
+  CLASSNAME_IS("Hash Context")
+  DECLARE_RESOURCE_ALLOCATION(HashContext)
+
+  // overriding ResourceData
+  virtual const String& o_getClassNameHook() const { return classnameof(); }
+
   HashEnginePtr ops;
   void *context;
   int options;
   char *key;
 };
+
+IMPLEMENT_RESOURCE_ALLOCATION(HashContext)
 
 ///////////////////////////////////////////////////////////////////////////////
 // hash functions
@@ -190,7 +191,7 @@ Array HHVM_FUNCTION(hash_algos) {
 
 static HashEnginePtr php_hash_fetch_ops(const String& algo) {
   HashEngineMap::const_iterator iter =
-    HashEngines.find(f_strtolower(algo).data());
+    HashEngines.find(HHVM_FN(strtolower)(algo).data());
   if (iter == HashEngines.end()) {
     return HashEnginePtr();
   }
@@ -207,7 +208,7 @@ static Variant php_hash_do_hash(const String& algo, const String& data,
   }
   Variant f;
   if (isfilename) {
-    f = f_fopen(data, "rb");
+    f = HHVM_FN(fopen)(data, "rb");
     if (same(f, false)) {
       return false;
     }
@@ -217,9 +218,9 @@ static Variant php_hash_do_hash(const String& algo, const String& data,
   ops->hash_init(context);
 
   if (isfilename) {
-    for (Variant chunk = f_fread(f.toResource(), 1024);
+    for (Variant chunk = HHVM_FN(fread)(f.toResource(), 1024);
          !is_empty_string(chunk);
-         chunk = f_fread(f.toResource(), 1024)) {
+         chunk = HHVM_FN(fread)(f.toResource(), 1024)) {
       String schunk = chunk.toString();
       ops->hash_update(context, (unsigned char *)schunk.data(), schunk.size());
     }
@@ -236,7 +237,7 @@ static Variant php_hash_do_hash(const String& algo, const String& data,
   if (raw_output) {
     return raw;
   }
-  return f_bin2hex(raw);
+  return HHVM_FN(bin2hex)(raw);
 }
 
 Variant HHVM_FUNCTION(hash, const String& algo, const String& data,
@@ -246,6 +247,12 @@ Variant HHVM_FUNCTION(hash, const String& algo, const String& data,
 
 Variant HHVM_FUNCTION(hash_file, const String& algo, const String& filename,
                                  bool raw_output /* = false */) {
+  if (filename.size() != strlen(filename.data())) {
+    raise_warning(
+     "hash_file() expects parameter 2 to be a valid path, string given"
+    );
+    return null_variant;
+  }
   return php_hash_do_hash(algo, filename, true, raw_output);
 }
 
@@ -306,7 +313,7 @@ Variant HHVM_FUNCTION(hash_init, const String& algo,
   void *context = malloc(ops->context_size);
   ops->hash_init(context);
 
-  const auto hash = new HashContext(ops, context, options);
+  const auto hash = newres<HashContext>(ops, context, options);
   if (options & k_HASH_HMAC) {
     hash->key = prepare_hmac_key(ops, context, key);
   }
@@ -320,9 +327,16 @@ bool HHVM_FUNCTION(hash_update, const Resource& context, const String& data) {
   return true;
 }
 
-String HHVM_FUNCTION(hash_final, const Resource& context,
+Variant HHVM_FUNCTION(hash_final, const Resource& context,
                                  bool raw_output /* = false */) {
   HashContext *hash = context.getTyped<HashContext>();
+
+  if (hash->context == nullptr) {
+    raise_warning(
+      "hash_final(): supplied resource is not a valid Hash Context resource"
+    );
+    return false;
+  }
 
   String raw = String(hash->ops->digest_size, ReserveString);
   char *digest = raw.bufferSlice().ptr;
@@ -338,13 +352,54 @@ String HHVM_FUNCTION(hash_final, const Resource& context,
   if (raw_output) {
     return raw;
   }
-  return f_bin2hex(raw);
+  return HHVM_FN(bin2hex)(raw);
 }
 
 Resource HHVM_FUNCTION(hash_copy, const Resource& context) {
   HashContext *oldhash = context.getTyped<HashContext>();
-  auto const hash = new HashContext(oldhash);
+  auto const hash = newres<HashContext>(oldhash);
   return Resource(hash);
+}
+
+/**
+ * It is important that the run time of this function is dependent
+ * only on the length of the user-supplied string.
+ *
+ * The only branch in the code below *should* result in non-branching
+ * machine code.
+ *
+ * Do not try to optimize this function.
+ */
+bool HHVM_FUNCTION(hash_equals, const Variant& known, const Variant& user) {
+  if (!known.isString()) {
+    raise_warning(
+      "hash_equals(): Expected known_string to be a string, %s given",
+      getDataTypeString(known.getType()).c_str()
+    );
+    return false;
+  }
+  if (!user.isString()) {
+    raise_warning(
+      "hash_equals(): Expected user_string to be a string, %s given",
+      getDataTypeString(user.getType()).c_str()
+    );
+    return false;
+  }
+  String known_str = known.toString();
+  String user_str = user.toString();
+  const auto known_len = known_str.size();
+  const auto known_limit = known_len - 1;
+  const auto user_len = user_str.size();
+  int64_t result = known_len ^ user_len;
+
+  int64_t ki = 0;
+  for (int64_t ui = 0; ui < user_len; ++ui) {
+    result |= user_str[ui] ^ known_str[ki];
+    if (ki < known_limit) {
+      ++ki;
+    }
+  }
+  return (result == 0);
 }
 
 int64_t HHVM_FUNCTION(furchash_hphp_ext, const String& key,

@@ -16,7 +16,13 @@
 */
 
 #include "hphp/runtime/ext/curl/ext_curl.h"
+#include "hphp/runtime/ext/asio/asio_external_thread_event.h"
+#include "hphp/runtime/ext/asio/socket-event.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/plain-file.h"
 #include "hphp/runtime/base/string-buffer.h"
+#include "hphp/runtime/base/smart-ptr.h"
 #include "hphp/runtime/base/libevent-http-client.h"
 #include "hphp/runtime/base/curl-tls-workarounds.h"
 #include "hphp/runtime/base/runtime-option.h"
@@ -65,7 +71,7 @@ private:
 
     int                method;
     Variant            callback;
-    SmartResource<File> fp;
+    SmartPtr<File>     fp;
     StringBuffer       buf;
     String             content;
     int                type;
@@ -77,7 +83,7 @@ private:
 
     int                method;
     Variant            callback;
-    SmartResource<File> fp;
+    SmartPtr<File>     fp;
   };
 
   class ToFree {
@@ -218,6 +224,26 @@ public:
     return nullptr;
   }
 
+  static int64_t minTimeout(int64_t timeout) {
+    auto info = ThreadInfo::s_threadInfo.getNoCheck();
+    auto& data = info->m_reqInjectionData;
+    if (!data.getTimeout()) {
+      return timeout;
+    }
+    auto remaining = int64_t(data.getRemainingTime());
+    return std::min(remaining, timeout);
+  }
+
+  static int64_t minTimeoutMS(int64_t timeout) {
+    auto info = ThreadInfo::s_threadInfo.getNoCheck();
+    auto& data = info->m_reqInjectionData;
+    if (!data.getTimeout()) {
+      return timeout;
+    }
+    auto remaining = int64_t(data.getRemainingTime());
+    return std::min(1000 * remaining, timeout);
+  }
+
   void reset() {
     curl_easy_reset(m_cp);
 
@@ -239,9 +265,9 @@ public:
     curl_easy_setopt(m_cp, CURLOPT_SSL_CTX_DATA, (void*)this);
 
     curl_easy_setopt(m_cp, CURLOPT_TIMEOUT,
-                     RuntimeOption::HttpDefaultTimeout);
+                     minTimeout(RuntimeOption::HttpDefaultTimeout));
     curl_easy_setopt(m_cp, CURLOPT_CONNECTTIMEOUT,
-                     RuntimeOption::HttpDefaultTimeout);
+                     minTimeout(RuntimeOption::HttpDefaultTimeout));
   }
 
   Variant execute() {
@@ -283,7 +309,7 @@ public:
       }
     }
     if (m_write.method == PHP_CURL_RETURN) {
-      return String("");
+      return empty_string_variant();
     }
     return true;
   }
@@ -313,6 +339,18 @@ public:
     m_error_no = CURLE_OK;
 
     switch (option) {
+    case CURLOPT_TIMEOUT: {
+      auto timeout = minTimeout(value.toInt64());
+      m_error_no = curl_easy_setopt(m_cp, (CURLoption)option, timeout);
+      break;
+    }
+#if LIBCURL_VERSION_NUM >= 0x071002
+    case CURLOPT_TIMEOUT_MS: {
+      auto timeout = minTimeoutMS(value.toInt64());
+      m_error_no = curl_easy_setopt(m_cp, (CURLoption)option, timeout);
+      break;
+    }
+#endif
     case CURLOPT_INFILESIZE:
     case CURLOPT_VERBOSE:
     case CURLOPT_HEADER:
@@ -328,10 +366,6 @@ public:
     case CURLOPT_FTPAPPEND:
     case CURLOPT_NETRC:
     case CURLOPT_PUT:
-    case CURLOPT_TIMEOUT:
-#if LIBCURL_VERSION_NUM >= 0x071002
-    case CURLOPT_TIMEOUT_MS:
-#endif
     case CURLOPT_FTP_USE_EPSV:
     case CURLOPT_LOW_SPEED_LIMIT:
     case CURLOPT_SSLVERSION:
@@ -435,21 +469,20 @@ public:
         }
 
         Resource obj = value.toResource();
-        if (obj.isNull() || obj.getTyped<File>(true) == nullptr) {
-          return false;
-        }
+        auto fp = obj.getTyped<File>(true);
+        if (!fp) return false;
 
         switch (option) {
           case CURLOPT_FILE:
-            m_write.fp = obj;
+            m_write.fp = fp;
             m_write.method = PHP_CURL_FILE;
             break;
           case CURLOPT_WRITEHEADER:
-            m_write_header.fp = obj;
+            m_write_header.fp = fp;
             m_write_header.method = PHP_CURL_FILE;
             break;
           case CURLOPT_INFILE:
-            m_read.fp = obj;
+            m_read.fp = fp;
             m_emptyPost = false;
             break;
           default: {
@@ -509,7 +542,7 @@ public:
               (&first, &last,
                CURLFORM_COPYNAME, key.data(),
                CURLFORM_NAMELENGTH, (long)key.size(),
-               CURLFORM_FILENAME, s_postname.empty()
+               CURLFORM_FILENAME, postname.empty()
                                   ? name.c_str()
                                   : postname.c_str(),
                CURLFORM_CONTENTTYPE, mime.empty()
@@ -530,7 +563,7 @@ public:
                *   curl_formadd
                * - Revert changes to postval at the end
                */
-              char* mutablePostval = const_cast<char*>(postval);
+              char* mutablePostval = const_cast<char*>(postval) + 1;
               char* type = strstr(mutablePostval, ";type=");
               char* filename = strstr(mutablePostval, ";filename=");
 
@@ -541,10 +574,11 @@ public:
                 *filename = '\0';
               }
 
+              String localName = File::TranslatePath(mutablePostval);
+
               /* The arguments after _NAMELENGTH and _CONTENTSLENGTH
                * must be explicitly cast to long in curl_formadd
                * use since curl needs a long not an int. */
-              ++postval;
               m_error_no = (CURLcode)curl_formadd
                 (&first, &last,
                  CURLFORM_COPYNAME, key.data(),
@@ -555,7 +589,7 @@ public:
                  CURLFORM_CONTENTTYPE, type
                                        ? type + sizeof(";type=") - 1
                                        : "application/octet-stream",
-                 CURLFORM_FILE, postval,
+                 CURLFORM_FILE, localName.c_str(),
                  CURLFORM_END);
 
               if (type) {
@@ -713,7 +747,7 @@ public:
       m_exception = e.clone();
       m_phpException = false;
     }
-    return uninit_null();
+    return init_null();
   }
 
   static int curl_progress(void* p,
@@ -745,7 +779,7 @@ public:
     int length = -1;
     switch (t->method) {
     case PHP_CURL_DIRECT:
-      if (!t->fp.isNull()) {
+      if (t->fp) {
         int data_size = size * nmemb;
         String ret = t->fp->read(data_size);
         length = ret.size();
@@ -758,7 +792,8 @@ public:
       {
         int data_size = size * nmemb;
         Variant ret = ch->do_callback(
-          t->callback, make_packed_array(Resource(ch), t->fp, data_size));
+          t->callback,
+          make_packed_array(Resource(ch), Resource(t->fp), data_size));
         if (ret.isString()) {
           String sret = ret.toString();
           length = data_size < sret.size() ? data_size : sret.size();
@@ -835,7 +870,7 @@ public:
 
   CURL *get(bool nullOkay = false) {
     if (m_cp == nullptr && !nullOkay) {
-      throw NullPointerException();
+      throw_null_pointer_exception();
     }
     return m_cp;
   }
@@ -967,15 +1002,15 @@ CURLcode CurlResource::ssl_ctx_callback(CURL *curl, void *sslctx, void *parm) {
 
 Variant HHVM_FUNCTION(curl_init, const Variant& url /* = null_string */) {
   if (url.isNull()) {
-    return NEWOBJ(CurlResource)(null_string);
+    return Variant(makeSmartPtr<CurlResource>(null_string));
   } else {
-    return NEWOBJ(CurlResource)(url.toString());
+    return Variant(makeSmartPtr<CurlResource>(url.toString()));
   }
 }
 
 Variant HHVM_FUNCTION(curl_copy_handle, const Resource& ch) {
   CHECK_RESOURCE(curl);
-  return NEWOBJ(CurlResource)(curl);
+  return Variant(makeSmartPtr<CurlResource>(curl));
 }
 
 const StaticString
@@ -1012,7 +1047,7 @@ Variant HHVM_FUNCTION(curl_version, int uversion /* = k_CURLVERSION_NOW */) {
     protocol_list.append(String(*p++, CopyString));
   }
   ret.set(s_protocols, protocol_list);
-  return ret.create();
+  return ret.toVariant();
 }
 
 bool HHVM_FUNCTION(curl_setopt, const Resource& ch, int option, const Variant& value) {
@@ -1081,7 +1116,7 @@ Variant HHVM_FUNCTION(curl_getinfo, const Resource& ch, int opt /* = 0 */) {
       if (s_code != nullptr) {
         ret.set(s_content_type, String(s_code, CopyString));
       } else {
-        ret.set(s_content_type, uninit_null());
+        ret.set(s_content_type, init_null());
       }
     }
     if (curl_easy_getinfo(cp, CURLINFO_HTTP_CODE, &l_code) == CURLE_OK) {
@@ -1209,7 +1244,7 @@ Variant HHVM_FUNCTION(curl_getinfo, const Resource& ch, int opt /* = 0 */) {
     }
   }
 
-  return uninit_null();
+  return init_null();
 }
 
 Variant HHVM_FUNCTION(curl_errno, const Resource& ch) {
@@ -1225,7 +1260,7 @@ Variant HHVM_FUNCTION(curl_error, const Resource& ch) {
 Variant HHVM_FUNCTION(curl_close, const Resource& ch) {
   CHECK_RESOURCE(curl);
   curl->close();
-  return uninit_null();
+  return init_null();
 }
 
 void HHVM_FUNCTION(curl_reset, const Resource& ch) {
@@ -1316,9 +1351,13 @@ public:
 
   CURLM *get() {
     if (m_multi == nullptr) {
-      throw NullPointerException();
+      throw_null_pointer_exception();
     }
     return m_multi;
+  }
+
+  const Array& getEasyHandles() const {
+    return m_easyh;
   }
 
 private:
@@ -1334,15 +1373,30 @@ void CurlMultiResource::sweep() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#define CURLM_ARG_WARNING "expects parameter 1 to be cURL multi resource"
+
 #define CHECK_MULTI_RESOURCE(curlm)                                      \
   CurlMultiResource *curlm = mh.getTyped<CurlMultiResource>(true, true); \
-  if (curlm == nullptr) {                                                \
-    raise_warning("expects parameter 1 to be cURL multi resource");      \
-    return uninit_null();                                                \
-  }                                                                      \
+  if (!curlm || curlm->isInvalid()) {                                    \
+    raise_warning(CURLM_ARG_WARNING);                                    \
+    return init_null();                                                  \
+  }
+
+#define CHECK_MULTI_RESOURCE_RETURN_VOID(curlm) \
+  CurlMultiResource *curlm = mh.getTyped<CurlMultiResource>(true, true); \
+  if (!curlm || curlm->isInvalid()) {                                    \
+    raise_warning(CURLM_ARG_WARNING);                                    \
+    return;                                                              \
+  }
+
+#define CHECK_MULTI_RESOURCE_THROW(curlm)                                \
+  CurlMultiResource *curlm = mh.getTyped<CurlMultiResource>(true, true); \
+  if (!curlm || curlm->isInvalid()) {                                    \
+    throw Object(SystemLib::AllocExceptionObject(CURLM_ARG_WARNING));    \
+  }
 
 Resource HHVM_FUNCTION(curl_multi_init) {
-  return NEWOBJ(CurlMultiResource)();
+  return Resource(makeSmartPtr<CurlMultiResource>());
 }
 
 Variant HHVM_FUNCTION(curl_multi_add_handle, const Resource& mh, const Resource& ch) {
@@ -1370,8 +1424,7 @@ Variant HHVM_FUNCTION(curl_multi_exec, const Resource& mh, VRefParam still_runni
   return result;
 }
 
-/* Fallback implementation of curl_multi_select() for
- * libcurl < 7.28.0 without FB's curl_multi_select() patch
+/* Fallback implementation of curl_multi_select()
  *
  * This allows the OSS build to work with older package
  * versions of libcurl, but will fail with file descriptors
@@ -1413,7 +1466,7 @@ static void hphp_curl_multi_select(CURLM *mh, int timeout_ms, int *ret) {
 #  define curl_multi_select_func hphp_curl_multi_select
 # endif
 #else
-#define curl_multi_select_func curl_multi_select
+#define curl_multi_select_func(mh, tm, ret) curl_multi_wait((mh), nullptr, 0, (tm), (ret))
 #endif
 
 Variant HHVM_FUNCTION(curl_multi_select, const Resource& mh,
@@ -1426,6 +1479,160 @@ Variant HHVM_FUNCTION(curl_multi_select, const Resource& mh,
   return ret;
 }
 
+class CurlMultiAwait;
+
+class CurlEventHandler : public AsioEventHandler {
+ public:
+  CurlEventHandler(AsioEventBase* base, int fd, CurlMultiAwait* cma):
+    AsioEventHandler(base, fd), m_curlMultiAwait(cma), m_fd(fd) {}
+
+  void handlerReady(uint16_t events) noexcept override;
+ private:
+  CurlMultiAwait* m_curlMultiAwait;
+  int m_fd;
+};
+
+class CurlTimeoutHandler : public AsioTimeoutHandler {
+ public:
+  CurlTimeoutHandler(AsioEventBase* base, CurlMultiAwait* cma):
+    AsioTimeoutHandler(base), m_curlMultiAwait(cma) {}
+
+  void timeoutExpired() noexcept override;
+ private:
+  CurlMultiAwait* m_curlMultiAwait;
+};
+
+class CurlMultiAwait : public AsioExternalThreadEvent {
+ public:
+  CurlMultiAwait(CurlMultiResource* multi, double timeout) {
+    if ((addLowHandles(multi) + addHighHandles(multi)) == 0) {
+      // Nothing to do
+      markAsFinished();
+      return;
+    }
+
+    // Add optional timeout
+    int64_t timeout_ms = timeout * 1000;
+    if (timeout_ms > 0) {
+      m_timeout = std::shared_ptr<CurlTimeoutHandler>
+        (new CurlTimeoutHandler(s_asio_event_base.get(), this));
+      s_asio_event_base->runInEventBaseThread([this, timeout_ms]{
+        m_timeout->scheduleTimeout(timeout_ms);
+      });
+    }
+  }
+
+  ~CurlMultiAwait() {
+    for (auto handler : m_handlers) {
+      handler->unregisterHandler();
+    }
+    if (m_timeout) {
+      std::shared_ptr<CurlTimeoutHandler> to = m_timeout;
+      s_asio_event_base->runInEventBaseThread([to]{
+        to.get()->cancelTimeout();
+      });
+      m_timeout.reset();
+    }
+    m_handlers.clear();
+  }
+
+  void unserialize(Cell& c) {
+    c.m_type = KindOfInt64;
+    c.m_data.num = m_result;
+  }
+
+  void setFinished(int fd) {
+    if (m_result < fd) {
+      m_result = fd;
+    }
+    if (!m_finished) {
+      markAsFinished();
+      m_finished = true;
+    }
+  }
+
+ private:
+  void addHandle(int fd, int events) {
+    auto handler =
+      std::make_shared<CurlEventHandler>(s_asio_event_base.get(), fd, this);
+    handler->registerHandler(events);
+    m_handlers.push_back(handler);
+  }
+
+  // Ask curl_multi for its handles directly
+  // This is preferable as we get to know which
+  // are blocking on reads, and which on writes.
+  int addLowHandles(CurlMultiResource* multi) {
+    fd_set read_fds, write_fds;
+    int max_fd = -1, count = 0;
+    FD_ZERO(&read_fds); FD_ZERO(&write_fds);
+    if ((CURLM_OK != curl_multi_fdset(multi->get(), &read_fds, &write_fds,
+                                      nullptr, &max_fd)) ||
+        (max_fd < 0)) {
+      return count;
+    }
+    for (int i = 0 ; i <= max_fd; ++i) {
+      int events = 0;
+      if (FD_ISSET(i, &read_fds))  events |= AsioEventHandler::READ;
+      if (FD_ISSET(i, &write_fds)) events |= AsioEventHandler::WRITE;
+      if (events) {
+        addHandle(i, events);
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  // Check for file descriptors >= FD_SETSIZE
+  // which can't be returned in an fdset
+  // This is a little hacky, but necessary given cURL's APIs
+  int addHighHandles(CurlMultiResource* multi) {
+    int count = 0;
+    auto easy_handles = multi->getEasyHandles();
+    for (ArrayIter iter(easy_handles); iter; ++iter) {
+      Variant easy_handle = iter.second();
+      auto easy = easy_handle.toResource().getTyped<CurlResource>(true, true);
+      if (!easy) continue;
+      long sock;
+      if ((curl_easy_getinfo(easy->get(),
+                             CURLINFO_LASTSOCKET, &sock) != CURLE_OK) ||
+          (sock < FD_SETSIZE)) {
+        continue;
+      }
+      // No idea which type of event it needs, ask for everything
+      addHandle(sock, AsioEventHandler::READ_WRITE);
+      ++count;
+    }
+    return count;
+  }
+
+  std::shared_ptr<CurlTimeoutHandler> m_timeout;
+  std::vector<std::shared_ptr<CurlEventHandler>> m_handlers;
+  int m_result{-1};
+  bool m_finished{false};
+};
+
+void CurlEventHandler::handlerReady(uint16_t events) noexcept {
+  m_curlMultiAwait->setFinished(m_fd);
+}
+
+void CurlTimeoutHandler::timeoutExpired() noexcept {
+  m_curlMultiAwait->setFinished(-1);
+}
+
+Object HHVM_FUNCTION(curl_multi_await, const Resource& mh,
+                                       double timeout /*=1.0*/) {
+  CHECK_MULTI_RESOURCE_THROW(curlm);
+  auto ev = new CurlMultiAwait(curlm, timeout);
+  try {
+    return ev->getWaitHandle();
+  } catch (...) {
+    assert(false);
+    ev->abandon();
+    throw;
+  }
+}
+
 Variant HHVM_FUNCTION(curl_multi_getcontent, const Resource& ch) {
   CHECK_RESOURCE(curl);
   return curl->getContents();
@@ -1435,8 +1642,7 @@ Array curl_convert_fd_to_stream(fd_set *fd, int max_fd) {
   Array ret = Array::Create();
   for (int i=0; i<=max_fd; i++) {
     if (FD_ISSET(i, fd)) {
-      BuiltinFile *file = NEWOBJ(BuiltinFile)(i);
-      ret.append(file);
+      ret.append(Variant(makeSmartPtr<BuiltinFile>(i)));
     }
   }
   return ret;
@@ -1497,7 +1703,7 @@ Variant HHVM_FUNCTION(curl_multi_info_read, const Resource& mh,
 Variant HHVM_FUNCTION(curl_multi_close, const Resource& mh) {
   CHECK_MULTI_RESOURCE(curlm);
   curlm->close();
-  return uninit_null();
+  return init_null();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2017,10 +2223,10 @@ const StaticString s_CURL_VERSION_KERBEROS4("CURL_VERSION_KERBEROS4");
 const StaticString s_CURL_VERSION_LIBZ("CURL_VERSION_LIBZ");
 const StaticString s_CURL_VERSION_SSL("CURL_VERSION_SSL");
 
-class CurlExtension : public Extension {
+class CurlExtension final : public Extension {
  public:
   CurlExtension() : Extension("curl") {}
-  virtual void moduleInit() {
+  void moduleInit() override {
 #if LIBCURL_VERSION_NUM >= 0x071500
     Native::registerConstant<KindOfInt64>(
       s_CURLINFO_LOCAL_PORT.get(), k_CURLINFO_LOCAL_PORT
@@ -2766,6 +2972,7 @@ class CurlExtension : public Extension {
     HHVM_FE(curl_multi_remove_handle);
     HHVM_FE(curl_multi_exec);
     HHVM_FE(curl_multi_select);
+    HHVM_FE(curl_multi_await);
     HHVM_FE(curl_multi_getcontent);
     HHVM_FE(fb_curl_multi_fdset);
     HHVM_FE(curl_multi_info_read);

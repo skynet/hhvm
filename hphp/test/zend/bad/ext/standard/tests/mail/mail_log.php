@@ -1,8 +1,4 @@
 <?php
-ini_set('mail.log ',  /tmp/mail.log);
-
-ini_set('sendmail_path', tee /tmp/mail.out >/dev/null);
-
 date_default_timezone_set("UTC");
 
 $logfile = ini_get("mail.log");
@@ -28,6 +24,7 @@ clearstatcache();
 echo file_get_contents($logfile);
 ?>
 Done
+<?php error_reporting(0); ?>
 <?php
 unlink("/tmp/mail.log");
 unlink("/tmp/mail.out");

@@ -22,9 +22,13 @@
 
 #include <boost/container/flat_map.hpp>
 
-#include "folly/Optional.h"
+#include <folly/Optional.h>
+
+#include "hphp/util/copy-ptr.h"
 
 #include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/repo-auth-type.h"
+#include "hphp/runtime/base/repo-auth-type-array.h"
 
 #include "hphp/hhbbc/misc.h"
 #include "hphp/hhbbc/index.h"
@@ -86,27 +90,26 @@ struct Type;
  *
  *   {Init,}Prim
  *
- *       "Primitive" types---these can be represented in a TypedValue
- *       without a pointer to the heap.
+ *       "Primitive" types---these can be represented in a TypedValue without a
+ *       pointer to the heap.
  *
  *   {Init,}Unc
  *
- *       "Uncounted" types---values of these types don't require
- *       reference counting.
+ *       "Uncounted" types---values of these types don't require reference
+ *       counting.
  *
  *   WaitH<T>
  *
- *       A WaitHandle that is known will either return a value of type
- *       T from its join() method (or AsyncAwait), or else throw an
- *       exception.
+ *       A WaitHandle that is known will either return a value of type T from
+ *       its join() method (or Await), or else throw an exception.
  *
  * Array types:
  *
- *   Arrays are divided along two dimensions: counted or uncounted,
- *   and empty or non-empty.  Unions of either are allowed.  The
- *   naming convention is {S,C,}Arr{N,E,}, where leaving out either
- *   bit means it's unknown along that dimension.  All arrays are
- *   subtypes of the Arr type.  The lattice here looks like this:
+ *   Arrays are divided along two dimensions: counted or uncounted, and empty
+ *   or non-empty.  Unions of either are allowed.  The naming convention is
+ *   {S,C,}Arr{N,E,}, where leaving out either bit means it's unknown along
+ *   that dimension.  All arrays are subtypes of the Arr type.  The lattice
+ *   here looks like this:
  *
  *                         Arr
  *                          |
@@ -120,16 +123,15 @@ struct Type;
  *              | /   \  |     | /   \  |
  *             SArrN  CArrN   CArrE  SArrE
  *
- *   "Specialized" array types may be found as subtypes of any of the
- *   above types except SArrE and CArrE, or of optional versions of
- *   the above types (e.g. as a subtype of ?ArrN).  The information
- *   about additional structure is dispayed in parenthesis, and
- *   probably best explained by some examples:
+ *   "Specialized" array types may be found as subtypes of any of the above
+ *   types except SArrE and CArrE, or of optional versions of the above types
+ *   (e.g. as a subtype of ?ArrN).  The information about additional structure
+ *   is dispayed in parenthesis, and probably best explained by some examples:
  *
  *     SArrN(Bool,Int)
  *
- *         Tuple-like static two-element array, with integer keys 0
- *         and 1, containing a Bool and an Int with unknown values.
+ *         Tuple-like static two-element array, with integer keys 0 and 1,
+ *         containing a Bool and an Int with unknown values.
  *
  *     Arr(Int,Dbl)
  *
@@ -138,39 +140,38 @@ struct Type;
  *
  *     CArrN([Bool])
  *
- *         Non-empty reference counted array with contiguous
- *         zero-based integer keys, unknown size, values all are
- *         subtypes of Bool.
+ *         Non-empty reference counted array with contiguous zero-based integer
+ *         keys, unknown size, values all are subtypes of Bool.
  *
  *     ArrN(x:Int,y:Int)
  *
- *         Struct-like array with known fields "x" and "y" that have
- *         Int values, and no other fields.  Struct-like arrays always
- *         have known string keys, and the type contains only those
- *         array values with exactly the given key set.  The order of
- *         the array elements is not tracked in this type system.
+ *         Struct-like array with known fields "x" and "y" that have Int
+ *         values, and no other fields.  Struct-like arrays always have known
+ *         string keys, and the type contains only those array values with
+ *         exactly the given key set.  The order of the array elements is not
+ *         tracked in this type system.
  *
  *     Arr([SStr:InitCell])
  *
  *         Possibly empty map-like array with unknown keys, but all
- *         non-reference counted strings, all values InitCell.  In
- *         this case the array itself may or may not be static.
+ *         non-reference counted strings, all values InitCell.  In this case
+ *         the array itself may or may not be static.
  *
- *         Note that struct-like arrays will be subtypes of map-like
- *         arrays with string keys.
+ *         Note that struct-like arrays will be subtypes of map-like arrays
+ *         with string keys.
  *
  *     ArrN([Int:InitPrim])
  *
- *         Map-like array with only integer keys (not-necessarily
- *         contiguous) and values that are all subtypes of InitPrim.
- *         Note that the keys *may* be contiguous integers, so for
- *         example Arr([InitPrim]) <: Arr([Int => InitPrim]).
+ *         Map-like array with only integer keys (not-necessarily contiguous)
+ *         and values that are all subtypes of InitPrim.  Note that the keys
+ *         *may* be contiguous integers, so for example Arr([InitPrim]) <:
+ *         Arr([Int => InitPrim]).
  *
  *     Arr([InitCell:InitCell])
  *
- *         Map-like array with either integer or string keys, and
- *         InitCell values, or empty.  Essentially this is the most
- *         generic array that can't contain php references.
+ *         Map-like array with either integer or string keys, and InitCell
+ *         values, or empty.  Essentially this is the most generic array that
+ *         can't contain php references.
  *
  *  TODO(#3774082): we should have a Str|Int type.
  */
@@ -249,6 +250,7 @@ enum class DataTag : uint8_t {
   Int,
   Dbl,
   Cls,
+  RefInner,
   ArrVal,
   ArrPacked,
   ArrPackedN,
@@ -310,10 +312,11 @@ struct Type {
   ~Type() noexcept;
 
   /*
-   * Exact equality or inequality of types.
+   * Exact equality or inequality of types, and hashing.
    */
   bool operator==(const Type& o) const;
   bool operator!=(const Type& o) const { return !(*this == o); }
+  size_t hash() const;
 
   /*
    * Returns true if this type is definitely going to be a subtype or a strict
@@ -348,6 +351,9 @@ private:
   friend Type wait_handle(const Index&, Type);
   friend bool is_specialized_wait_handle(const Type&);
   friend bool is_specialized_array(const Type&);
+  friend bool is_specialized_obj(const Type&);
+  friend bool is_specialized_cls(const Type&);
+  friend bool is_ref_with_inner(const Type&);
   friend Type wait_handle_inner(const Type&);
   friend Type sval(SString);
   friend Type ival(int64_t);
@@ -357,6 +363,7 @@ private:
   friend Type objExact(res::Class);
   friend Type subCls(res::Class);
   friend Type clsExact(res::Class);
+  friend Type ref_to(Type);
   friend Type arr_packed(std::vector<Type>);
   friend Type sarr_packed(std::vector<Type>);
   friend Type carr_packed(std::vector<Type>);
@@ -373,6 +380,7 @@ private:
   friend DCls dcls_of(Type);
   friend Type union_of(Type, Type);
   friend Type widening_union(const Type&, const Type&);
+  friend Type promote_emptyish(Type, Type);
   friend Type opt(Type);
   friend Type unopt(Type);
   friend bool is_opt(Type);
@@ -380,9 +388,13 @@ private:
   friend std::string show(Type);
   friend struct ArrKey disect_key(const Type&);
   friend Type array_elem(const Type&, const Type&);
+  friend Type arrayN_set(Type, const Type&, const Type&);
   friend Type array_set(Type, const Type&, const Type&);
+  friend std::pair<Type,Type> arrayN_newelem_key(const Type&, const Type&);
   friend std::pair<Type,Type> array_newelem_key(const Type&, const Type&);
   friend std::pair<Type,Type> iter_types(const Type&);
+  friend RepoAuthType make_repo_type_arr(ArrayTypeTable::Builder&,
+    const Type&);
 
 private:
   union Data {
@@ -395,6 +407,7 @@ private:
     SArray aval;
     DObj dobj;
     DCls dcls;
+    copy_ptr<Type> inner;
     copy_ptr<DArrPacked> apacked;
     copy_ptr<DArrPackedN> apackedn;
     copy_ptr<DArrStruct> astruct;
@@ -410,6 +423,8 @@ private:
   static Type unionArr(const Type& a, const Type& b);
 
 private:
+  template<class Ret, class T, class Function>
+  DJHelperFn<Ret,T,Function> djbind(const Function& f, const T& t) const;
   template<class Ret, class T, class Function>
   Ret dj2nd(const Type&, DJHelperFn<Ret,T,Function>) const;
   template<class Function>
@@ -556,6 +571,11 @@ Type aempty();
 Type counted_aempty();
 
 /*
+ * Create an any-countedness empty array type.
+ */
+Type some_aempty();
+
+/*
  * Create types for objects or classes with some known constraint on
  * which res::Class is associated with them.
  */
@@ -620,10 +640,16 @@ Type unopt(Type t);
 bool is_opt(Type t);
 
 /*
- * Returns true if type 't' represents a "specialized" object, that is
- * an object of a known class, or an optional object of a known class.
+ * Returns true if type 't' represents a "specialized" object, that is an
+ * object of a known class, or an optional object of a known class.
  */
-bool is_specialized_obj(Type t);
+bool is_specialized_obj(const Type&);
+
+/*
+ * Returns true if type 't' represents a "specialized" class---i.e. a class
+ * with a DCls structure.
+ */
+bool is_specialized_cls(const Type&);
 
 /*
  * Returns whether `t' is a WaitH<T> or ?WaitH<T> for some T.
@@ -645,7 +671,7 @@ bool is_specialized_array(const Type& t);
  *
  * Pre: t.subtypeOf(TObj)
  */
-Type objcls(Type t);
+Type objcls(const Type& t);
 
 /*
  * If the type t has a known constant value, return it as a Cell.
@@ -673,7 +699,7 @@ DObj dobj_of(const Type& t);
 /*
  * Return the DCls structure for a strict subtype of TCls.
  *
- * Pre: t.strictSubtypeOf(TCls)
+ * Pre: is_specialized_cls(t)
  */
 DCls dcls_of(Type t);
 
@@ -728,6 +754,18 @@ Type union_of(Type a, Type b);
  * analyze.cpp.
  */
 Type widening_union(const Type& a, const Type& b);
+
+/*
+ * A sort of union operation that also attempts to remove "emptyish" types from
+ * union_of(a, b).  This is useful for promoting emptyish types (sempty(),
+ * false, and null) to stdClass or to arrays, in member instructions.
+ *
+ * This function currently doesn't give specific guarantees about exactly when
+ * the emptyish types will not be part of the return type (informally it only
+ * happens in the "easy" cases right now), so you should not use it in
+ * situations where union_of(a, b) would not also be correct.
+ */
+Type promote_emptyish(Type a, Type b);
 
 /*
  * Returns the smallest type that `a' is a subtype of, from the
@@ -804,6 +842,18 @@ std::pair<Type,Type> array_newelem_key(const Type& arr, const Type& val);
  * the returned types are at worst InitCell.
  */
 std::pair<Type,Type> iter_types(const Type&);
+
+/*
+ * Create a RepoAuthType for a Type.
+ *
+ * RepoAuthTypes may contain things like RepoAuthType::Array*'s or
+ * SStrings for class names.  The emit code needs to handle making
+ * sure these things are merged into the appropriate unit or repo.
+ *
+ * Pre: !t.couldBe(TCls)
+ *      !t.subtypeOf(TBottom)
+ */
+RepoAuthType make_repo_type(ArrayTypeTable::Builder&, const Type& t);
 
 //////////////////////////////////////////////////////////////////////
 

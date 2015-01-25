@@ -17,6 +17,7 @@
 #include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/comparisons.h"
 #include "hphp/util/exception.h"
 #include "hphp/runtime/base/zend-printf.h"
 #include "hphp/runtime/base/zend-functions.h"
@@ -42,9 +43,21 @@ const StaticString
 
 VariableSerializer::VariableSerializer(Type type, int option /* = 0 */,
                                        int maxRecur /* = 3 */)
-  : m_type(type), m_option(option), m_buf(nullptr), m_indent(0),
-    m_valueCount(0), m_referenced(false), m_refCount(1), m_maxCount(maxRecur),
-    m_levelDebugger(0) {
+  : m_type(type)
+  , m_option(option)
+  , m_buf(nullptr)
+  , m_indent(0)
+  , m_valueCount(0)
+  , m_referenced(false)
+  , m_refCount(1)
+  , m_objId(0)
+  , m_objCode(0)
+  , m_rsrcId(0)
+  , m_maxCount(maxRecur)
+  , m_levelDebugger(0)
+  , m_currentDepth(0)
+  , m_maxDepth(0)
+{
   m_maxLevelDebugger = g_context->debuggerSettings.printLevel;
   if (type == Type::Serialize ||
       type == Type::APCSerialize ||
@@ -55,23 +68,45 @@ VariableSerializer::VariableSerializer(Type type, int option /* = 0 */,
   }
 }
 
-void VariableSerializer::setObjectInfo(const String& objClass, int objId,
-                                       char objCode) {
+void VariableSerializer::pushObjectInfo(const String& objClass, int objId,
+                                        char objCode) {
   assert(objCode == 'O' || objCode == 'V' || objCode == 'K');
+  m_objectInfos.emplace_back(
+    ObjectInfo { m_objClass, m_objId, m_objCode, m_rsrcName, m_rsrcId }
+  );
   m_objClass = objClass;
   m_objId = objId;
   m_objCode = objCode;
+  m_rsrcName.reset();
+  m_rsrcId = 0;
 }
 
-void VariableSerializer::getResourceInfo(String &rsrcName, int &rsrcId) {
-  rsrcName = m_rsrcName;
-  rsrcId = m_rsrcId;
-}
-
-void VariableSerializer::setResourceInfo(const String& rsrcName, int rsrcId) {
+void VariableSerializer::pushResourceInfo(const String& rsrcName, int rsrcId) {
+  m_objectInfos.emplace_back(
+    ObjectInfo { m_objClass, m_objId, m_objCode, m_rsrcName, m_rsrcId }
+  );
+  m_objClass.reset();
+  m_objId = 0;
+  m_objCode = 0;
   m_rsrcName = rsrcName;
   m_rsrcId = rsrcId;
-  m_objCode = 0;
+}
+
+void VariableSerializer::popObjectInfo() {
+  ObjectInfo &info = m_objectInfos.back();
+  m_objClass = info.objClass;
+  m_objId = info.objId;
+  m_objCode = info.objCode;
+  m_rsrcName = info.rsrcName;
+  m_rsrcId = info.rsrcId;
+  m_objectInfos.pop_back();
+}
+
+__thread int64_t VariableSerializer::serializationSizeLimit =
+  StringData::MaxSize;
+
+void VariableSerializer::popResourceInfo() {
+  popObjectInfo();
 }
 
 String VariableSerializer::serialize(const Variant& v, bool ret,
@@ -79,7 +114,7 @@ String VariableSerializer::serialize(const Variant& v, bool ret,
   StringBuffer buf;
   m_buf = &buf;
   if (ret) {
-    buf.setOutputLimit(RuntimeOption::SerializationSizeLimit);
+    buf.setOutputLimit(serializationSizeLimit);
   } else {
     buf.setOutputLimit(StringData::MaxSize);
   }
@@ -91,14 +126,14 @@ String VariableSerializer::serialize(const Variant& v, bool ret,
     String str = m_buf->detach();
     g_context->write(str);
   }
-  return null_string;
+  return String();
 }
 
 String VariableSerializer::serializeValue(const Variant& v, bool limit) {
   StringBuffer buf;
   m_buf = &buf;
   if (limit) {
-    buf.setOutputLimit(RuntimeOption::SerializationSizeLimit);
+    buf.setOutputLimit(serializationSizeLimit);
   }
   m_valueCount = 1;
   write(v);
@@ -109,13 +144,13 @@ String VariableSerializer::serializeWithLimit(const Variant& v, int limit) {
   if (m_type == Type::Serialize || m_type == Type::JSON ||
       m_type == Type::APCSerialize || m_type == Type::DebuggerSerialize) {
     assert(false);
-    return null_string;
+    return String();
   }
   StringBuffer buf;
   m_buf = &buf;
-  if (RuntimeOption::SerializationSizeLimit > 0 &&
-      (limit <= 0 || limit > RuntimeOption::SerializationSizeLimit)) {
-    limit = RuntimeOption::SerializationSizeLimit;
+  if (serializationSizeLimit > 0 &&
+      (limit <= 0 || limit > serializationSizeLimit)) {
+    limit = serializationSizeLimit;
   }
   buf.setOutputLimit(limit);
   //Does not need m_valueCount, which is only useful with the unsupported types
@@ -207,8 +242,10 @@ void VariableSerializer::write(double v) {
       m_buf->append(buf);
       free(buf);
     } else {
-      // PHP issues a warning: double INF/NAN does not conform to the
-      // JSON spec, encoded as 0.
+      if (std::isnan(v) || std::isinf(v)) {
+        json_set_last_error_code(json_error_codes::JSON_ERROR_INF_OR_NAN);
+      }
+
       m_buf->append('0');
     }
     break;
@@ -289,7 +326,8 @@ static void appendJsonEscape(StringBuffer& sb,
 
   UTF8To16Decoder decoder(s, len, options & k_JSON_FB_LOOSE);
   for (;;) {
-    int c = decoder.decode();
+    int c = options & k_JSON_UNESCAPED_UNICODE ? decoder.decodeAsUTF8()
+                                               : decoder.decode();
     if (c == UTF8_END) {
       sb.append('"');
       break;
@@ -367,9 +405,8 @@ static void appendJsonEscape(StringBuffer& sb,
       }
       break;
     default:
-      if (us >= ' ' && options & k_JSON_UNESCAPED_UNICODE) {
-        utf16_to_utf8(sb, us);
-      } else if (us >= ' ' && (us & 127) == us) {
+      if (us >= ' ' &&
+          ((options & k_JSON_UNESCAPED_UNICODE) || (us & 127) == us)) {
         sb.append((char)us);
       } else {
         sb.append("\\u", 2);
@@ -385,7 +422,8 @@ static void appendJsonEscape(StringBuffer& sb,
 }
 
 void VariableSerializer::write(const char *v, int len /* = -1 */,
-                               bool isArrayKey /* = false */) {
+                               bool isArrayKey /* = false */,
+                               bool noQuotes /* = false */) {
   if (v == nullptr) v = "";
   if (len < 0) len = strlen(v);
 
@@ -433,26 +471,24 @@ void VariableSerializer::write(const char *v, int len /* = -1 */,
     m_buf->append("\";");
     break;
   case Type::JSON: {
-    if (m_option & k_JSON_NUMERIC_CHECK) {
+    if ((m_option & k_JSON_NUMERIC_CHECK) && !isArrayKey) {
       int64_t lval; double dval;
-      switch (is_numeric_string(v, len, &lval, &dval, 0)) {
-        case KindOfInt64:
-          write(lval);
-          return;
-        case KindOfDouble:
-          write(dval);
-          return;
-        default:
-          break;
+      auto dt = is_numeric_string(v, len, &lval, &dval, 0);
+      if (IS_INT_TYPE(dt)) {
+        write(lval);
+        return;
+      } else if (IS_DOUBLE_TYPE(dt)) {
+        write(dval);
+        return;
       }
     }
-
     appendJsonEscape(*m_buf, v, len, m_option);
     break;
   }
   case Type::DebuggerDump:
   case Type::PHPOutput: {
-    m_buf->append('"');
+    if (!noQuotes)
+      m_buf->append('"');
     for (int i = 0; i < len; ++i) {
       const unsigned char c = v[i];
       switch (c) {
@@ -475,7 +511,8 @@ void VariableSerializer::write(const char *v, int len /* = -1 */,
         }
       }
     }
-    m_buf->append('"');
+    if (!noQuotes)
+      m_buf->append('"');
     break;
   }
   default:
@@ -505,27 +542,53 @@ void VariableSerializer::write(const Object& v) {
     if (v.instanceof(s_JsonSerializable)) {
       assert(!v->isCollection());
       Variant ret = v->o_invoke_few_args(s_jsonSerialize, 0);
-      // for non objects or when $this is returned
+      // for non objects or when $this is not returned
       if (!ret.isObject() || (ret.isObject() && !same(ret, v))) {
-        write(ret);
+        if (ret.isArray() || ret.isObject()) {
+          preventOverflow(v, [&ret, this]() {
+            write(ret);
+          });
+        } else {
+          // Don't need to check for overflows if ret is of primitive type
+          // because the depth does not change.
+          write(ret);
+        }
         return;
       }
     }
-    if (incNestedLevel(v.get(), true)) {
-      writeOverflow(v.get(), true);
-    } else {
+    preventOverflow(v, [&v, this]() {
       if (v->isCollection()) {
         collectionSerialize(v.get(), this);
+      } else if (v->instanceof(SystemLib::s_ClosureClass)) {
+        // We serialize closures as "{}" in JSON mode to be compatible
+        // with PHP. And issue a warning in HipHop syntax.
+        if (RuntimeOption::EnableHipHopSyntax) {
+          m_buf->append("null");
+          json_set_last_error_code(
+            json_error_codes::JSON_ERROR_UNSUPPORTED_TYPE);
+          return;
+        }
+        m_buf->append("{}");
       } else {
-        Array props = v->o_toArray(true);
-        setObjectInfo(v->o_getClassName(), v->o_getId(), 'O');
+        auto props = v->toArray(true);
+        pushObjectInfo(v->getClassName(), v->getId(), 'O');
         props.serialize(this);
+        popObjectInfo();
       }
-    }
-    decNestedLevel(v.get());
+    });
   } else {
     v.serialize(this);
   }
+}
+
+void VariableSerializer::preventOverflow(const Object& v,
+                                         const std::function<void()>& func) {
+  if (incNestedLevel(v.get(), true)) {
+    writeOverflow(v.get(), true);
+  } else {
+    func();
+  }
+  decNestedLevel(v.get());
 }
 
 void VariableSerializer::write(const Variant& v, bool isArrayKey /* = false */) {
@@ -584,7 +647,7 @@ void VariableSerializer::writeOverflow(void* ptr, bool isObject /* = false */) {
     break;
   case Type::VarExport:
   case Type::PHPOutput:
-    throw NestingLevelTooDeepException();
+    throw ExtendedException("Nesting level too deep - recursive dependency?");
   case Type::VarDump:
   case Type::DebugDump:
   case Type::DebuggerDump:
@@ -619,7 +682,7 @@ void VariableSerializer::writeOverflow(void* ptr, bool isObject /* = false */) {
     }
     break;
   case Type::JSON:
-    raise_warning("json_encode(): recursion detected");
+    json_set_last_error_code(json_error_codes::JSON_ERROR_RECURSION);
     m_buf->append("null");
     break;
   default:
@@ -642,6 +705,7 @@ void VariableSerializer::writeArrayHeader(int size, bool isVectorData) {
   ArrayInfo &info = m_arrayInfos.back();
   info.first_element = true;
   info.indent_delta = 0;
+  info.size = size;
 
   switch (m_type) {
   case Type::DebuggerDump:
@@ -760,7 +824,8 @@ void VariableSerializer::writeArrayHeader(int size, bool isVectorData) {
       m_buf->append('{');
     }
 
-    if (m_type == Type::JSON && m_option & k_JSON_PRETTY_PRINT) {
+    if (m_type == Type::JSON && (m_option & k_JSON_PRETTY_PRINT) &&
+        info.size > 0) {
       m_buf->append("\n");
       m_indent += (info.indent_delta = 4);
     }
@@ -884,7 +949,7 @@ void VariableSerializer::writeArrayKey(Variant key) {
           k++;
           len -= 2;
         }
-        write(k, len);
+        write(k, len, true);
       } else {
         m_buf->append('"');
         m_buf->append(keyCell->m_data.num);
@@ -1013,7 +1078,8 @@ void VariableSerializer::writeArrayFooter() {
     m_buf->append('}');
     break;
   case Type::JSON:
-    if (m_type == Type::JSON && m_option & k_JSON_PRETTY_PRINT) {
+    if (m_type == Type::JSON && (m_option & k_JSON_PRETTY_PRINT) &&
+        info.size > 0) {
       m_buf->append("\n");
       indent();
     }
@@ -1058,14 +1124,21 @@ void VariableSerializer::indent() {
 
 bool VariableSerializer::incNestedLevel(void *ptr,
                                         bool isObject /* = false */) {
+  ++m_currentDepth;
+
   switch (m_type) {
   case Type::VarExport:
   case Type::PHPOutput:
   case Type::PrintR:
   case Type::VarDump:
   case Type::DebugDump:
-  case Type::JSON:
   case Type::DebuggerDump:
+    return ++m_counts[ptr] >= m_maxCount;
+  case Type::JSON:
+    if (m_currentDepth > m_maxDepth) {
+      json_set_last_error_code(json_error_codes::JSON_ERROR_DEPTH);
+    }
+
     return ++m_counts[ptr] >= m_maxCount;
   case Type::DebuggerSerialize:
     if (m_maxLevelDebugger > 0 && ++m_levelDebugger > m_maxLevelDebugger) {
@@ -1094,6 +1167,7 @@ bool VariableSerializer::incNestedLevel(void *ptr,
 }
 
 void VariableSerializer::decNestedLevel(void *ptr) {
+  --m_currentDepth;
   --m_counts[ptr];
   if (m_type == Type::DebuggerSerialize && m_maxLevelDebugger > 0) {
     --m_levelDebugger;

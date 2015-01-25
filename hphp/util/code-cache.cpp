@@ -25,7 +25,10 @@ namespace HPHP {
 
 TRACE_SET_MOD(mcg);
 
-static const int kMaxTranslationBytes = 8192;
+// This value should be enough bytes to emit the "main" part of a
+// minimal translation, which consists of a single jump (for a
+// REQ_INTERPRET service request).
+static const int kMinTranslationBytes = 8;
 
 CodeCache::Selector::Selector(const Args& args)
   : m_cache(args.m_cache)
@@ -37,7 +40,7 @@ CodeCache::Selector::Selector(const Args& args)
     // Profile has higher precedence than Hot.
     if (args.m_profile) {
       m_cache.m_selection = Selection::Profile;
-    } else if (args.m_hot && m_cache.m_hot.available() > kMaxTranslationBytes) {
+    } else if (args.m_hot && m_cache.m_hot.available() > kMinTranslationBytes) {
       m_cache.m_selection = Selection::Hot;
     }
   }
@@ -49,32 +52,37 @@ CodeCache::Selector::~Selector() {
 
 CodeCache::CodeCache()
   : m_selection(Selection::Default)
+  , m_lock(false)
 {
   static const size_t kRoundUp = 2 << 20;
 
   auto ru = [=] (size_t sz) { return sz + (-sz & (kRoundUp - 1)); };
 
-  const size_t kAHotSize   = ru(RuntimeOption::RepoAuthoritative ?
-                                RuntimeOption::EvalJitAHotSize : 0);
-  const size_t kASize      = ru(RuntimeOption::EvalJitASize);
-  const size_t kAProfSize  = ru(RuntimeOption::EvalJitPGO ?
-                                RuntimeOption::EvalJitAProfSize : 0);
-  const size_t kAStubsSize = ru(RuntimeOption::EvalJitAStubsSize);
+  const size_t kAHotSize    = ru(RuntimeOption::EvalJitAHotSize);
+  const size_t kASize       = ru(RuntimeOption::EvalJitASize);
+  const size_t kAProfSize   = ru(RuntimeOption::EvalJitPGO ?
+                                 RuntimeOption::EvalJitAProfSize : 0);
+  const size_t kAColdSize  = ru(RuntimeOption::EvalJitAColdSize);
+  const size_t kAFrozenSize = ru(RuntimeOption::EvalJitAFrozenSize);
+
   const size_t kGDataSize  = ru(RuntimeOption::EvalJitGlobalDataSize);
-  m_totalSize = kAHotSize + kASize + kAStubsSize + kAProfSize + kGDataSize;
+  m_totalSize = kAHotSize + kASize + kAColdSize + kAProfSize +
+                kAFrozenSize + kGDataSize;
   m_codeSize = m_totalSize - kGDataSize;
 
   if ((kASize < (10 << 20)) ||
-      (kAStubsSize < (10 << 20)) ||
+      (kAColdSize < (4 << 20)) ||
+      (kAFrozenSize < (6 << 20)) ||
       (kGDataSize < (2 << 20))) {
-    fprintf(stderr, "Allocation sizes ASize, AStubsSize, and GlobalDataSize "
-                    "are too small.\n");
+    fprintf(stderr, "Allocation sizes ASize, AColdSize, AFrozenSize and "
+                    "GlobalDataSize are too small.\n");
     exit(1);
   }
 
   if (m_totalSize > (2ul << 30)) {
-    fprintf(stderr,"Combined size of ASize, AStubSize, and GlobalDataSize "
-                   "must be < 2GiB to support 32-bit relative addresses\n");
+    fprintf(stderr,"Combined size of ASize, AColdSize, AFrozenSize and "
+                    "GlobalDataSize must be < 2GiB to support 32-bit relative "
+                    "addresses\n");
     exit(1);
   }
 
@@ -119,57 +127,64 @@ CodeCache::CodeCache()
 
   numa_interleave(base, m_totalSize);
 
-  TRACE(1, "init atrampolines @%p\n", base);
-
-  m_trampolines.init(base, kTrampolinesBlockSize);
-
-  auto misalign = kTrampolinesBlockSize;
-
   if (kAHotSize) {
     TRACE(1, "init ahot @%p\n", base);
-    m_hot.init(base, kAHotSize);
+    m_hot.init(base, kAHotSize, "hot");
     enhugen(base, kAHotSize >> 20);
     base += kAHotSize;
-    m_hot.skip(misalign);
-    misalign = 0;
   }
 
   TRACE(1, "init a @%p\n", base);
 
-  m_main.init(base, kASize);
+  m_main.init(base, kASize, "main");
   enhugen(base, RuntimeOption::EvalTCNumHugeHotMB);
   m_mainBase = base;
   base += kASize;
-  m_main.skip(misalign);
-  misalign = 0;
 
   TRACE(1, "init aprof @%p\n", base);
-  m_prof.init(base, kAProfSize);
+  m_prof.init(base, kAProfSize, "prof");
   base += kAProfSize;
 
-  TRACE(1, "init astubs @%p\n", base);
-  m_stubs.init(base, kAStubsSize);
+  TRACE(1, "init acold @%p\n", base);
+  m_cold.init(base, kAColdSize, "cold");
   enhugen(base, RuntimeOption::EvalTCNumHugeColdMB);
-  base += kAStubsSize;
+  base += kAColdSize;
+
+  TRACE(1, "init afrozen @%p\n", base);
+  m_frozen.init(base, kAFrozenSize, "afrozen");
+  base += kAFrozenSize;
 
   TRACE(1, "init gdata @%p\n", base);
-  m_data.init(base, kGDataSize);
+  m_data.init(base, kGDataSize, "gdata");
   base += kGDataSize;
+
+  // The default on linux for the newly allocated memory is read/write/exec
+  // but on some systems its just read/write. Call unprotect to ensure that
+  // the memory is marked executable.
+  unprotect();
 
   assert(base - m_base <= allocationSize);
   assert(base - m_base + kRoundUp > allocationSize);
 }
 
 CodeCache::~CodeCache() {
-  int result = munmap(m_trampolines.base(), m_totalSize);
-  if (result != 0) {
-    perror("freeSlab: munmap");
-  }
 }
 
 CodeBlock& CodeCache::blockFor(CodeAddress addr) {
-  return JIT::codeBlockChoose(addr,
-                              m_main, m_hot, m_prof, m_stubs, m_trampolines);
+  always_assert(!m_lock);
+  return jit::codeBlockChoose(addr, m_main, m_hot, m_prof,
+                              m_cold, m_frozen);
+}
+
+size_t CodeCache::totalUsed() const {
+  size_t ret = 0;
+  forEachBlock([&ret](const char*, const CodeBlock& b) {
+    // A thread with the write lease may be modifying b.m_frontier while we
+    // call b.used() but it should never modify b.m_base. This means that at
+    // worst b.used() will return a slightly stale value.
+    ret += b.used();
+  });
+  return ret;
 }
 
 bool CodeCache::isValidCodeAddress(CodeAddress addr) const {
@@ -185,6 +200,7 @@ void CodeCache::unprotect() {
 }
 
 CodeBlock& CodeCache::main() {
+  always_assert(!m_lock);
     switch (m_selection) {
       case Selection::Default: return m_main;
       case Selection::Hot:     return m_hot;
@@ -193,13 +209,18 @@ CodeBlock& CodeCache::main() {
     always_assert(false && "Invalid Selection");
 }
 
-CodeBlock& CodeCache::stubs() {
+CodeBlock& CodeCache::cold() {
+  always_assert(!m_lock);
   switch (m_selection) {
     case Selection::Default:
-    case Selection::Hot:
-    case Selection::Profile: return m_stubs;
+    case Selection::Hot:     return m_cold;
+    case Selection::Profile: return frozen();
   }
   always_assert(false && "Invalid Selection");
+}
+
+CodeBlock& CodeCache::frozen() {
+  return m_frozen;
 }
 
 }

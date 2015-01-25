@@ -62,14 +62,30 @@ Cell cellDiv(Cell, Cell);
 Cell cellMod(Cell, Cell);
 
 /*
+ * PHP Operator **.
+ *
+ * Always returns a TypedNum.
+ */
+Cell cellPow(Cell, Cell);
+
+/*
  * PHP operators &, |, and ^.
  *
- * These functions return a KindOfInt64, unless both arguments are
- * KindOfString, in which case they return a KindOfString.
+ * These operators return a KindOfInt64, unless both arguments are
+ * KindOfString, in which case they return a KindOfString that the caller owns
+ * a reference to.
  */
 Cell cellBitAnd(Cell, Cell);
 Cell cellBitOr(Cell, Cell);
 Cell cellBitXor(Cell, Cell);
+
+/*
+ * PHP operators << and >>.
+ *
+ * These operators always return a KindOfInt64.
+ */
+Cell cellShl(Cell, Cell);
+Cell cellShr(Cell, Cell);
 
 //////////////////////////////////////////////////////////////////////
 
@@ -116,6 +132,14 @@ void cellDivEq(Cell& c1, Cell);
 void cellModEq(Cell& c1, Cell);
 
 /*
+ * PHP operator **=.
+ *
+ * Mutates the first argument in place, by combining the second
+ * argument with it in the of php operator **=.
+ */
+void cellPowEq(Cell& c1, Cell);
+
+/*
  * PHP operators &=, |=, and ^=.
  *
  * Mutates the first argument in place, by combining the second
@@ -126,6 +150,17 @@ void cellModEq(Cell& c1, Cell);
 void cellBitAndEq(Cell& c1, Cell);
 void cellBitOrEq(Cell& c1, Cell);
 void cellBitXorEq(Cell& c1, Cell);
+
+/*
+ * PHP operators <<= and >>=.
+ *
+ * Mutates the first argument in place, by combining the second argument
+ * with it in the sense of the appropriate operator.
+ *
+ * Post: c1.m_type == KindOfInt64
+ */
+void cellShlEq(Cell& c1, Cell);
+void cellShrEq(Cell& c1, Cell);
 
 //////////////////////////////////////////////////////////////////////
 

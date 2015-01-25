@@ -20,7 +20,7 @@
 #include <vector>
 #include <bitset>
 
-#include "folly/Optional.h"
+#include <folly/Optional.h>
 
 #include "hphp/hhbbc/misc.h"
 #include "hphp/hhbbc/index.h"
@@ -29,6 +29,7 @@
 namespace HPHP { namespace HHBBC {
 
 struct PropertiesInfo;
+struct CollectedInfo;
 struct State;
 struct StepFlags;
 struct Bytecode;
@@ -51,7 +52,7 @@ struct RunFlags {
 
 //////////////////////////////////////////////////////////////////////
 
-constexpr int kMaxTrackedLocals = 128;
+constexpr int kMaxTrackedLocals = 512;
 
 /*
  * StepFlags are information about the effects of a single opcode.
@@ -72,17 +73,21 @@ struct StepFlags {
   bool wasPEI = true;
 
   /*
-   * If a conditional branch at the end of the BB was known to be
-   * taken (e.g. because the condition was a constant), this flag
-   * indicates the state doesn't need to be propagated to the
-   * fallthrough block.
+   * Information about the branch taken by a conditional JmpZ/JmpNZ at
+   * the end of the BB.
+   *
+   * 'Either' indicates that both branches could be taken. 'Taken' indicates
+   * that the conditional branch was known to be taken (e.g. because the
+   * condition was a constant). In this case, the state doesn't need to
+   * be propagated to the fallthrough block.
+   *
+   * 'Fallthrough' indicates that the conditional branch was known to be not
+   * taken, and control goes to the fallthrough block. In this case, the
+   * JmpZ/JmpNZ instruction can be converted to a PopC (no-op).
    */
-  bool tookBranch = false;
+  enum class JmpFlags : uint8_t { Either, Taken, Fallthrough };
 
-  /*
-   * If true, we made a call to a function that never returns.
-   */
-  bool calledNoReturn = false;
+  JmpFlags jmpFlag = JmpFlags::Either;
 
   /*
    * If an instruction sets this flag, it means that if it pushed a
@@ -132,7 +137,7 @@ struct StepFlags {
 struct Interp {
   const Index& index;
   Context ctx;
-  PropertiesInfo& props;
+  CollectedInfo& collect;
   borrowed_ptr<const php::Block> blk;
   State& state;
 };

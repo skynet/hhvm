@@ -20,6 +20,8 @@ var_dump( filesize($file) );
 
 echo "*** Done ***\n";
 ?>
+
+<?php error_reporting(0); ?>
 <?php
 unlink(dirname(__FILE__)."/copy_variation10.tmp");
 ?>

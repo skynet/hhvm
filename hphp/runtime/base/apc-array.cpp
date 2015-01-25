@@ -15,9 +15,10 @@
 */
 #include "hphp/runtime/base/apc-array.h"
 
-#include "folly/Bits.h"
+#include <folly/Bits.h>
 
 #include "hphp/runtime/base/apc-handle.h"
+#include "hphp/runtime/base/data-walker.h"
 #include "hphp/runtime/base/apc-handle-defs.h"
 #include "hphp/runtime/base/apc-typed-value.h"
 #include "hphp/runtime/base/apc-string.h"
@@ -25,13 +26,14 @@
 #include "hphp/runtime/base/apc-local-array-defs.h"
 #include "hphp/runtime/base/array-iterator.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
-#include "hphp/runtime/ext/ext_apc.h"
+#include "hphp/runtime/ext/apc/ext_apc.h"
 
 namespace HPHP {
 
 ///////////////////////////////////////////////////////////////////////////////
 
 APCHandle* APCArray::MakeShared(ArrayData* arr,
+                                size_t& size,
                                 bool inner,
                                 bool unserializeObj) {
   if (!inner) {
@@ -40,24 +42,24 @@ APCHandle* APCArray::MakeShared(ArrayData* arr,
     DataWalker::DataFeature features = walker.traverseData(arr);
     if (features.isCircular() || features.hasCollection()) {
       String s = apc_serialize(arr);
-      APCHandle* handle = APCString::MakeShared(KindOfArray, s.get());
+      APCHandle* handle = APCString::MakeShared(KindOfArray, s.get(), size);
       handle->setSerializedArray();
-      handle->mustCache();
       return handle;
     }
 
     if (apcExtension::UseUncounted &&
         !features.hasObjectOrResource() &&
         !arr->empty()) {
+      size = getMemSize(arr) + sizeof(APCTypedValue);
       return APCTypedValue::MakeSharedArray(arr);
     }
   }
 
   if (arr->isVectorData()) {
-    return APCArray::MakePackedShared(arr, unserializeObj);
+    return APCArray::MakePackedShared(arr, size, unserializeObj);
   }
 
-  return APCArray::MakeShared(arr, unserializeObj);
+  return APCArray::MakeShared(arr, size, unserializeObj);
 }
 
 APCHandle* APCArray::MakeShared() {
@@ -67,26 +69,27 @@ APCHandle* APCArray::MakeShared() {
 }
 
 APCHandle* APCArray::MakeShared(ArrayData* arr,
+                                size_t& size,
                                 bool unserializeObj) {
   auto num = arr->size();
   auto cap = num > 2 ? folly::nextPowTwo(num) : 2;
 
-  void* p = malloc(sizeof(APCArray) +
-                   sizeof(int) * cap +
-                   sizeof(Bucket) * num);
+  size = sizeof(APCArray) + sizeof(int) * cap + sizeof(Bucket) * num;
+  void* p = malloc(size);
   APCArray* ret = new (p) APCArray(static_cast<unsigned int>(cap));
 
   for (int i = 0; i < cap; i++) ret->hash()[i] = -1;
 
   try {
     for (ArrayIter it(arr); !it.end(); it.next()) {
-      auto key = APCHandle::Create(it.first(), false, true,
+      size_t s = 0;
+      auto key = APCHandle::Create(it.first(), s, false, true,
                                    unserializeObj);
-      auto val = APCHandle::Create(it.secondRef(), false, true,
+      size += s;
+      s = 0;
+      auto val = APCHandle::Create(it.secondRef(), s, false, true,
                                    unserializeObj);
-      if (val->shouldCache()) {
-        ret->mustCache();
-      }
+      size += s;
       ret->add(key, val);
     }
   } catch (...) {
@@ -98,20 +101,21 @@ APCHandle* APCArray::MakeShared(ArrayData* arr,
 }
 
 APCHandle* APCArray::MakePackedShared(ArrayData* arr,
+                                      size_t& size,
                                       bool unserializeObj) {
   size_t num_elems = arr->size();
-  void* p = malloc(sizeof(APCArray) + sizeof(APCHandle*) * num_elems);
+  size = sizeof(APCArray) + sizeof(APCHandle*) * num_elems;
+  void* p = malloc(size);
   auto ret = new (p) APCArray(static_cast<size_t>(num_elems));
 
   try {
     size_t i = 0;
     for (ArrayIter it(arr); !it.end(); it.next()) {
+      size_t s = 0;
       APCHandle* val = APCHandle::Create(it.secondRef(),
-                                         false, true,
+                                         s, false, true,
                                          unserializeObj);
-      if (val->shouldCache()) {
-        ret->mustCache();
-      }
+      size += s;
       ret->vals()[i++] = val;
     }
     assert(i == num_elems);
@@ -123,19 +127,19 @@ APCHandle* APCArray::MakePackedShared(ArrayData* arr,
   return ret->getHandle();
 }
 
-Variant APCArray::MakeArray(APCHandle* handle) {
-  if (handle->getUncounted()) {
+Variant APCArray::MakeArray(const APCHandle* handle) {
+  if (handle->isUncounted()) {
     return APCTypedValue::fromHandle(handle)->getArrayData();
-  } else if (handle->getSerializedArray()) {
-    StringData* serArr = APCString::fromHandle(handle)->getStringData();
+  } else if (handle->isSerializedArray()) {
+    auto const serArr = APCString::fromHandle(handle)->getStringData();
     return apc_unserialize(serArr->data(), serArr->size());
   }
   return APCLocalArray::Make(APCArray::fromHandle(handle))->asArrayData();
 }
 
 void APCArray::Delete(APCHandle* handle) {
-  handle->getSerializedArray() ? delete APCString::fromHandle(handle)
-                               : delete APCArray::fromHandle(handle);
+  handle->isSerializedArray() ? delete APCString::fromHandle(handle)
+                              : delete APCArray::fromHandle(handle);
 }
 
 APCArray::~APCArray() {
@@ -162,13 +166,13 @@ void APCArray::add(APCHandle *key, APCHandle *val) {
   bucket->val = val;
   m.m_num++;
   int hash_pos;
-  if (!IS_REFCOUNTED_TYPE(key->getType())) {
-    APCTypedValue *k = APCTypedValue::fromHandle(key);
-    hash_pos = (key->is(KindOfInt64) ?
+  if (!IS_REFCOUNTED_TYPE(key->type())) {
+    auto const k = APCTypedValue::fromHandle(key);
+    hash_pos = (key->type() == KindOfInt64 ?
         k->getInt64() : k->getStringData()->hash()) & m.m_capacity_mask;
   } else {
-    assert(key->is(KindOfString));
-    APCString *k = APCString::fromHandle(key);
+    assert(key->type() == KindOfString);
+    auto const k = APCString::fromHandle(key);
     hash_pos = k->getStringData()->hash() & m.m_capacity_mask;
   }
 
@@ -182,15 +186,15 @@ ssize_t APCArray::indexOf(const StringData* key) const {
   ssize_t bucket = hash()[h & m.m_capacity_mask];
   Bucket* b = buckets();
   while (bucket != -1) {
-    if (!IS_REFCOUNTED_TYPE(b[bucket].key->getType())) {
-      APCTypedValue *k = APCTypedValue::fromHandle(b[bucket].key);
-      if (!b[bucket].key->is(KindOfInt64) &&
+    if (!IS_REFCOUNTED_TYPE(b[bucket].key->type())) {
+      auto const k = APCTypedValue::fromHandle(b[bucket].key);
+      if (b[bucket].key->type() != KindOfInt64 &&
           key->same(k->getStringData())) {
         return bucket;
       }
     } else {
-      assert(b[bucket].key->is(KindOfString));
-      APCString *k = APCString::fromHandle(b[bucket].key);
+      assert(b[bucket].key->type() == KindOfString);
+      auto const k = APCString::fromHandle(b[bucket].key);
       if (key->same(k->getStringData())) {
         return bucket;
       }
@@ -204,7 +208,7 @@ ssize_t APCArray::indexOf(int64_t key) const {
   ssize_t bucket = hash()[key & m.m_capacity_mask];
   Bucket* b = buckets();
   while (bucket != -1) {
-    if (b[bucket].key->is(KindOfInt64) &&
+    if (b[bucket].key->type() == KindOfInt64 &&
         key == APCTypedValue::fromHandle(b[bucket].key)->getInt64()) {
       return bucket;
     }

@@ -17,9 +17,12 @@ class Runner {
   private string $fatal_information = "";
   private string $diff_information = "";
   private string $stat_information = "";
+  // Each PHPUnit process gets its' own tempdir to avoid race conditions
+  // between multiple runs
+  private ?string $temp_dir;
 
-  private array<resource> $pipes = null;
-  private resource $process = null;
+  private array<resource> $pipes = [];
+  private ?resource $process = null;
   private string $actual_test_command = "";
 
   public function __construct(public Framework $framework, string $p = "") {
@@ -109,15 +112,14 @@ class Runner {
       $this->outputData();
     } else {
       error_and_exit("Could not open process to run test ".$this->name.
-                     " for framework ".$this->framework->getName(),
-                     Options::$csv_only);
+                     " for framework ".$this->framework->getName());
     }
     chdir(__DIR__);
     return $ret_val;
   }
 
   private function analyzeTest(string $test): bool {
-    verbose("Analyzing test: ".$test.PHP_EOL, Options::$verbose);
+    verbose("Analyzing test: ".$test.PHP_EOL);
     // If we hit a fatal or something, we will stop the overall test running
     // for this particular test sequence
     $continue_testing = true;
@@ -157,14 +159,14 @@ class Runner {
         continue;
       }
     } while (!feof($this->pipes[1]) &&
-           preg_match(PHPUnitPatterns::$status_code_pattern,
+           preg_match(PHPUnitPatterns::STATUS_CODE_PATTERN,
                       $status) === 0);
     // Test names should have all characters before and including __DIR__
     // removed, so that specific user info is not added
     $test = rtrim($test, PHP_EOL);
     $test = remove_string_from_text($test, __DIR__, null);
     $this->test_information .= $test.PHP_EOL;
-    $this->processStatus($status, $test);
+    $this->processStatus(nullthrows($status), $test);
 
     return $continue_testing;
   }
@@ -184,34 +186,42 @@ class Runner {
 
     $this->test_information .= $status.PHP_EOL;
 
-    if ($this->framework->getCurrentTestStatuses() !== null &&
-        $this->framework->getCurrentTestStatuses()->containsKey($test)) {
-      if ($status === $this->framework->getCurrentTestStatuses()[$test]) {
+    $fbmake_name = fbmake_test_name($this->framework, $test);
+    fbmake_json(Map {'op' => 'start', 'test' => $fbmake_name});
+    fbmake_json(
+      (Map {
+        'op' => 'test_done',
+        'test' => $fbmake_name,
+      })->setAll(fbmake_result_json($this->framework, $test, $status))
+    );
+    $statuses = $this->framework->getCurrentTestStatuses();
+
+    if ($statuses !== null &&
+        $statuses->containsKey($test)) {
+      if ($status === $statuses[$test]) {
         // FIX: posix_isatty(STDOUT) was always returning false, even
         // though can print in color. Check this out later.
-        verbose(Colors::GREEN.Statuses::PASS.Colors::NONE, !Options::$csv_only);
+        human(Colors::GREEN.Statuses::PASS.Colors::NONE);
       } else {
         // Red if we go from pass to something else
-        if ($this->framework->getCurrentTestStatuses()[$test] === '.') {
-          verbose(Colors::RED.Statuses::FAIL.Colors::NONE, !Options::$csv_only);
+        if ($statuses[$test] === '.') {
+          human(Colors::RED.Statuses::FAIL.Colors::NONE);
         // Green if we go from something else to pass
         } else if ($status === '.') {
-          verbose(Colors::GREEN.Statuses::FAIL.Colors::NONE,
-                  !Options::$csv_only);
+          human(Colors::GREEN.Statuses::FAIL.Colors::NONE);
         // Blue if we go from something "faily" to something "faily"
         // e.g., E to I or F
         } else {
-          verbose(Colors::BLUE.Statuses::FAIL.Colors::NONE,
-                  !Options::$csv_only);
+          human(Colors::BLUE.Statuses::FAIL.Colors::NONE);
         }
-        verbose(PHP_EOL."Different status in ".$this->framework->getName().
-                " for test ".$test." was ".
-                $this->framework->getCurrentTestStatuses()[$test].
-                " and now is ".$status.PHP_EOL, !Options::$csv_only);
+        human(PHP_EOL."Different status in ".$this->framework->getName().
+              " for test ".$test." was ".
+              $statuses[$test].
+              " and now is ".$status.PHP_EOL);
         $this->diff_information .= "----------------------".PHP_EOL.
           $test.PHP_EOL.PHP_EOL.
           $this->getTestRunStr($test, "RUN TEST FILE: ").PHP_EOL.PHP_EOL.
-          "EXPECTED: ".$this->framework->getCurrentTestStatuses()[$test].
+          "EXPECTED: ".$statuses[$test].
           PHP_EOL.">>>>>>>".PHP_EOL.
           "ACTUAL: ".$status.PHP_EOL.PHP_EOL;
       }
@@ -220,16 +230,15 @@ class Runner {
       // because we are establishing a baseline. OR we have run the tests
       // before, but we are having an issue getting to the actual tests
       // (e.g., yii is one test suite that has behaved this way).
-      if ($this->framework->getCurrentTestStatuses() !== null) {
-        verbose(Colors::LIGHTBLUE.Statuses::FAIL.Colors::NONE,
-                !Options::$csv_only);
-        verbose(PHP_EOL."Different status in ".$this->framework->getName().
-                " for test ".$test.PHP_EOL,!Options::$csv_only);
+      if ($statuses !== null) {
+        human(Colors::LIGHTBLUE.Statuses::FAIL.Colors::NONE);
+        human(PHP_EOL."Different status in ".$this->framework->getName().
+              " for test ".$test.PHP_EOL);
         $this->diff_information .= "----------------------".PHP_EOL.
           "Maybe haven't see this test before: ".$test.PHP_EOL.PHP_EOL.
           $this->getTestRunStr($test, "RUN TEST FILE: ").PHP_EOL.PHP_EOL;
       } else {
-        verbose(Colors::GRAY.Statuses::PASS.Colors::NONE, !Options::$csv_only);
+        human(Colors::GRAY.Statuses::PASS.Colors::NONE);
       }
     }
   }
@@ -272,13 +281,13 @@ class Runner {
       // There was 1 failure:  <---- Don't print
       // <blank line>
       // 1) Assetic\Test\Asset\HttpAssetTest::testGetLastModified <---- print
-      if (preg_match(PHPUnitPatterns::$tests_ok_skipped_inc_pattern,
+      if (preg_match(PHPUnitPatterns::TESTS_OK_SKIPPED_INC_PATTERN,
                      $line) === 1 ||
-          preg_match(PHPUnitPatterns::$num_errors_failures_pattern,
+          preg_match(PHPUnitPatterns::NUM_ERRORS_FAILURES_PATTERN,
                      $line) === 1 ||
-          preg_match(PHPUnitPatterns::$failures_header_pattern,
+          preg_match(PHPUnitPatterns::FAILURES_HEADER_PATTERN,
                      $line) === 1 ||
-          preg_match(PHPUnitPatterns::$num_skips_inc_pattern,
+          preg_match(PHPUnitPatterns::NUM_SKIPS_INC_PATTERN,
                      $line) === 1) {
         do {
           // throw out any blank lines after these pattern
@@ -294,9 +303,9 @@ class Runner {
       // stat information is part of the information provided for a
       // given test error -- or -- we have hit a fatal at the very end of
       // running PHPUnit. For that fatal case, we handle that a bit differently.
-      if (preg_match(PHPUnitPatterns::$tests_ok_pattern, $line) === 1 ||
-          preg_match(PHPUnitPatterns::$tests_failure_pattern, $line) === 1 ||
-          preg_match(PHPUnitPatterns::$no_tests_executed_pattern,
+      if (preg_match(PHPUnitPatterns::TESTS_OK_PATTERN, $line) === 1 ||
+          preg_match(PHPUnitPatterns::TESTS_FAILURE_PATTERN, $line) === 1 ||
+          preg_match(PHPUnitPatterns::NO_TESTS_EXECUTED_PATTERN,
                      $line) === 1) {
         $prev_line = $line;
         $line = $this->getLine();
@@ -371,7 +380,7 @@ class Runner {
     $this->stat_information = $this->name.PHP_EOL;
     if ($final_stats === null) {
       $this->stat_information .= Statuses::FATAL.PHP_EOL;
-    } else if (preg_match(PHPUnitPatterns::$no_tests_executed_pattern,
+    } else if (preg_match(PHPUnitPatterns::NO_TESTS_EXECUTED_PATTERN,
                           $final_stats) === 1) {
       $this->stat_information .= Statuses::SKIP.PHP_EOL;
     } else {
@@ -380,13 +389,13 @@ class Runner {
   }
 
   private function isStop(string $line) {
-    return preg_match(PHPUnitPatterns::$stop_parsing_pattern, $line) === 1;
+    return preg_match(PHPUnitPatterns::STOP_PARSING_PATTERN, $line) === 1;
   }
 
   private function isPrologue(string $line) {
-    return preg_match(PHPUnitPatterns::$header_pattern, $line) === 1 ||
-        preg_match(PHPUnitPatterns::$config_file_pattern, $line) === 1 ||
-        preg_match(PHPUnitPatterns::$xdebug_pattern, $line) === 1;
+    return preg_match(PHPUnitPatterns::HEADER_PATTERN, $line) === 1 ||
+        preg_match(PHPUnitPatterns::CONFIG_FILE_PATTERN, $line) === 1 ||
+        preg_match(PHPUnitPatterns::XDEBUG_PATTERN, $line) === 1;
   }
 
   private function isBlankLine(string $line): bool {
@@ -395,7 +404,7 @@ class Runner {
 
   private function initialize(): bool {
     $this->actual_test_command = $this->framework->getTestCommand($this->name);
-    verbose("Command: ".$this->actual_test_command."\n", Options::$verbose);
+    verbose("Command: ".$this->actual_test_command."\n");
 
     $descriptorspec = array(
       0 => array("pipe", "r"),
@@ -405,10 +414,17 @@ class Runner {
 
     $env = $_ENV;
     // Use the proxies in case the test needs access to the outside world
-    $env = array_merge($env, ProxyInformation::$proxies->toArray());
+    $env = array_merge($env, nullthrows(ProxyInformation::$proxies)->toArray());
     if ($this->framework->getEnvVars() !== null) {
-      $env = array_merge($env, $this->framework->getEnvVars()->toArray());
+      $env = array_merge($env,
+                         nullthrows($this->framework->getEnvVars())->toArray());
     }
+    $temp_dir = sys_get_temp_dir().'/hhvm_oss_'.
+      uniqid($this->framework->getName(), true);
+    mkdir($temp_dir);
+    $this->temp_dir = $temp_dir;
+    $env['TMPDIR'] = $temp_dir;
+
     $this->process = proc_open($this->actual_test_command, $descriptorspec,
                                $this->pipes, $this->framework->getTestPath(),
                                $env);
@@ -419,6 +435,17 @@ class Runner {
     fclose($this->pipes[0]);
     fclose($this->pipes[1]);
     fclose($this->pipes[2]);
+
+    $temp_dir = $this->temp_dir;
+    $this->temp_dir = null;
+    if ($temp_dir !== null) {
+      if (!file_exists($temp_dir)) {
+        throw new Exception(
+          'Temp directory already deleted in test '.$this->name
+        );
+      }
+      remove_dir_recursive($temp_dir);
+    }
 
     return proc_close($this->process) === -1 ? -1 : 0;
   }
@@ -448,12 +475,12 @@ class Runner {
   }
 
   private function checkForFatals(string $line): bool {
-    return preg_match(PHPUnitPatterns::$hhvm_fatal_pattern, $line) === 1;
+    return preg_match(PHPUnitPatterns::FATAL_PATTERN, $line) === 1;
   }
 
   private function checkForWarnings(string $line): bool {
-    return preg_match(PHPUnitPatterns::$hhvm_warning_pattern, $line) === 1 ||
-      preg_match(PHPUnitPatterns::$phpunit_exception_with_hhvm_warning,
+    return preg_match(PHPUnitPatterns::WARNING_PATTERN, $line) === 1 ||
+      preg_match(PHPUnitPatterns::PHPUNIT_EXCEPTION_WITH_WARNING,
                  $line) === 1;
   }
 

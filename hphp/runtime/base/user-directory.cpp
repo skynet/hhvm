@@ -35,6 +35,10 @@ UserDirectory::UserDirectory(Class* cls) : UserFSNode(cls) {
   m_DirRewind  = lookupMethod(s_dir_rewinddir.get());
 }
 
+void UserDirectory::sweep() {
+  // Don't close like the parent, 'cause that's what zend does
+}
+
 bool UserDirectory::open(const String& path) {
   // bool dir_opendir ( string $path , int $options )
   bool invoked = false;
@@ -60,7 +64,7 @@ Variant UserDirectory::read() {
   if (!invoked) {
     raise_warning("%s::dir_readdir is not implemented",
                   m_cls->name()->data());
-    return null_string;
+    return init_null();
   }
   return ret;
 }

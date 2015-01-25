@@ -13,47 +13,58 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/vm/jit/normalized-instruction.h"
 
-#include "hphp/runtime/vm/jit/tracelet.h"
+#include "hphp/runtime/base/repo-auth-type-codec.h"
 #include "hphp/runtime/vm/jit/translator.h"
 
-namespace HPHP {
-namespace JIT {
+namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
 
-NormalizedInstruction::NormalizedInstruction()
-    : next(nullptr)
-    , prev(nullptr)
-    , source()
-    , funcd(nullptr)
-    , m_unit(nullptr)
-    , outStack(nullptr)
-    , outLocal(nullptr)
-    , outLocal2(nullptr)
-    , outStack2(nullptr)
-    , outStack3(nullptr)
-    , outPred(Type::Gen)
-    , immVec()
-    , calleeTrace(nullptr)
-    , checkedInputs(0)
-    , stackOffset(0)
-    , sequenceNum(0)
-    , nextOffset(0)
-    , breaksTracelet(false)
-    , includeBothPaths(false)
-    , changesPC(false)
-    , fuseBranch(false)
-    , preppedByRef(false)
-    , outputPredicted(false)
-    , outputPredictionStatic(false)
-    , ignoreInnerType(false)
-    , guardedThis(false)
-    , guardedCls(false)
-    , noOp(false)
-    , interp(false)
-    , inlineReturn(false) {
-  memset(imm, 0, sizeof(imm));
+/*
+ * Populates `imm' on `inst'.
+ *
+ * Assumes that inst.source and inst.unit have been properly set.
+ */
+static void populateImmediates(NormalizedInstruction& inst) {
+  auto offset = 1;
+  for (int i = 0; i < numImmediates(inst.op()); ++i) {
+    if (immType(inst.op(), i) == RATA) {
+      auto rataPc = inst.pc() + offset;
+      inst.imm[i].u_RATA = decodeRAT(inst.unit(), rataPc);
+    } else {
+      inst.imm[i] = getImm(reinterpret_cast<const Op*>(inst.pc()), i);
+    }
+    offset += immSize(reinterpret_cast<const Op*>(inst.pc()), i);
+  }
+  if (hasImmVector(*reinterpret_cast<const Op*>(inst.pc()))) {
+    inst.immVec = getImmVector(reinterpret_cast<const Op*>(inst.pc()));
+  }
+  if (inst.op() == OpFCallArray) {
+    inst.imm[0].u_IVA = 1;
+  }
 }
+
+///////////////////////////////////////////////////////////////////////////////
+
+NormalizedInstruction::NormalizedInstruction(SrcKey sk, const Unit* u)
+  : source(sk)
+  , funcd(nullptr)
+  , m_unit(u)
+  , immVec()
+  , nextOffset(kInvalidOffset)
+  , endsRegion(false)
+  , nextIsMerge(false)
+  , preppedByRef(false)
+  , ignoreInnerType(false)
+  , interp(false)
+{
+  memset(imm, 0, sizeof(imm));
+  populateImmediates(*this);
+}
+
+NormalizedInstruction::NormalizedInstruction() { }
 
 NormalizedInstruction::~NormalizedInstruction() { }
 
@@ -101,44 +112,5 @@ SrcKey NormalizedInstruction::nextSk() const {
   return source.advanced(m_unit);
 }
 
-NormalizedInstruction::OutputUse
-NormalizedInstruction::getOutputUsage(const DynLocation* output) const {
-  for (auto succ = next; succ; succ = succ->next) {
-    if (succ->noOp) continue;
-    for (size_t i = 0; i < succ->inputs.size(); ++i) {
-      if (succ->inputs[i] == output) {
-        if (succ->inputWasInferred(i)) {
-          return OutputUse::Inferred;
-        }
-        if (dontGuardAnyInputs(succ->op())) {
-          /* the consumer doesnt care about its inputs
-             but we may still have inferred something about
-             its outputs that a later instruction may depend on
-          */
-          if (!outputDependsOnInput(succ->op()) ||
-              !(succ->outStack && !succ->outStack->rtt.isVagueValue() &&
-                succ->getOutputUsage(succ->outStack) != OutputUse::Used) ||
-              !(succ->outLocal && !succ->outLocal->rtt.isVagueValue() &&
-                succ->getOutputUsage(succ->outLocal) != OutputUse::Used)) {
-            return OutputUse::DoesntCare;
-          }
-        }
-        return OutputUse::Used;
-      }
-    }
-  }
-  return OutputUse::Unused;
-}
-
-bool NormalizedInstruction::isOutputUsed(const DynLocation* output) const {
-  return (output && !output->rtt.isVagueValue() &&
-          getOutputUsage(output) == OutputUse::Used);
-}
-
-bool NormalizedInstruction::isAnyOutputUsed() const
-{
-  return (isOutputUsed(outStack) ||
-          isOutputUsed(outLocal));
-}
-
-} } // HPHP::JIT
+///////////////////////////////////////////////////////////////////////////////
+}}

@@ -18,28 +18,13 @@
 #include "hphp/runtime/ext/asio/blockable_wait_handle.h"
 
 #include "hphp/runtime/base/smart-containers.h"
+#include "hphp/runtime/ext/asio/asio_blockable.h"
 #include "hphp/runtime/ext/asio/asio_context.h"
 #include "hphp/runtime/ext/asio/waitable_wait_handle.h"
 #include "hphp/system/systemlib.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
-
-void c_BlockableWaitHandle::t___construct() {
-  throw NotSupportedException(__func__, "WTF? This is an abstract class");
-}
-
-c_BlockableWaitHandle* c_BlockableWaitHandle::unblock() {
-  c_BlockableWaitHandle* next = m_nextParent;
-
-  // notify subclass that we are no longer blocked
-  onUnblocked();
-
-  // decrement ref count, we can't be called by child anymore
-  decRefObj(this);
-
-  return next;
-}
 
 void c_BlockableWaitHandle::exitContextBlocked(context_idx_t ctx_idx) {
   assert(getState() == STATE_BLOCKED);
@@ -55,9 +40,7 @@ void c_BlockableWaitHandle::exitContextBlocked(context_idx_t ctx_idx) {
   setContextIdx(getContextIdx() - 1);
 
   // recursively move all wait handles blocked by us
-  for (auto pwh = getFirstParent(); pwh; pwh = pwh->getNextParent()) {
-    pwh->exitContextBlocked(ctx_idx);
-  }
+  getParentChain().exitContext(ctx_idx);
 }
 
 // throws if establishing a dependency from this to child would form a cycle
@@ -79,12 +62,12 @@ c_BlockableWaitHandle::createCycleException(c_WaitableWaitHandle* child) const {
   exception_msg_items.push_back(folly::stringPrintf(
     "  %s (%" PRId64 ")\n", child->getName().data(), child->t_getid()));
 
-  assert(dynamic_cast<c_BlockableWaitHandle*>(child));
+  assert(child->instanceof(c_BlockableWaitHandle::classof()));
   auto current = static_cast<c_BlockableWaitHandle*>(child);
 
   while (current != this) {
     assert(current->getState() == STATE_BLOCKED);
-    assert(dynamic_cast<c_BlockableWaitHandle*>(current->getChild()));
+    assert(current->getChild()->instanceof(c_BlockableWaitHandle::classof()));
     current = static_cast<c_BlockableWaitHandle*>(current->getChild());
 
     exception_msg_items.push_back(folly::stringPrintf(

@@ -13,144 +13,65 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/vm/jit/translator.h"
 
-// Translator front-end: parse instruction stream into basic blocks, decode
-// and normalize instructions. Propagate run-time type info to instructions
-// to annotate their inputs and outputs with types.
 #include <cinttypes>
 #include <assert.h>
-#include <stdint.h>
 #include <stdarg.h>
+#include <stdint.h>
 
-#include <vector>
-#include <string>
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
-#include "folly/Optional.h"
-#include "folly/Conv.h"
-#include "folly/MapUtil.h"
+#include <folly/Conv.h>
+#include <folly/MapUtil.h>
 
-#include "hphp/util/trace.h"
-#include "hphp/util/biased-coin.h"
 #include "hphp/util/map-walker.h"
 #include "hphp/util/ringbuffer.h"
-#include "hphp/runtime/base/file-repository.h"
+#include "hphp/util/timer.h"
+#include "hphp/util/trace.h"
+
+#include "hphp/runtime/base/arch.h"
+#include "hphp/runtime/base/repo-auth-type-codec.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/stats.h"
 #include "hphp/runtime/base/types.h"
-#include "hphp/runtime/ext/ext_continuation.h"
+#include "hphp/runtime/base/unit-cache.h"
 #include "hphp/runtime/ext/ext_collections.h"
-#include "hphp/runtime/vm/hhbc.h"
+#include "hphp/runtime/ext/ext_generator.h"
 #include "hphp/runtime/vm/bytecode.h"
-#include "hphp/runtime/vm/jit/annotation.h"
-#include "hphp/runtime/vm/jit/hhbc-translator.h"
-#include "hphp/runtime/vm/jit/ir-unit.h"
-#include "hphp/runtime/vm/jit/ir-translator.h"
-#include "hphp/runtime/vm/jit/normalized-instruction.h"
-#include "hphp/runtime/vm/jit/print.h"
-#include "hphp/runtime/vm/jit/region-selection.h"
-#include "hphp/runtime/base/rds.h"
-#include "hphp/runtime/vm/jit/timer.h"
-#include "hphp/runtime/vm/jit/tracelet.h"
-#include "hphp/runtime/vm/jit/translator-inline.h"
-#include "hphp/runtime/vm/jit/mc-generator.h"
-#include "hphp/runtime/vm/jit/type.h"
-#include "hphp/runtime/vm/pendq.h"
+#include "hphp/runtime/vm/hhbc.h"
+#include "hphp/runtime/vm/runtime.h"
 #include "hphp/runtime/vm/treadmill.h"
 #include "hphp/runtime/vm/type-profile.h"
-#include "hphp/runtime/vm/runtime.h"
+#include "hphp/runtime/vm/bc-pattern.h"
 
-#define KindOfUnknown DontUseKindOfUnknownInThisFile
-#define KindOfInvalid DontUseKindOfInvalidInThisFile
+#include "hphp/runtime/vm/jit/annotation.h"
+#include "hphp/runtime/vm/jit/ir-unit.h"
+#include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/normalized-instruction.h"
+#include "hphp/runtime/vm/jit/print.h"
+#include "hphp/runtime/vm/jit/prof-data.h"
+#include "hphp/runtime/vm/jit/punt.h"
+#include "hphp/runtime/vm/jit/region-selection.h"
+#include "hphp/runtime/vm/jit/timer.h"
+#include "hphp/runtime/vm/jit/translator-inline.h"
+#include "hphp/runtime/vm/jit/type.h"
+#include "hphp/runtime/vm/jit/inlining-decider.h"
+#include "hphp/runtime/vm/jit/translate-region.h"
+#include "hphp/runtime/vm/jit/irgen.h"
 
-namespace {
 TRACE_SET_MOD(trans);
-}
 
-namespace HPHP {
-namespace JIT {
+namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
 
-static __thread BiasedCoin *dbgTranslateCoin;
 Lease Translator::s_writeLease;
 
-struct TraceletContext {
-  TraceletContext() = delete;
-
-  TraceletContext(Tracelet* t, const TypeMap& initialTypes)
-    : m_t(t)
-    , m_numJmps(0)
-    , m_aliasTaint(false)
-    , m_varEnvTaint(false)
-  {
-    for (auto& kv : initialTypes) {
-      TRACE(1, "%s\n",
-            Trace::prettyNode("InitialType", kv.first, kv.second).c_str());
-      m_currentMap[kv.first] = t->newDynLocation(kv.first, kv.second);
-    }
-  }
-
-  Tracelet*   m_t;
-  ChangeMap   m_currentMap;
-  DepMap      m_dependencies;
-  DepMap      m_resolvedDeps; // dependencies resolved by static analysis
-  LocationSet m_changeSet;
-  LocationSet m_deletedSet;
-  int         m_numJmps;
-  bool        m_aliasTaint;
-  bool        m_varEnvTaint;
-
-  RuntimeType currentType(const Location& l) const;
-  DynLocation* recordRead(const InputInfo& l,
-                          DataType staticType = KindOfAny);
-  void recordWrite(DynLocation* dl);
-  void recordDelete(const Location& l);
-  void recordJmp();
-  void aliasTaint();
-  void varEnvTaint();
-};
-
-void InstrStream::append(NormalizedInstruction* ni) {
-  if (last) {
-    assert(first);
-    last->next = ni;
-    ni->prev = last;
-    ni->next = nullptr;
-    last = ni;
-    return;
-  }
-  assert(!first);
-  first = ni;
-  last = ni;
-  ni->prev = nullptr;
-  ni->next = nullptr;
-}
-
-void InstrStream::remove(NormalizedInstruction* ni) {
-  if (ni->prev) {
-    ni->prev->next = ni->next;
-  } else {
-    first = ni->next;
-  }
-  if (ni->next) {
-    ni->next->prev = ni->prev;
-  } else {
-    last = ni->prev;
-  }
-  ni->prev = nullptr;
-  ni->next = nullptr;
-}
-
-/*
- * locPhysicalOffset --
- *
- *   Return offset, in cells, of this location from its base
- *   pointer. It needs a function descriptor to see how many locals
- *   to skip for iterators; if the current frame pointer is not the context
- *   you're looking for, be sure to pass in a non-default f.
- */
 int locPhysicalOffset(Location l, const Func* f) {
   f = f ? f : liveFunc();
   assert_not_implemented(l.space == Location::Stack ||
@@ -161,255 +82,22 @@ int locPhysicalOffset(Location l, const Func* f) {
   return -((l.offset + 1) * iterInflator + localsToSkip);
 }
 
-// The global Translator object.
-Translator* tx;
-
-RuntimeType Translator::liveType(Location l,
-                                 const Unit& u,
-                                 bool specialize) {
-  Cell *outer;
-  switch (l.space) {
-    case Location::Stack:
-      // Stack accesses must be to addresses pushed before
-      // translation time; if they are to addresses pushed after,
-      // they should be hitting in the changemap.
-      assert(locPhysicalOffset(l) >= 0);
-      // fallthru
-    case Location::Local: {
-      Cell *base;
-      int offset = locPhysicalOffset(l);
-      base    = l.space == Location::Stack ? vmsp() : vmfp();
-      outer = &base[offset];
-    } break;
-    case Location::Iter: {
-      const Iter *it = frame_iter(liveFrame(), l.offset);
-      TRACE(1, "Iter input: fp %p, iter %p, offset %" PRId64 "\n", vmfp(),
-            it, l.offset);
-      return RuntimeType(it);
-    } break;
-    case Location::Litstr: {
-      return RuntimeType(u.lookupLitstrId(l.offset));
-    } break;
-    case Location::Litint: {
-      return RuntimeType(l.offset);
-    } break;
-    case Location::This: {
-      return outThisObjectType();
-    } break;
-    default: {
-      not_reached();
-    }
-  }
-  assert(IS_REAL_TYPE(outer->m_type));
-  return liveType(outer, l, specialize);
-}
-
-RuntimeType
-Translator::liveType(const Cell* outer, const Location& l, bool specialize) {
-  always_assert(analysisDepth() == 0);
-
-  if (!outer) {
-    // An undefined global; starts out as a variant null
-    return RuntimeType(KindOfRef, KindOfNull);
-  }
-  DataType outerType = (DataType)outer->m_type;
-  assert(IS_REAL_TYPE(outerType));
-  DataType valueType = outerType;
-  DataType innerType = KindOfNone;
-  const Cell* valCell = outer;
-  if (outerType == KindOfRef) {
-    // Variant. Pick up the inner type, too.
-    valCell = outer->m_data.pref->tv();
-    innerType = valCell->m_type;
-    assert(IS_REAL_TYPE(innerType));
-    valueType = innerType;
-    assert(innerType != KindOfRef);
-    FTRACE(2, "liveType {}: Var -> {}\n", l.pretty(), tname(innerType));
-  } else {
-    FTRACE(2, "liveType {}: {}\n", l.pretty(), tname(outerType));
-  }
-  RuntimeType retval = RuntimeType(outerType, innerType);
-  const Class *klass = nullptr;
-  if (specialize) {
-    // Only record the class/array kind if specialization requested
-    if (valueType == KindOfObject) {
-      klass = valCell->m_data.pobj->getVMClass();
-      if (klass != nullptr && (klass->attrs() & AttrFinal)) {
-        retval = retval.setKnownClass(klass);
-      }
-    } else if (valueType == KindOfArray) {
-      ArrayData::ArrayKind arrayKind = valCell->m_data.parr->kind();
-      // We currently only benefit from array specialization for packed arrays.
-      if (arrayKind == ArrayData::ArrayKind::kPackedKind) {
-        retval = retval.setArrayKind(arrayKind);
-      }
-    }
-  }
-  return retval;
-}
-
-RuntimeType Translator::outThisObjectType() {
-  /*
-   * Use the current method's context class (ctx) as a constraint.
-   * For instance methods, if $this is non-null, we are guaranteed
-   * that $this is an instance of ctx or a class derived from
-   * ctx. Zend allows this assumption to be violated but we have
-   * deliberately chosen to diverge from them here.
-   *
-   * Note that if analysisDepth() != 0 we'll have !hasThis() here,
-   * because our fake ActRec has no $this, but we'll still return the
-   * correct object type because arGetContextClass() looks at
-   * ar->m_func's class for methods.
-   */
-  const Class *ctx = liveFunc()->isMethod() ?
-    arGetContextClass(liveFrame()) : nullptr;
-  if (ctx) {
-    assert(!liveFrame()->hasThis() ||
-           liveFrame()->getThis()->getVMClass()->classof(ctx));
-    TRACE(2, "OutThisObject: derived from Class \"%s\"\n",
-          ctx->name()->data());
-    return RuntimeType(KindOfObject, KindOfNone, ctx);
-  }
-  return RuntimeType(KindOfObject, KindOfNone);
-}
-
-bool Translator::liveFrameIsPseudoMain() {
-  ActRec* ar = (ActRec*)vmfp();
-  return ar->hasVarEnv() && ar->getVarEnv()->isGlobalScope();
-}
-
-static int64_t typeToMask(DataType t) {
-  return (t == KindOfAny) ? 1 : (1 << (1 + getDataTypeIndex(t)));
-}
-
-struct InferenceRule {
-  int64_t mask;
-  DataType result;
-};
-
-static DataType inferType(const InferenceRule* rules,
-                          const std::vector<DynLocation*>& inputs) {
-  int inputMask = 0;
-  // We generate the inputMask by ORing together the mask for each input's
-  // type.
-  for (unsigned int i = 0; i < inputs.size(); ++i) {
-    DataType inType = inputs[i]->rtt.valueType();
-    inputMask |= typeToMask(inType);
-  }
-  // This loop checks each rule in order, looking for the first rule that
-  // applies. Note that we assume there's a "catch-all" at the end.
-  for (unsigned int i = 0; ; ++i) {
-    if (rules[i].mask == 0 || (rules[i].mask & inputMask) != 0) {
-      return rules[i].result;
-    }
-  }
-  // We return KindOfAny by default if none of the rules applied.
-  return KindOfAny;
-}
-
-/*
- * Inference rules used for OutArith. These are applied in order
- * row-by-row.
- */
-
-#define TYPE_MASK(name) \
-  static const int64_t name ## Mask = typeToMask(KindOf ## name);
-TYPE_MASK(Any);
-TYPE_MASK(Uninit);
-TYPE_MASK(Null);
-TYPE_MASK(Boolean);
-static const int64_t IntMask = typeToMask(KindOfInt64);
-TYPE_MASK(Double);
-static const int64_t StringMask = typeToMask(KindOfString) |
-                                typeToMask(KindOfStaticString);
-TYPE_MASK(Array);
-TYPE_MASK(Object);
-
-static const InferenceRule ArithRules[] = {
-  { DoubleMask, KindOfDouble },
-  { ArrayMask, KindOfArray },
-  // If one of the inputs is known to be a String or if one of the input
-  // types is unknown, the output type is Unknown
-  { StringMask | AnyMask, KindOfAny },
-  // Default to Int64
-  { 0, KindOfInt64 },
-};
-
-static const InferenceRule ArithORules[] = {
-  // Same rules as ArithRules, but default to KindOfAny
-  { DoubleMask, KindOfDouble },
-  { ArrayMask, KindOfArray },
-  { StringMask | AnyMask, KindOfAny },
-  { 0, KindOfAny },
-};
-
-/**
- * Returns the type of the output of a bitwise operator on the two
- * DynLocs. The only case that doesn't result in KindOfInt64 is String
- * op String.
- */
-static const InferenceRule BitOpRules[] = {
-  { UninitMask | NullMask | BooleanMask |
-    IntMask | DoubleMask | ArrayMask | ObjectMask,
-    KindOfInt64 },
-  { StringMask, KindOfString },
-  { 0, KindOfAny },
-};
-
-static RuntimeType bitOpType(DynLocation* a, DynLocation* b) {
-  std::vector<DynLocation*> ins;
-  ins.push_back(a);
-  if (b) ins.push_back(b);
-  return RuntimeType(inferType(BitOpRules, ins));
-}
-
-static uint32_t m_w = 1;    /* must not be zero */
-static uint32_t m_z = 1;    /* must not be zero */
-
-static uint32_t get_random()
-{
-    m_z = 36969 * (m_z & 65535) + (m_z >> 16);
-    m_w = 18000 * (m_w & 65535) + (m_w >> 16);
-    return (m_z << 16) + m_w;  /* 32-bit result */
-}
-
-static const int kTooPolyRet = 6;
-
-bool
-isNormalPropertyAccess(const NormalizedInstruction& i,
-                       int propInput,
-                       int objInput) {
-  const LocationCode lcode = i.immVec.locationCode();
-  return
-    i.immVecM.size() == 1 &&
-    (lcode == LC || lcode == LL || lcode == LR || lcode == LH) &&
-    mcodeIsProp(i.immVecM[0]) &&
-    i.inputs[propInput]->isString() &&
-    i.inputs[objInput]->valueType() == KindOfObject;
-}
-
 PropInfo getPropertyOffset(const NormalizedInstruction& ni,
-                           Class* ctx,
-                           const Class*& baseClass,
+                           const Class* ctx, const Class*& baseClass,
                            const MInstrInfo& mii,
                            unsigned mInd, unsigned iInd) {
   if (mInd == 0) {
     auto const baseIndex = mii.valCount();
-    baseClass = ni.inputs[baseIndex]->rtt.isObject()
-      ? ni.inputs[baseIndex]->rtt.valueClass()
+    baseClass = ni.inputs[baseIndex]->rtt < Type::Obj
+      ? ni.inputs[baseIndex]->rtt.getClass()
       : nullptr;
-  } else {
-    baseClass = ni.immVecClasses[mInd - 1];
   }
   if (!baseClass) return PropInfo();
 
-  if (!ni.inputs[iInd]->rtt.isString()) {
-    return PropInfo();
-  }
-  auto* const name = ni.inputs[iInd]->rtt.valueString();
-  if (!name) return PropInfo();
+  auto keyType = ni.inputs[iInd]->rtt;
+  if (!keyType.isConst(Type::Str)) return PropInfo();
+  auto const name = keyType.strVal();
 
-  bool accessible;
   // If we are not in repo-authoriative mode, we need to check that
   // baseClass cannot change in between requests
   if (!RuntimeOption::RepoAuthoritative ||
@@ -429,15 +117,16 @@ PropInfo getPropertyOffset(const NormalizedInstruction& ni,
     }
   }
   // Lookup the index of the property based on ctx and baseClass
-  Slot idx = baseClass->getDeclPropIndex(ctx, name, accessible);
-  // If we couldn't find a property that is accessible in the current
-  // context, bail out
-  if (idx == kInvalidSlot || !accessible) {
-    return PropInfo();
-  }
-  // If it's a declared property we're good to go: even if a subclass
-  // redefines an accessible property with the same name it's guaranteed
-  // to be at the same offset
+  auto const lookup = baseClass->getDeclPropIndex(ctx, name);
+  auto const idx = lookup.prop;
+
+  // If we couldn't find a property that is accessible in the current context,
+  // bail out
+  if (idx == kInvalidSlot || !lookup.accessible) return PropInfo();
+
+  // If it's a declared property we're good to go: even if a subclass redefines
+  // an accessible property with the same name it's guaranteed to be at the same
+  // offset.
   return PropInfo(
     baseClass->declPropOffset(idx),
     baseClass->declPropRepoAuthType(idx)
@@ -445,523 +134,15 @@ PropInfo getPropertyOffset(const NormalizedInstruction& ni,
 }
 
 PropInfo getFinalPropertyOffset(const NormalizedInstruction& ni,
-                                Class* context,
-                                const MInstrInfo& mii) {
+                                Class* ctx, const MInstrInfo& mii) {
   unsigned mInd = ni.immVecM.size() - 1;
   unsigned iInd = mii.valCount() + 1 + mInd;
 
   const Class* cls = nullptr;
-  return getPropertyOffset(ni, context, cls, mii, mInd, iInd);
+  return getPropertyOffset(ni, ctx, cls, mii, mInd, iInd);
 }
 
-static folly::Optional<DataType>
-predictionForRepoAuthType(RepoAuthType repoTy) {
-  using T = RepoAuthType::Tag;
-  switch (repoTy.tag()) {
-  case T::OptBool:  return KindOfBoolean;
-  case T::OptInt:   return KindOfInt64;
-  case T::OptDbl:   return KindOfDouble;
-  case T::OptRes:   return KindOfResource;
-
-  case T::OptSArr:
-  case T::OptArr:
-    return KindOfArray;
-
-  case T::OptStr:
-  case T::OptSStr:
-    return KindOfString;
-
-  case T::OptSubObj:
-  case T::OptExactObj:
-  case T::OptObj:
-    return KindOfObject;
-
-  case T::Bool:
-  case T::Uninit:
-  case T::InitNull:
-  case T::Int:
-  case T::Dbl:
-  case T::Res:
-  case T::Str:
-  case T::Arr:
-  case T::Obj:
-  case T::Null:
-  case T::SStr:
-  case T::SArr:
-  case T::SubObj:
-  case T::ExactObj:
-  case T::Cell:
-  case T::Ref:
-  case T::InitUnc:
-  case T::Unc:
-  case T::InitCell:
-  case T::InitGen:
-  case T::Gen:
-    return folly::none;
-  }
-  not_reached();
-}
-
-static std::pair<DataType,double>
-predictMVec(const NormalizedInstruction* ni) {
-  auto info = getFinalPropertyOffset(*ni,
-                                     ni->func()->cls(),
-                                     getMInstrInfo(ni->mInstrOp()));
-  if (info.offset != -1) {
-    auto const predTy = predictionForRepoAuthType(info.repoAuthType);
-    if (predTy) {
-      FTRACE(1, "prediction for CGetM prop: {}, hphpc\n",
-        static_cast<int>(*predTy));
-      return std::make_pair(*predTy, 1.0);
-    }
-    // If the RepoAuthType converts to an exact data type, there's no
-    // point in having a prediction because we know its type with 100%
-    // accuracy.  Disable it in that case here.
-    if (convertToDataType(info.repoAuthType)) {
-      return std::make_pair(KindOfAny, 0.0);
-    }
-  }
-
-  auto& immVec = ni->immVec;
-  StringData* name;
-  MemberCode mc;
-  if (immVec.decodeLastMember(ni->m_unit, name, mc)) {
-    auto pred = predictType(TypeProfileKey(mc, name));
-    TRACE(1, "prediction for CGetM %s named %s: %d, %f\n",
-          mc == MET ? "elt" : "prop",
-          name->data(),
-          pred.first,
-          pred.second);
-    return pred;
-  }
-
-  return std::make_pair(KindOfAny, 0.0);
-}
-
-/*
- * predictOutputs --
- *
- *   Provide a best guess for the output type of this instruction.
- */
-static DataType
-predictOutputs(const NormalizedInstruction* ni) {
-  if (!RuntimeOption::EvalJitTypePrediction) return KindOfAny;
-
-  if (RuntimeOption::EvalJitStressTypePredPercent &&
-      RuntimeOption::EvalJitStressTypePredPercent > int(get_random() % 100)) {
-    int dt;
-    while (true) {
-      dt = get_random() % (KindOfRef + 1);
-      switch (dt) {
-        case KindOfNull:
-        case KindOfBoolean:
-        case KindOfInt64:
-        case KindOfDouble:
-        case KindOfString:
-        case KindOfArray:
-        case KindOfObject:
-        case KindOfResource:
-          break;
-        // KindOfRef and KindOfUninit can't happen for lots of predicted
-        // types.
-        case KindOfRef:
-        case KindOfUninit:
-        default:
-          continue;
-      }
-      break;
-    }
-    return DataType(dt);
-  }
-
-  if (ni->op() == OpCns ||
-      ni->op() == OpCnsE ||
-      ni->op() == OpCnsU) {
-    StringData* sd = ni->m_unit->lookupLitstrId(ni->imm[0].u_SA);
-    auto const tv = Unit::lookupCns(sd);
-    if (tv) return tv->m_type;
-  }
-
-  if (ni->op() == OpMod) {
-    // x % 0 returns boolean false, so we don't know for certain, but it's
-    // probably an int.
-    return KindOfInt64;
-  }
-
-  if (ni->op() == OpSqrt) {
-    // sqrt returns a double, unless you pass something nasty to it.
-    return KindOfDouble;
-  }
-
-  if (ni->op() == OpDiv) {
-    // Integers can produce integers if there's no residue, but $i / $j in
-    // general produces a double. $i / 0 produces boolean false, so we have
-    // actually check the result.
-    auto lhs = ni->inputs[0];
-    auto rhs = ni->inputs[1];
-
-    if (lhs->valueType() == KindOfDouble || rhs->valueType() == KindOfDouble) {
-      return KindOfDouble;
-    }
-
-    if (rhs->isLiteral()) {
-      if (ni->imm[1].u_I64A == 0) return KindOfBoolean;
-      if (ni->imm[1].u_I64A == 1) return lhs->valueType();
-
-      if (rhs->isLiteral()) {
-        return ni->imm[0].u_I64A % ni->imm[1].u_I64A ? KindOfDouble
-                                                     : KindOfInt64;
-      }
-    }
-
-    return KindOfDouble;
-  }
-
-  if (ni->op() == OpAbs) {
-    if (ni->inputs[0]->valueType() == KindOfDouble) {
-      return KindOfDouble;
-    }
-
-    // some types can't be converted to integers and will return false here
-    if (ni->inputs[0]->valueType() == KindOfArray) {
-      return KindOfBoolean;
-    }
-
-    // If the type is not numeric we need to convert it to a numeric type,
-    // a string can be converted to an Int64 or a Double but most other types
-    // will end up being integral.
-    return KindOfInt64;
-  }
-
-  if (ni->op() == OpClsCnsD) {
-    const NamedEntityPair& cne =
-      ni->unit()->lookupNamedEntityPairId(ni->imm[1].u_SA);
-    StringData* cnsName = ni->m_unit->lookupLitstrId(ni->imm[0].u_SA);
-    Class* cls = cne.second->getCachedClass();
-    if (cls) {
-      DataType dt = cls->clsCnsType(cnsName);
-      if (dt != KindOfUninit) {
-        TRACE(1, "clscnsd: %s:%s prediction type %d\n",
-              cne.first->data(), cnsName->data(), dt);
-        return dt;
-      }
-    }
-  }
-
-  if (ni->op() == OpSetM) {
-    /*
-     * SetM pushes null for certain rare combinations of input types, a string
-     * if the base was a string, or (most commonly) its first stack input. We
-     * mark the output as predicted here and do a very rough approximation of
-     * what really happens; most of the time the prediction will be a noop
-     * since MInstrTranslator side exits in all uncommon cases.
-     */
-
-    auto const inDt = ni->inputs[0]->rtt.valueType();
-    // If the base is a string, the output is probably a string. Unless the
-    // member code is MW, then we're either going to fatal or promote the
-    // string to an array.
-    Type baseType;
-    switch (ni->immVec.locationCode()) {
-      case LGL: case LGC:
-      case LNL: case LNC:
-      case LSL: case LSC:
-        baseType = Type::Gen;
-        break;
-
-      default:
-        baseType = Type(ni->inputs[1]->rtt);
-    }
-    if (baseType <= Type::Str && ni->immVecM.size() == 1) {
-      return ni->immVecM[0] == MW ? inDt : KindOfString;
-    }
-
-    // Otherwise, it's probably the input type.
-    return inDt;
-  }
-
-  auto const op = ni->op();
-  static const double kAccept = 1.0;
-  std::pair<DataType, double> pred = std::make_pair(KindOfAny, 0.0);
-  if (op == OpCGetS) {
-    const StringData* propName = ni->inputs[1]->rtt.valueStringOrNull();
-    if (propName) {
-      pred = predictType(TypeProfileKey(TypeProfileKey::StaticPropName,
-                                        propName));
-      TRACE(1, "prediction for static fields named %s: %d, %f\n",
-            propName->data(),
-            pred.first,
-            pred.second);
-    }
-  } else if (op == OpCGetM) {
-    pred = predictMVec(ni);
-  }
-  if (pred.second < kAccept) {
-    if (const StringData* invName = fcallToFuncName(ni)) {
-      pred = predictType(TypeProfileKey(TypeProfileKey::MethodName, invName));
-      FTRACE(1, "prediction for methods named {}: {}, {:.2}\n",
-             invName->data(),
-             pred.first,
-             pred.second);
-    }
-  }
-  if (pred.second >= kAccept) {
-    FTRACE(1, "accepting prediction of type {}\n", pred.first);
-    assert(pred.first != KindOfUninit);
-    return pred.first;
-  }
-  return KindOfAny;
-}
-
-/**
- * Returns the type of the value a SetOpL will store into the local.
- */
-static RuntimeType setOpOutputType(NormalizedInstruction* ni,
-                                   const std::vector<DynLocation*>& inputs) {
-  assert(inputs.size() == 2);
-  const int kValIdx = 0;
-  const int kLocIdx = 1;
-  auto const op = static_cast<SetOpOp>(ni->imm[1].u_OA);
-  DynLocation locLocation(inputs[kLocIdx]->location,
-                          inputs[kLocIdx]->rtt.unbox());
-  assert(inputs[kLocIdx]->location.isLocal());
-  bool isOverflow = true;
-
-  switch (op) {
-  case SetOpOp::PlusEqual:
-  case SetOpOp::MinusEqual:
-  case SetOpOp::MulEqual: {
-    isOverflow = false;
-    // fallthrough
-  }
-  case SetOpOp::PlusEqualO:
-  case SetOpOp::MinusEqualO:
-  case SetOpOp::MulEqualO: {
-    // Same as OutArith[O], except we have to fiddle with inputs a bit.
-    std::vector<DynLocation*> arithInputs;
-    arithInputs.push_back(&locLocation);
-    arithInputs.push_back(inputs[kValIdx]);
-    auto rules = isOverflow ? ArithORules : ArithRules;
-    return RuntimeType(inferType(rules, arithInputs));
-  }
-  case SetOpOp::ConcatEqual: return RuntimeType(KindOfString);
-  case SetOpOp::DivEqual:
-  case SetOpOp::ModEqual:    return RuntimeType(KindOfAny);
-  case SetOpOp::AndEqual:
-  case SetOpOp::OrEqual:
-  case SetOpOp::XorEqual:    return bitOpType(&locLocation, inputs[kValIdx]);
-  case SetOpOp::SlEqual:
-  case SetOpOp::SrEqual:     return RuntimeType(KindOfInt64);
-  }
-  not_reached();
-}
-
-static RuntimeType
-getDynLocType(const SrcKey startSk,
-              NormalizedInstruction* ni,
-              InstrFlags::OutTypeConstraints constraint,
-              TransKind mode) {
-  using namespace InstrFlags;
-  auto const& inputs = ni->inputs;
-  assert(constraint != OutFInputL);
-
-  switch (constraint) {
-#define CS(OutXLike, KindOfX) \
-    case OutXLike:            \
-      return RuntimeType(KindOfX);
-    CS(OutInt64,       KindOfInt64);
-    CS(OutBoolean,     KindOfBoolean);
-    CS(OutDouble,      KindOfDouble);
-    CS(OutString,      KindOfString);
-    CS(OutNull,        KindOfNull);
-    CS(OutUnknown,     KindOfAny); // Subtle interaction with BB-breaking.
-    CS(OutFDesc,       KindOfAny); // Unclear if OutFDesc has a purpose.
-    CS(OutArray,       KindOfArray);
-    CS(OutObject,      KindOfObject);
-    CS(OutResource,    KindOfResource);
-#undef CS
-
-    case OutCns: {
-      // If it's a system constant, burn in its type. Otherwise we have
-      // to accept prediction; use the translation-time value, or fall back
-      // to the targetcache if none exists.
-      StringData* sd = ni->m_unit->lookupLitstrId(ni->imm[0].u_SA);
-      assert(sd);
-      const TypedValue* tv = Unit::lookupPersistentCns(sd);
-      // KindOfUninit means this is a dynamic system constant so we don't know
-      // the type. <img src="clowntown.jpg">
-      if (tv && tv->m_type != KindOfUninit) {
-        return RuntimeType(tv->m_type);
-      }
-    } // Fall through
-    case OutPred: {
-      // In TransProfile mode, disable type prediction to avoid side exits.
-      auto dt = mode == TransProfile ? KindOfAny : predictOutputs(ni);
-      if (dt != KindOfAny) ni->outputPredicted = true;
-      return RuntimeType(dt, dt == KindOfRef ? KindOfAny : KindOfNone);
-    }
-
-    case OutClassRef: {
-      Op op = Op(ni->op());
-      if ((op == OpAGetC && inputs[0]->isString())) {
-        const StringData* sd = inputs[0]->rtt.valueString();
-        if (sd) {
-          Class *klass = Unit::lookupUniqueClass(sd);
-          TRACE(3, "KindOfClass: derived class \"%s\" from string literal\n",
-                klass ? klass->preClass()->name()->data() : "NULL");
-          return RuntimeType(klass);
-        }
-      } else if (op == OpSelf) {
-        return RuntimeType(liveClass());
-      } else if (op == OpParent) {
-        Class* clss = liveClass();
-        if (clss != nullptr)
-          return RuntimeType(clss->parent());
-      }
-      return RuntimeType(KindOfClass);
-    }
-
-    case OutNullUninit: {
-      assert(ni->op() == OpNullUninit);
-      return RuntimeType(KindOfUninit);
-    }
-
-    case OutStringImm: {
-      assert(ni->op() == OpString);
-      StringData* sd = ni->m_unit->lookupLitstrId(ni->imm[0].u_SA);
-      assert(sd);
-      return RuntimeType(sd);
-    }
-
-    case OutArrayImm: {
-      assert(ni->op() == OpArray);
-      ArrayData *ad = ni->m_unit->lookupArrayId(ni->imm[0].u_AA);
-      assert(ad);
-      return RuntimeType(ad);
-    }
-
-    case OutBooleanImm: {
-      assert(ni->op() == OpTrue || ni->op() == OpFalse);
-      return RuntimeType(ni->op() == OpTrue);
-    }
-
-    case OutThisObject: {
-      return Translator::outThisObjectType();
-    }
-
-    case OutVUnknown: {
-      return RuntimeType(KindOfRef, KindOfAny);
-    }
-
-    case OutArith: {
-      return RuntimeType(inferType(ArithRules, inputs));
-    }
-    case OutArithO: {
-      return RuntimeType(inferType(ArithORules, inputs));
-    }
-
-    case OutSameAsInput: {
-      /*
-       * Relies closely on the order that inputs are pushed in
-       * getInputs().  (Pushing top of stack first for multi-stack
-       * consumers, stack elements before M-vectors and locals, etc.)
-       */
-      assert(inputs.size() >= 1);
-      auto op = ni->op();
-      ASSERT_NOT_IMPLEMENTED(
-        // Sets and binds that take multiple arguments have the rhs
-        // pushed first.  In the case of the M-vector versions, the
-        // rhs comes before the M-vector elements.
-        op == OpSetL  || op == OpSetN  || op == OpSetG  || op == OpSetS  ||
-        op == OpBindL || op == OpBindG || op == OpBindS || op == OpBindN ||
-        op == OpBindM || op == OpVerifyRetTypeV || op == OpVerifyRetTypeC ||
-        // Dup takes a single element.
-        op == OpDup
-      );
-
-      const int idx = 0; // all currently supported cases.
-
-      if (debug) {
-        if (!inputs[idx]->rtt.isVagueValue()) {
-          if (op == OpBindG || op == OpBindN || op == OpBindS ||
-              op == OpBindM || op == OpBindL || op == OpVerifyRetTypeV) {
-            assert(inputs[idx]->rtt.isRef() && !inputs[idx]->isLocal());
-          } else {
-            assert(inputs[idx]->rtt.valueType() ==
-                   inputs[idx]->rtt.outerType());
-          }
-        }
-      }
-      return inputs[idx]->rtt;
-    }
-
-    case OutCInputL: {
-      assert(inputs.size() >= 1);
-      const DynLocation* in = inputs[inputs.size() - 1];
-      RuntimeType retval;
-      if (in->rtt.outerType() == KindOfUninit) {
-        // Locals can be KindOfUninit, so we need to convert
-        // this to KindOfNull
-        retval = RuntimeType(KindOfNull);
-      } else {
-        retval = in->rtt.unbox();
-      }
-      TRACE(2, "Input (%d, %d) -> (%d, %d)\n",
-            in->rtt.outerType(), in->rtt.innerType(),
-            retval.outerType(), retval.innerType());
-      return retval;
-    }
-
-    case OutIncDec: {
-      const RuntimeType &inRtt = ni->inputs[0]->rtt;
-      // TODO: instead of KindOfAny this should track the actual
-      // type we will get from interping a non-int IncDec.
-      return RuntimeType(IS_INT_TYPE(inRtt.valueType()) ?
-                         KindOfInt64 : KindOfAny);
-    }
-
-    case OutStrlen: {
-      auto const& rtt = ni->inputs[0]->rtt;
-      return RuntimeType(rtt.isString() ? KindOfInt64 : KindOfAny);
-    }
-
-    case OutCInput: {
-      assert(inputs.size() >= 1);
-      const DynLocation* in = inputs[inputs.size() - 1];
-      if (in->rtt.outerType() == KindOfRef) {
-        return in->rtt.unbox();
-      }
-      return in->rtt;
-    }
-
-    case OutBitOp: {
-      assert(inputs.size() == 2 ||
-             (inputs.size() == 1 && ni->op() == OpBitNot));
-      if (inputs.size() == 2) {
-        return bitOpType(inputs[0], inputs[1]);
-      } else {
-        return bitOpType(inputs[0], nullptr);
-      }
-    }
-
-    case OutSetOp: {
-      return setOpOutputType(ni, inputs);
-    }
-
-    case OutVInput:
-    case OutVInputL:
-    case OutFInputL:
-    case OutFInputR:
-    case OutAsyncAwait:
-      return RuntimeType(KindOfAny);
-
-    case OutFPushCufSafe:
-      not_reached();
-
-    case OutNone: not_reached();
-  }
-  always_assert(false && "Invalid output type constraint");
-}
+///////////////////////////////////////////////////////////////////////////////
 
 /*
  * NB: this opcode structure is sparse; it cannot just be indexed by
@@ -978,7 +159,6 @@ static const struct {
 
   /*** 1. Basic instructions ***/
 
-  { OpNop,         {None,             None,         OutNone,           0 }},
   { OpPopA,        {Stack1,           None,         OutNone,          -1 }},
   { OpPopC,        {Stack1|
                     DontGuardStack1,  None,         OutNone,          -1 }},
@@ -992,9 +172,7 @@ static const struct {
   { OpBox,         {Stack1,           Stack1,       OutVInput,         0 }},
   { OpUnbox,       {Stack1,           Stack1,       OutCInput,         0 }},
   { OpBoxR,        {Stack1,           Stack1,       OutVInput,         0 }},
-  { OpBoxRNop,     {None,             None,         OutNone,           0 }},
   { OpUnboxR,      {Stack1,           Stack1,       OutCInput,         0 }},
-  { OpUnboxRNop,   {None,             None,         OutNone,           0 }},
 
   /*** 2. Literal and constant instructions ***/
 
@@ -1007,6 +185,11 @@ static const struct {
   { OpString,      {None,             Stack1,       OutStringImm,      1 }},
   { OpArray,       {None,             Stack1,       OutArrayImm,       1 }},
   { OpNewArray,    {None,             Stack1,       OutArray,          1 }},
+  { OpNewMixedArray,  {None,          Stack1,       OutArray,          1 }},
+  { OpNewVArray,   {None,             Stack1,       OutArray,          1 }},
+  { OpNewMIArray,  {None,             Stack1,       OutArray,          1 }},
+  { OpNewMSArray,  {None,             Stack1,       OutArray,          1 }},
+  { OpNewLikeArrayL,  {None,          Stack1,       OutArray,          1 }},
   { OpNewPackedArray, {StackN,        Stack1,       OutArray,          0 }},
   { OpNewStructArray, {StackN,        Stack1,       OutArray,          0 }},
   { OpAddElemC,    {StackTop3,        Stack1,       OutArray,         -2 }},
@@ -1020,7 +203,7 @@ static const struct {
   { OpCnsE,        {None,             Stack1,       OutCns,            1 }},
   { OpCnsU,        {None,             Stack1,       OutCns,            1 }},
   { OpClsCns,      {Stack1,           Stack1,       OutUnknown,        0 }},
-  { OpClsCnsD,     {None,             Stack1,       OutPred,           1 }},
+  { OpClsCnsD,     {None,             Stack1,       OutUnknown,           1 }},
   { OpFile,        {None,             Stack1,       OutString,         1 }},
   { OpDir,         {None,             Stack1,       OutString,         1 }},
   { OpNameA,       {Stack1,           Stack1,       OutString,         0 }},
@@ -1029,8 +212,8 @@ static const struct {
 
   /* Binary string */
   { OpConcat,      {StackTop2,        Stack1,       OutString,        -1 }},
+  { OpConcatN,     {StackN,           Stack1,       OutString,         0 }},
   /* Arithmetic ops */
-  { OpAbs,         {Stack1,           Stack1,       OutPred,           0 }},
   { OpAdd,         {StackTop2,        Stack1,       OutArith,         -1 }},
   { OpSub,         {StackTop2,        Stack1,       OutArith,         -1 }},
   { OpMul,         {StackTop2,        Stack1,       OutArith,         -1 }},
@@ -1039,9 +222,9 @@ static const struct {
   { OpSubO,        {StackTop2,        Stack1,       OutArithO,        -1 }},
   { OpMulO,        {StackTop2,        Stack1,       OutArithO,        -1 }},
   /* Div and mod might return boolean false. Sigh. */
-  { OpDiv,         {StackTop2,        Stack1,       OutPred,          -1 }},
-  { OpMod,         {StackTop2,        Stack1,       OutPred,          -1 }},
-  { OpSqrt,        {Stack1,           Stack1,       OutPred,           0 }},
+  { OpDiv,         {StackTop2,        Stack1,       OutUnknown,       -1 }},
+  { OpMod,         {StackTop2,        Stack1,       OutUnknown,       -1 }},
+  { OpPow,         {StackTop2,        Stack1,       OutUnknown,       -1 }},
   /* Logical ops */
   { OpXor,         {StackTop2,        Stack1,       OutBoolean,       -1 }},
   { OpNot,         {Stack1,           Stack1,       OutBoolean,        0 }},
@@ -1068,7 +251,7 @@ static const struct {
   { OpCastArray,   {Stack1,           Stack1,       OutArray,          0 }},
   { OpCastObject,  {Stack1,           Stack1,       OutObject,         0 }},
   { OpInstanceOf,  {StackTop2,        Stack1,       OutBoolean,       -1 }},
-  { OpInstanceOfD, {Stack1,           Stack1,       OutBoolean,        0 }},
+  { OpInstanceOfD, {Stack1,           Stack1,       OutPredBool,       0 }},
   { OpPrint,       {Stack1,           Stack1,       OutInt64,          0 }},
   { OpClone,       {Stack1,           Stack1,       OutObject,         0 }},
   { OpExit,        {Stack1,           Stack1,       OutNull,           0 }},
@@ -1104,8 +287,8 @@ static const struct {
   { OpPushL,       {Local,            Stack1|Local, OutCInputL,        1 }},
   { OpCGetN,       {Stack1,           Stack1,       OutUnknown,        0 }},
   { OpCGetG,       {Stack1,           Stack1,       OutUnknown,        0 }},
-  { OpCGetS,       {StackTop2,        Stack1,       OutPred,          -1 }},
-  { OpCGetM,       {MVector,          Stack1,       OutPred,           1 }},
+  { OpCGetS,       {StackTop2,        Stack1,       OutUnknown,       -1 }},
+  { OpCGetM,       {MVector,          Stack1,       OutUnknown,        1 }},
   { OpVGetL,       {Local,            Stack1|Local, OutVInputL,        1 }},
   { OpVGetN,       {Stack1,           Stack1|Local, OutVUnknown,       0 }},
   // TODO: In pseudo-main, the VGetG instruction invalidates what we know
@@ -1133,7 +316,7 @@ static const struct {
   { OpEmptyM,      {MVector,          Stack1,       OutBoolean,        1 }},
   { OpIsTypeC,     {Stack1|
                     DontGuardStack1,  Stack1,       OutBoolean,        0 }},
-  { OpIsTypeL,     {Local,            Stack1,       OutBoolean,        1 }},
+  { OpIsTypeL,     {Local,            Stack1,       OutIsTypeL,        1 }},
 
   /*** 7. Mutator instructions ***/
 
@@ -1141,7 +324,7 @@ static const struct {
   { OpSetN,        {StackTop2,        Stack1|Local, OutSameAsInput,   -1 }},
   { OpSetG,        {StackTop2,        Stack1,       OutSameAsInput,   -1 }},
   { OpSetS,        {StackTop3,        Stack1,       OutSameAsInput,   -2 }},
-  { OpSetM,        {MVector|Stack1,   Stack1|Local, OutPred,           0 }},
+  { OpSetM,        {MVector|Stack1,   Stack1|Local, OutUnknown,        0 }},
   { OpSetWithRefLM,{MVector|Local ,   Local,        OutNone,           0 }},
   { OpSetWithRefRM,{MVector|Stack1,   Local,        OutNone,          -1 }},
   { OpSetOpL,      {Stack1|Local,     Stack1|Local, OutSetOp,          0 }},
@@ -1201,10 +384,8 @@ static const struct {
   { OpFPushCufSafe,{StackTop2|DontGuardAny,
                                       StackTop2|FStack, OutFPushCufSafe,
                                                          kNumActRecCells }},
-  { OpFPassC,      {FuncdRef,         None,         OutSameAsInput,    0 }},
   { OpFPassCW,     {FuncdRef,         None,         OutSameAsInput,    0 }},
   { OpFPassCE,     {FuncdRef,         None,         OutSameAsInput,    0 }},
-  { OpFPassVNop,   {None,             None,         OutNone,           0 }},
   { OpFPassV,      {Stack1|FuncdRef,  Stack1,       OutUnknown,        0 }},
   { OpFPassR,      {Stack1|FuncdRef,  Stack1,       OutFInputR,        0 }},
   { OpFPassL,      {Local|FuncdRef,   Stack1,       OutFInputL,        1 }},
@@ -1217,12 +398,12 @@ static const struct {
    * FCall is special. Like the Ret* instructions, its manipulation of the
    * runtime stack are outside the boundaries of the tracelet abstraction.
    */
-  { OpFCall,       {FStack,           Stack1,       OutPred,           0 }},
-  { OpFCallD,      {FStack,           Stack1,       OutPred,           0 }},
-  { OpFCallArray,  {FStack,           Stack1,       OutPred,
+  { OpFCall,       {FStack,           Stack1,       OutUnknown,        0 }},
+  { OpFCallD,      {FStack,           Stack1,       OutUnknown,        0 }},
+  { OpFCallUnpack, {FStack,           Stack1,       OutUnknown,        0 }},
+  { OpFCallArray,  {FStack,           Stack1,       OutUnknown,
                                                    -(int)kNumActRecCells }},
-  // TODO: output type is known
-  { OpFCallBuiltin,{BStackN,          Stack1,       OutPred,          0 }},
+  { OpFCallBuiltin,{BStackN,          Stack1,       OutUnknown,        0 }},
   { OpCufSafeArray,{StackTop3|DontGuardAny,
                                       Stack1,       OutArray,         -2 }},
   { OpCufSafeReturn,{StackTop3|DontGuardAny,
@@ -1259,7 +440,6 @@ static const struct {
   { OpDefFunc,     {None,             None,         OutNone,           0 }},
   { OpDefTypeAlias,{None,             None,         OutNone,           0 }},
   { OpDefCls,      {None,             None,         OutNone,           0 }},
-  { OpNopDefCls,   {None,             None,         OutNone,           0 }},
   { OpDefCns,      {Stack1,           Stack1,       OutBoolean,        0 }},
 
   /*** 13. Miscellaneous instructions ***/
@@ -1280,10 +460,8 @@ static const struct {
                    {Stack1,           Stack1,       OutSameAsInput,    0 }},
   { OpVerifyRetTypeC,
                    {Stack1,           Stack1,       OutSameAsInput,    0 }},
-  { OpClassExists, {StackTop2,        Stack1,       OutBoolean,       -1 }},
-  { OpInterfaceExists,
+  { OpOODeclExists,
                    {StackTop2,        Stack1,       OutBoolean,       -1 }},
-  { OpTraitExists, {StackTop2,        Stack1,       OutBoolean,       -1 }},
   { OpSelf,        {None,             Stack1,       OutClassRef,       1 }},
   { OpParent,      {None,             Stack1,       OutClassRef,       1 }},
   { OpLateBoundCls,{None,             Stack1,       OutClassRef,       1 }},
@@ -1293,35 +471,30 @@ static const struct {
   { OpIncStat,     {None,             None,         OutNone,           0 }},
   { OpIdx,         {StackTop3,        Stack1,       OutUnknown,       -2 }},
   { OpArrayIdx,    {StackTop3,        Stack1,       OutUnknown,       -2 }},
-  { OpFloor,       {Stack1,           Stack1,       OutDouble,         0 }},
-  { OpCeil,        {Stack1,           Stack1,       OutDouble,         0 }},
   { OpCheckProp,   {None,             Stack1,       OutBoolean,        1 }},
   { OpInitProp,    {Stack1,           None,         OutNone,          -1 }},
-  { OpAssertTL,    {None,             None,         OutNone,           0 }},
-  { OpAssertTStk,  {None,             None,         OutNone,           0 }},
-  { OpAssertObjL,  {None,             None,         OutNone,           0 }},
-  { OpAssertObjStk,{None,             None,         OutNone,           0 }},
-  { OpPredictTL,   {None,             None,         OutNone,           0 }},
-  { OpPredictTStk, {None,             None,         OutNone,           0 }},
+  { OpSilence,     {Local|DontGuardAny,
+                                      Local,        OutNone,           0 }},
+  { OpAssertRATL,  {None,             None,         OutNone,           0 }},
+  { OpAssertRATStk,{None,             None,         OutNone,           0 }},
   { OpBreakTraceHint,{None,           None,         OutNone,           0 }},
+  { OpGetMemoKey,  {Stack1,           Stack1,       OutUnknown,        0 }},
 
-  /*** 14. Continuation instructions ***/
+  /*** 14. Generator instructions ***/
 
   { OpCreateCont,  {None,             Stack1,       OutNull,           1 }},
-  { OpContEnter,   {Stack1,           None,         OutNone,          -1 }},
-  { OpContRaise,   {Stack1,           None,         OutNone,          -1 }},
+  { OpContEnter,   {Stack1,           Stack1,       OutUnknown,        0 }},
+  { OpContRaise,   {Stack1,           Stack1,       OutUnknown,        0 }},
   { OpYield,       {Stack1,           Stack1,       OutUnknown,        0 }},
   { OpYieldK,      {StackTop2,        Stack1,       OutUnknown,       -1 }},
   { OpContCheck,   {None,             None,         OutNone,           0 }},
   { OpContValid,   {None,             Stack1,       OutBoolean,        1 }},
   { OpContKey,     {None,             Stack1,       OutUnknown,        1 }},
   { OpContCurrent, {None,             Stack1,       OutUnknown,        1 }},
-  { OpContStopped, {None,             None,         OutNone,           0 }},
 
   /*** 15. Async functions instructions ***/
 
-  { OpAsyncAwait,  {Stack1,           StackTop2,    OutAsyncAwait,     1 }},
-  { OpAsyncSuspend,{Stack1,           Stack1,       OutUnknown,        0 }},
+  { OpAwait,       {Stack1,           Stack1,       OutUnknown,        0 }},
 };
 
 static hphp_hash_map<Op, InstrInfo> instrInfo;
@@ -1387,8 +560,9 @@ int64_t getStackPopped(PC pc) {
     case Op::FCallD:       return getImm((Op*)pc, 0).u_IVA + kNumActRecCells;
     case Op::FCallArray:   return kNumActRecCells + 1;
 
-    case Op::FCallBuiltin:
     case Op::NewPackedArray:
+    case Op::ConcatN:
+    case Op::FCallBuiltin:
     case Op::CreateCl:     return getImm((Op*)pc, 0).u_IVA;
 
     case Op::NewStructArray: return getImmVector((Op*)pc).size();
@@ -1426,8 +600,9 @@ int getStackDelta(const NormalizedInstruction& ni) {
         return 1 - numArgs - kNumActRecCells;
       }
 
-    case Op::FCallBuiltin:
     case Op::NewPackedArray:
+    case Op::ConcatN:
+    case Op::FCallBuiltin:
     case Op::CreateCl:
       return 1 - ni.imm[0].u_IVA;
 
@@ -1446,95 +621,15 @@ int getStackDelta(const NormalizedInstruction& ni) {
   return delta;
 }
 
-static NormalizedInstruction* findInputSrc(NormalizedInstruction* ni,
-                                           DynLocation* dl) {
-  while (ni != nullptr) {
-    if (ni->outStack == dl ||
-        ni->outLocal == dl ||
-        ni->outLocal2 == dl ||
-        ni->outStack2 == dl ||
-        ni->outStack3 == dl) {
-      break;
-    }
-    ni = ni->prev;
-  }
-  return ni;
-}
-
-// Task #3449943: This returns true even if there's meta-data telling
-// that the value was inferred.
-bool outputIsPredicted(NormalizedInstruction& inst) {
-  auto const& iInfo = getInstrInfo(inst.op());
-  auto doPrediction =
-    (iInfo.type == OutPred || iInfo.type == OutCns) && !inst.breaksTracelet;
-  if (doPrediction) {
-    // All OutPred ops except for SetM have a single stack output for now.
-    assert(iInfo.out == Stack1 || inst.op() == OpSetM);
-    auto dt = predictOutputs(&inst);
-    if (dt != KindOfAny) {
-      inst.outPred = Type(dt, dt == KindOfRef ? KindOfAny : KindOfNone);
-      inst.outputPredicted = true;
-    } else {
-      doPrediction = false;
-    }
-  }
-
-  return doPrediction;
-}
-
-/*
- * For MetaData information that affects whether we want to even put a
- * value in the ni->inputs, we need to look at it before we call
- * getInputs(), so this is separate from applyInputMetaData.
- *
- * We also check GuardedThis here, since RetC is short-circuited in
- * applyInputMetaData.
- */
-void preInputApplyMetaData(Unit::MetaHandle metaHand,
-                           NormalizedInstruction* ni) {
-  if (!metaHand.findMeta(ni->unit(), ni->offset())) return;
-
-  Unit::MetaInfo info;
-  while (metaHand.nextArg(info)) {
-    switch (info.m_kind) {
-    case Unit::MetaInfo::Kind::GuardedThis:
-      ni->guardedThis = true;
-      break;
-    default:
-      break;
-    }
-  }
-}
-
-static bool isTypeAssert(Op op) {
-  return op == Op::AssertTL || op == Op::AssertTStk ||
-         op == Op::AssertObjL || op == Op::AssertObjStk;
-}
-
-static bool isNullableAssertObj(const NormalizedInstruction& i) {
-  if (i.op() != Op::AssertObjStk && i.op() != Op::AssertObjL) return false;
-  switch (static_cast<AssertObjOp>(i.imm[2].u_OA)) {
-  case AssertObjOp::Exact:
-  case AssertObjOp::Sub:
-    return false;
-  case AssertObjOp::OptExact:
-  case AssertObjOp::OptSub:
-    return true;
-  }
-  not_reached();
-}
-
-static bool isTypePredict(Op op) {
-  return op == Op::PredictTL || op == Op::PredictTStk;
-}
-
-static bool isAlwaysNop(Op op) {
-  if (isTypeAssert(op) || isTypePredict(op)) return true;
+bool isAlwaysNop(Op op) {
   switch (op) {
-  case Op::UnboxRNop:
   case Op::BoxRNop:
-  case Op::FPassVNop:
+  case Op::DefClsNop:
   case Op::FPassC:
+  case Op::FPassVNop:
+  case Op::Nop:
+  case Op::UnboxRNop:
+  case Op::RGetCNop:
     return true;
   case Op::VerifyRetTypeC:
   case Op::VerifyRetTypeV:
@@ -1542,391 +637,6 @@ static bool isAlwaysNop(Op op) {
   default:
     return false;
   }
-}
-
-void Translator::handleAssertionEffects(Tracelet& t,
-                                        const NormalizedInstruction& ni,
-                                        TraceletContext& tas,
-                                        int currentStackOffset) {
-  assert(isTypeAssert(ni.op()) || isTypePredict(ni.op()));
-
-  auto const loc = [&] {
-    switch (ni.op()) {
-    case Op::AssertTL:
-    case Op::AssertObjL:
-    case Op::PredictTL:
-      return Location(Location::Local, ni.imm[0].u_LA);
-    case Op::AssertTStk:
-    case Op::AssertObjStk:
-    case Op::PredictTStk:
-      return Location(Location::Stack,
-                      currentStackOffset - 1 - ni.imm[0].u_IVA);
-    default:
-      not_reached();
-    }
-  }();
-  if (loc.isInvalid()) return;
-
-  auto const assertTy = [&]() -> folly::Optional<RuntimeType> {
-    if (ni.op() == Op::AssertObjStk || ni.op() == Op::AssertObjL) {
-      /*
-       * Even though the class must be defined at the point of the
-       * AssertObj (unless it's optional), we might not have defined
-       * it yet in this tracelet, or it might not be unique.  For now
-       * just restrict this to unique classes (we could also check
-       * parent of current context).
-       *
-       * There's nothing we can do with the 'exact' bit right now,
-       * since neither analyze() nor the IR typesystem tracks that.
-       */
-      auto const cls = Unit::lookupUniqueClass(
-        ni.m_unit->lookupLitstrId(ni.imm[1].u_SA)
-      );
-      if (!cls || !(cls->attrs() & AttrUnique)) return folly::none;
-      return RuntimeType{KindOfObject, KindOfNone, cls};
-    }
-
-    switch (static_cast<AssertTOp>(ni.imm[1].u_OA)) {
-    case AssertTOp::Uninit:   return RuntimeType{KindOfUninit};
-    case AssertTOp::InitNull: return RuntimeType{KindOfNull};
-    case AssertTOp::Int:      return RuntimeType{KindOfInt64};
-    case AssertTOp::Dbl:      return RuntimeType{KindOfDouble};
-    case AssertTOp::Res:      return RuntimeType{KindOfResource};
-    case AssertTOp::Bool:     return RuntimeType{KindOfBoolean};
-    case AssertTOp::SStr:     return RuntimeType{KindOfString};
-    case AssertTOp::Str:      return RuntimeType{KindOfString};
-    case AssertTOp::SArr:     return RuntimeType{KindOfArray};
-    case AssertTOp::Arr:      return RuntimeType{KindOfArray};
-    case AssertTOp::Obj:      return RuntimeType{KindOfObject};
-
-    // We can turn these into information in hhbc-translator but can't
-    // really remove guards, since it can be more than one DataType,
-    // so don't do anything here.
-    case AssertTOp::OptInt:
-    case AssertTOp::OptDbl:
-    case AssertTOp::OptRes:
-    case AssertTOp::OptBool:
-    case AssertTOp::OptSStr:
-    case AssertTOp::OptStr:
-    case AssertTOp::OptSArr:
-    case AssertTOp::OptArr:
-    case AssertTOp::OptObj:
-    case AssertTOp::Null:    // could be KindOfUninit or KindOfNull
-      return folly::none;
-
-    case AssertTOp::Ref:
-      // We should be able to use this to avoid the outer-type guards
-      // on KindOfRefs, but for now we don't because of complications
-      // with communicating the predicted inner type to
-      // hhbc-translator.
-      return folly::none;
-
-    // There's really not much we can do with a Cell assertion at
-    // translation time, right now.
-    case AssertTOp::Cell:
-      return folly::none;
-
-    // Since these don't correspond to data types, there's not much we
-    // can do in the current situation.
-    case AssertTOp::InitUnc:
-    case AssertTOp::Unc:
-    case AssertTOp::InitCell:
-      // These could also remove guards, but it's a little too hard to
-      // get this information to hhbc-translator with this legacy
-      // tracelet stuff since they don't map directly to a DataType.
-      return folly::none;
-    }
-    not_reached();
-  }();
-  if (!assertTy) return;
-
-  FTRACE(1, "examining assertion for {}\n", loc.pretty());
-
-  /*
-   * Nullable object assertions are slightly special: we have extra
-   * information, but it's conditional on previously guarding that the
-   * object wasn't null.  And if it is null in this tracelet, the
-   * assertion should have no effects.
-   *
-   * We need to do a recordRead without setting dontGuard, so we'll
-   * still leave a guard.  (Guard relaxation will remove it if nothing
-   * ends up using it.)
-   *
-   * We also shouldn't try to remove predictions like the code below:
-   * a prediction guard might be the reason we know it's not null
-   * here.
-   */
-  if (isNullableAssertObj(ni)) {
-    auto const dl = tas.recordRead(InputInfo{loc});
-    if (dl->rtt.isNull()) {
-      FTRACE(1, "assertion leaving live KindOfNull alone for ?Obj type\n");
-      return;
-    }
-    if (!dl->isObject()) {
-      // We're about to fail a VerifyParamType or something similar.
-      FTRACE(1, "not adjusting {} since it's not an object\n",
-             dl->pretty());
-      return;
-    }
-    dl->rtt = *assertTy;
-    return;
-  }
-
-  InputInfo ii{loc};
-  ii.dontGuard = true;
-  auto const dl = tas.recordRead(ii, assertTy->outerType());
-
-  if (dl->rtt.outerType() != assertTy->outerType() &&
-      !(dl->rtt.isString() && assertTy->isString())) {
-    if (!dl->rtt.isVagueValue()) {
-      /*
-       * The live or tracked type disagrees with ahead of time analysis.
-       * A similar case occurs in applyInputMetaData.
-       *
-       * Either static analysis is wrong (bug), this was a mispredicted
-       * type from warmup profiling, or the code is unreachable because
-       * we're about to fatal earlier in this tracelet.  (e.g. a
-       * VerifyParamType is about to throw.)
-       */
-      if (tas.m_changeSet.count(dl->location)) {
-        auto const src = findInputSrc(tas.m_t->m_instrStream.last, dl);
-        if (src && src->outputPredicted) {
-          FTRACE(1, "correcting mispredicted type for {}\n", loc.pretty());
-          src->outputPredicted = false;
-          return;
-        }
-      }
-      FTRACE(1, "punting for {}\n", loc.pretty());
-      punt();
-    }
-  } else {
-    /*
-     * Static inference confirmed a type we already have, but if the
-     * type we have came from profiling we want to clear outputPredicted
-     * to avoid unnecessary guards.
-     */
-    if (tas.m_changeSet.count(dl->location)) {
-      auto const src = findInputSrc(tas.m_t->m_instrStream.last, dl);
-      if (src && src->outputPredicted) src->outputPredicted = false;
-    }
-  }
-
-  /*
-   * The valueClass fields we track on KindOfObject types basically
-   * all come from static analysis, but they can also come from being
-   * inside of an analyzeCallee situation and knowing more specific
-   * argument types.  It's also possible in principle for a tracelet
-   * to extend through a join point, and thereby propagate a better
-   * type than one of the type assertions we get from static analysis.
-   *
-   * So, sometimes we may know a more derived type here dynamically,
-   * in which case we don't want to modify the RuntimeType and make it
-   * worse.
-   */
-  auto const assertIsSpecializedObj =
-    assertTy->isObject() && assertTy->valueClass() != nullptr;
-  auto const liveIsSpecializedObj =
-    dl->rtt.isObject() && dl->rtt.valueClass() != nullptr;
-  if (assertIsSpecializedObj && liveIsSpecializedObj) {
-    auto const assertCls = assertTy->valueClass();
-    auto const liveCls = dl->rtt.valueClass();
-    if (assertCls != liveCls && !assertCls->classof(liveCls)) {
-      // liveCls must be more specialized than assertCls.
-      FTRACE(1, "assertion leaving curVal alone {}\n", loc.pretty());
-      return;
-    }
-  }
-
-  FTRACE(1, "assertion effects {} -> {}\n", loc.pretty(), assertTy->pretty());
-  dl->rtt = *assertTy;
-}
-
-bool Translator::applyInputMetaData(Unit::MetaHandle& metaHand,
-                                    NormalizedInstruction* ni,
-                                    TraceletContext& tas,
-                                    InputInfos &inputInfos) {
-  if (isAlwaysNop(ni->op())) {
-    ni->noOp = true;
-    return true;
-  }
-
-  if (!metaHand.findMeta(ni->unit(), ni->offset())) return false;
-
-  Unit::MetaInfo info;
-  if (!metaHand.nextArg(info)) return false;
-
-  /*
-   * We need to adjust the indexes in MetaInfo::m_arg if this
-   * instruction takes other stack arguments than those related to the
-   * MVector.  (For example, the rhs of an assignment.)
-   */
-  const InstrInfo& iInfo = instrInfo[ni->op()];
-  if (iInfo.in & AllLocals) {
-    /*
-     * RetC/RetV dont care about their stack input, but it may have
-     * been annotated. Skip it (because RetC/RetV pretend they dont
-     * have a stack input).
-     */
-    return false;
-  }
-  if (iInfo.in == FuncdRef) {
-    /*
-     * FPassC* pretend to have no inputs
-     */
-    return false;
-  }
-  const int base = !(iInfo.in & MVector) ? 0 :
-                   !(iInfo.in & Stack1) ? 0 :
-                   !(iInfo.in & Stack2) ? 1 :
-                   !(iInfo.in & Stack3) ? 2 : 3;
-
-  do {
-    SKTRACE(3, ni->source, "considering MetaInfo of kind %d\n", info.m_kind);
-
-    int arg = info.m_arg & Unit::MetaInfo::VectorArg ?
-      base + (info.m_arg & ~Unit::MetaInfo::VectorArg) : info.m_arg;
-
-    switch (info.m_kind) {
-      case Unit::MetaInfo::Kind::GuardedCls:
-        ni->guardedCls = true;
-        break;
-      case Unit::MetaInfo::Kind::DataTypePredicted: {
-        // In TransProfile mode, disable type predictions to avoid side exits.
-        if (m_mode == TransProfile) break;
-
-        // If the original type was invalid or predicted, then use the
-        // prediction in the meta-data.
-        assert((unsigned) arg < inputInfos.size());
-
-        SKTRACE(1, ni->source, "MetaInfo DataTypePredicted for input %d; "
-                "newType = %d\n", arg, DataType(info.m_data));
-        InputInfo& ii = inputInfos[arg];
-        DynLocation* dl = tas.recordRead(ii, KindOfAny);
-        NormalizedInstruction* src = findInputSrc(tas.m_t->m_instrStream.last,
-                                                  dl);
-        if (src) {
-          // Update the rtt and mark src's output as predicted if either:
-          //  a) we don't have type information yet (ie, it's KindOfAny), or
-          //  b) src's output was predicted. This is assuming that the
-          //     front-end's prediction is more accurate.
-          if (dl->rtt.outerType() == KindOfAny || src->outputPredicted) {
-            SKTRACE(1, ni->source, "MetaInfo DataTypePredicted for input %d; "
-                    "replacing oldType = %d with newType = %d\n", arg,
-                    dl->rtt.outerType(), DataType(info.m_data));
-            dl->rtt = RuntimeType((DataType)info.m_data);
-            src->outputPredicted = true;
-            src->outputPredictionStatic = true;
-          }
-        }
-        break;
-      }
-      case Unit::MetaInfo::Kind::DataTypeInferred: {
-        assert((unsigned)arg < inputInfos.size());
-        SKTRACE(1, ni->source, "MetaInfo DataTypeInferred for input %d; "
-                   "newType = %d\n", arg, DataType(info.m_data));
-        InputInfo& ii = inputInfos[arg];
-        ii.dontGuard = true;
-        DynLocation* dl = tas.recordRead(ii, (DataType)info.m_data);
-        if (dl->rtt.outerType() != info.m_data &&
-            (!dl->isString() || info.m_data != KindOfString)) {
-          if (dl->rtt.outerType() != KindOfAny) {
-            // Either static analysis is wrong, or
-            // this was mis-predicted by the type
-            // profiler, or this code is unreachable,
-            // and there's an earlier bytecode in the tracelet
-            // thats going to fatal
-            NormalizedInstruction *src = nullptr;
-            if (tas.m_changeSet.count(dl->location)) {
-              src = findInputSrc(tas.m_t->m_instrStream.last, dl);
-              if (src && src->outputPredicted) {
-                src->outputPredicted = false;
-              } else {
-                src = nullptr;
-              }
-            }
-            if (!src) {
-              // Not a type-profiler mis-predict
-              if (tas.m_t->m_instrStream.first) {
-                // We're not the first instruction, so punt
-                // If this bytecode /is/ reachable, we'll
-                // get here again, and that time, we will
-                // be the first instruction
-                punt();
-              }
-              not_reached();
-            }
-          }
-          dl->rtt = RuntimeType((DataType)info.m_data);
-          ni->markInputInferred(arg);
-        } else {
-          /*
-           * Static inference confirmed the expected type
-           * but if the expected type was provided by the type
-           * profiler we want to clear outputPredicted to
-           * avoid unneeded guards
-           */
-          if (tas.m_changeSet.count(dl->location)) {
-            NormalizedInstruction *src =
-              findInputSrc(tas.m_t->m_instrStream.last, dl);
-            if (src->outputPredicted) {
-              src->outputPredicted = false;
-              ni->markInputInferred(arg);
-            }
-          }
-        }
-        break;
-      }
-
-      case Unit::MetaInfo::Kind::Class: {
-        assert((unsigned)arg < inputInfos.size());
-        InputInfo& ii = inputInfos[arg];
-        DynLocation* dl = tas.recordRead(ii);
-        if (dl->rtt.valueType() != KindOfObject) {
-          continue;
-        }
-
-        const StringData* metaName = ni->unit()->lookupLitstrId(info.m_data);
-        const StringData* rttName =
-          dl->rtt.valueClass() ? dl->rtt.valueClass()->name() : nullptr;
-        // The two classes might not be exactly the same, which is ok
-        // as long as metaCls is more derived than rttCls.
-        Class* metaCls = Unit::lookupUniqueClass(metaName);
-        Class* rttCls = rttName ? Unit::lookupUniqueClass(rttName) : nullptr;
-        if (metaCls && rttCls && metaCls != rttCls &&
-            !metaCls->classof(rttCls)) {
-          // Runtime type is more derived
-          metaCls = 0;
-        }
-        if (metaCls && metaCls != rttCls) {
-          SKTRACE(1, ni->source, "replacing input %d with a MetaInfo-supplied "
-                  "class of %s; old type = %s\n",
-                  arg, metaName->data(), dl->pretty().c_str());
-          if (dl->rtt.isRef()) {
-            dl->rtt = RuntimeType(KindOfRef, KindOfObject, metaCls);
-          } else {
-            dl->rtt = RuntimeType(KindOfObject, KindOfNone, metaCls);
-          }
-        }
-        break;
-      }
-
-      case Unit::MetaInfo::Kind::MVecPropClass: {
-        const StringData* metaName = ni->unit()->lookupLitstrId(info.m_data);
-        Class* metaCls = Unit::lookupUniqueClass(metaName);
-        if (metaCls) {
-          ni->immVecClasses[arg] = metaCls;
-        }
-        break;
-      }
-
-      case Unit::MetaInfo::Kind::GuardedThis:
-        // fallthrough; these are handled in preInputApplyMetaData.
-      case Unit::MetaInfo::Kind::None:
-        break;
-    }
-  } while (metaHand.nextArg(info));
-
-  return false;
 }
 
 static void addMVectorInputs(NormalizedInstruction& ni,
@@ -1953,10 +663,6 @@ static void addMVectorInputs(NormalizedInstruction& ni,
   /*
    * Note that we have to push as we go so that the arguments come in
    * the order expected for the M-vector.
-   *
-   * Indexes into these argument lists must also be in the same order
-   * as the information in Unit::MetaInfo, because the analysis phase
-   * may replace some of them with literals.
    */
 
   /*
@@ -2029,25 +735,10 @@ static void addMVectorInputs(NormalizedInstruction& ni,
     push_stack();
   }
 
-  ni.immVecClasses.resize(ni.immVecM.size());
-
   assert(stackCount == ni.immVec.numStackValues());
 
   SKTRACE(2, ni.source, "M-vector using %d hidden stack "
                         "inputs, %d locals\n", stackCount, localCount);
-}
-
-void getInputs(SrcKey startSk, NormalizedInstruction& inst, InputInfos& infos,
-               const Func* func, const LocalTypeFn& localType) {
-  // MCGenerator expected top of stack to be index -1, with indexes growing
-  // down from there. hhir defines top of stack to be index 0, with indexes
-  // growing up from there. To compensate we start with a stack offset of 1 and
-  // negate the index of any stack input after the call to getInputs.
-  int stackOff = 1;
-  getInputsImpl(startSk, &inst, stackOff, infos, func, localType);
-  for (auto& info : infos) {
-    if (info.loc.isStack()) info.loc.offset = -info.loc.offset;
-  }
 }
 
 /*
@@ -2064,21 +755,21 @@ void getInputs(SrcKey startSk, NormalizedInstruction& inst, InputInfos& infos,
  *     Truncate the tracelet at the preceding instruction, which must
  *     exists because *something* modified something in it.
  */
-void getInputsImpl(SrcKey startSk,
-                   NormalizedInstruction* ni,
-                   int& currentStackOffset,
-                   InputInfos& inputs,
-                   const Func* func,
-                   const LocalTypeFn& localType) {
+static void getInputsImpl(SrcKey startSk,
+                          NormalizedInstruction* ni,
+                          int& currentStackOffset,
+                          InputInfoVec& inputs) {
 #ifdef USE_TRACE
-  const SrcKey& sk = ni->source;
+  auto sk = ni->source;
 #endif
+  if (isAlwaysNop(ni->op())) return;
+
   assert(inputs.empty());
-  if (debug && !instrInfo.count(ni->op())) {
-    fprintf(stderr, "Translator does not understand "
-      "instruction %s\n", opcodeToName(ni->op()));
-    assert(false);
-  }
+  always_assert_flog(
+    instrInfo.count(ni->op()),
+    "Invalid opcode in getInputsImpl: {}\n",
+    opcodeToName(ni->op())
+  );
   const InstrInfo& info = instrInfo[ni->op()];
   Operands input = info.in;
   if (input & FuncdRef) {
@@ -2106,10 +797,13 @@ void getInputsImpl(SrcKey startSk,
     }
   }
   if (input & StackN) {
-    int numArgs = ni->op() == OpNewPackedArray ? ni->imm[0].u_IVA :
-                  ni->immVec.numStackValues();
-    SKTRACE(1, sk, "getInputs: stackN %d %d\n", currentStackOffset - 1,
-            numArgs);
+    int numArgs = (ni->op() == Op::NewPackedArray ||
+                   ni->op() == Op::ConcatN)
+      ? ni->imm[0].u_IVA
+      : ni->immVec.numStackValues();
+
+    SKTRACE(1, sk, "getInputs: stackN %d %d\n",
+            currentStackOffset - 1, numArgs);
     for (int i = 0; i < numArgs; i++) {
       inputs.emplace_back(Location(Location::Stack, --currentStackOffset));
       inputs.back().dontGuard = true;
@@ -2148,32 +842,8 @@ void getInputsImpl(SrcKey startSk,
     inputs.emplace(insertAt, Location(Location::Local, loc));
   }
 
-  auto wantInlineReturn = [&] {
-    const int localCount = ni->func()->numLocals();
-    // Inline return causes us to guard this tracelet more precisely. If
-    // we're already chaining to get here, just do a generic return in the
-    // hopes of avoiding further specialization. The localCount constraint
-    // is an unfortunate consequence of the current generic machinery not
-    // working for 0 locals.
-    if (mcg->numTranslations(startSk) >= kTooPolyRet && localCount > 0) {
-      return false;
-    }
-    int numRefCounted = 0;
-    for (int i = 0; i < localCount; ++i) {
-      if (localType(i).maybeCounted()) {
-        numRefCounted++;
-      }
-    }
-    return numRefCounted <= RuntimeOption::EvalHHIRInliningMaxReturnDecRefs;
-  };
-
-  if ((input & AllLocals) && wantInlineReturn()) {
-    ni->inlineReturn = true;
+  if (input & AllLocals) {
     ni->ignoreInnerType = true;
-    int n = ni->func()->numLocals();
-    for (int i = 0; i < n; ++i) {
-      inputs.emplace_back(Location(Location::Local, i));
-    }
   }
 
   SKTRACE(1, sk, "stack args: virtual sfo now %d\n", currentStackOffset);
@@ -2190,1059 +860,313 @@ void getInputsImpl(SrcKey startSk,
   }
 }
 
+InputInfoVec getInputs(SrcKey startSk, NormalizedInstruction& inst) {
+  InputInfoVec infos;
+  // MCGenerator expected top of stack to be index -1, with indexes growing
+  // down from there. hhir defines top of stack to be index 0, with indexes
+  // growing up from there. To compensate we start with a stack offset of 1 and
+  // negate the index of any stack input after the call to getInputs.
+  int stackOff = 1;
+  getInputsImpl(startSk, &inst, stackOff, infos);
+  for (auto& info : infos) {
+    if (info.loc.isStack()) info.loc.offset = -info.loc.offset;
+  }
+  return infos;
+}
+
 bool dontGuardAnyInputs(Op op) {
   switch (op) {
-#define CASE(iNm) case Op ## iNm:
-#define NOOP(...)
-  INSTRS
-  PSEUDOINSTR_DISPATCH(NOOP)
+  case Op::IterBreak:
+  case Op::DecodeCufIter:
+  case Op::IterNext:
+  case Op::IterNextK:
+  case Op::WIterInit:
+  case Op::WIterInitK:
+  case Op::WIterNext:
+  case Op::WIterNextK:
+  case Op::MIterInit:
+  case Op::MIterInitK:
+  case Op::MIterNext:
+  case Op::MIterNextK:
+  case Op::IterInitK:
+  case Op::IterInit:
+  case Op::JmpZ:
+  case Op::JmpNZ:
+  case Op::Jmp:
+  case Op::JmpNS:
+  case Op::BindM:
+  case Op::CGetM:
+  case Op::EmptyM:
+  case Op::FPassM:
+  case Op::IncDecM:
+  case Op::IssetM:
+  case Op::SetM:
+  case Op::SetOpM:
+  case Op::SetWithRefLM:
+  case Op::SetWithRefRM:
+  case Op::UnsetM:
+  case Op::VGetM:
+  case Op::FCallArray:
+  case Op::FCall:
+  case Op::FCallD:
+  case Op::ClsCnsD:
+  case Op::FPassCW:
+  case Op::FPassCE:
+  case Op::FPassR:
+  case Op::FPassV:
+  case Op::FPassG:
+  case Op::FPassL:
+  case Op::FPassS:
+  case Op::FCallBuiltin:
+  case Op::NewStructArray:
+  case Op::Switch:
+  case Op::SSwitch:
+  case Op::Lt:
+  case Op::Lte:
+  case Op::Gt:
+  case Op::Gte:
+  case Op::SetOpL:
+  case Op::InitProp:
+  case Op::BreakTraceHint:
+  case Op::IsTypeL:
+  case Op::IsTypeC:
+  case Op::IncDecL:
+  case Op::DefCls:
+  case Op::FPushCuf:
+  case Op::FPushCufF:
+  case Op::FPushCufSafe:
+  case Op::IncStat:
+  case Op::Eq:
+  case Op::Neq:
+  case Op::AssertRATL:
+  case Op::AssertRATStk:
+  case Op::SetL:
+  case Op::BindL:
+  case Op::EmptyL:
+  case Op::CastBool:
+  case Op::Same:
+  case Op::NSame:
+  case Op::Yield:
+  case Op::YieldK:
+  case Op::ContEnter:
+  case Op::ContRaise:
+  case Op::CreateCont:
+  case Op::Await:
+  case Op::BitAnd:
+  case Op::BitOr:
+  case Op::BitXor:
+  case Op::Sub:
+  case Op::Mul:
+  case Op::SubO:
+  case Op::MulO:
+  case Op::Add:
+  case Op::AddO:
+  case Op::AGetC:
+  case Op::AGetL:
+  case Op::AKExists:
+  case Op::AddElemC:
+  case Op::AddNewElemC:
+  case Op::Array:
+  case Op::ArrayIdx:
+  case Op::BareThis:
+  case Op::BindG:
+  case Op::BindS:
+  case Op::BitNot:
+  case Op::CGetG:
+  case Op::CGetL:
+  case Op::CGetL2:
+  case Op::CGetS:
+  case Op::CIterFree:
+  case Op::CastArray:
+  case Op::CastDouble:
+  case Op::CastInt:
+  case Op::CastObject:
+  case Op::CastString:
+  case Op::CheckProp:
+  case Op::CheckThis:
+  case Op::Clone:
+  case Op::Cns:
+  case Op::CnsE:
+  case Op::CnsU:
+  case Op::ColAddElemC:
+  case Op::ColAddNewElemC:
+  case Op::ConcatN:
+  case Op::Concat:
+  case Op::ContCheck:
+  case Op::ContCurrent:
+  case Op::ContKey:
+  case Op::ContValid:
+  case Op::CreateCl:
+  case Op::DefCns:
+  case Op::DefFunc:
+  case Op::Dir:
+  case Op::Div:
+  case Op::Double:
+  case Op::Dup:
+  case Op::EmptyG:
+  case Op::EmptyS:
+  case Op::FPushClsMethodD:
+  case Op::FPushClsMethod:
+  case Op::FPushClsMethodF:
+  case Op::FPushCtor:
+  case Op::FPushCtorD:
+  case Op::FPushCufIter:
+  case Op::FPushFunc:
+  case Op::FPushFuncD:
+  case Op::FPushFuncU:
+  case Op::FPushObjMethodD:
+  case Op::False:
+  case Op::File:
+  case Op::GetMemoKey:
+  case Op::Idx:
+  case Op::InitThisLoc:
+  case Op::InstanceOf:
+  case Op::InstanceOfD:
+  case Op::Int:
+  case Op::IssetG:
+  case Op::IssetL:
+  case Op::IssetS:
+  case Op::IterFree:
+  case Op::LateBoundCls:
+  case Op::MIterFree:
+  case Op::Mod:
+  case Op::Pow:
+  case Op::NameA:
+  case Op::NativeImpl:
+  case Op::NewArray:
+  case Op::NewCol:
+  case Op::NewLikeArrayL:
+  case Op::NewMixedArray:
+  case Op::NewVArray:
+  case Op::NewMIArray:
+  case Op::NewMSArray:
+  case Op::NewPackedArray:
+  case Op::Not:
+  case Op::Null:
+  case Op::NullUninit:
+  case Op::OODeclExists:
+  case Op::Parent:
+  case Op::PopA:
+  case Op::PopC:
+  case Op::PopR:
+  case Op::PopV:
+  case Op::Print:
+  case Op::PushL:
+  case Op::RetC:
+  case Op::RetV:
+  case Op::Self:
+  case Op::SetG:
+  case Op::SetS:
+  case Op::Shl:
+  case Op::Shr:
+  case Op::Silence:
+  case Op::StaticLoc:
+  case Op::StaticLocInit:
+  case Op::String:
+  case Op::Strlen:
+  case Op::This:
+  case Op::True:
+  case Op::Unbox:
+  case Op::UnboxR:
+  case Op::UnsetL:
+  case Op::VGetG:
+  case Op::VGetL:
+  case Op::VGetS:
+  case Op::VerifyParamType:
+  case Op::VerifyRetTypeC:
+  case Op::VerifyRetTypeV:
+  case Op::Xor:
     return false;
 
-  default:
+  // These are instructions that are always interp-one'd, or are always no-ops.
+  case Op::LowInvalid:
+  case Op::Nop:
+  case Op::Box:
+  case Op::BoxR:
+  case Op::BoxRNop:
+  case Op::UnboxRNop:
+  case Op::RGetCNop:
+  case Op::AddElemV:
+  case Op::AddNewElemV:
+  case Op::ClsCns:
+  case Op::Exit:
+  case Op::Fatal:
+  case Op::Unwind:
+  case Op::Throw:
+  case Op::CGetL3:
+  case Op::CGetN:
+  case Op::VGetN:
+  case Op::IssetN:
+  case Op::EmptyN:
+  case Op::SetN:
+  case Op::SetOpN:
+  case Op::SetOpG:
+  case Op::SetOpS:
+  case Op::IncDecN:
+  case Op::IncDecG:
+  case Op::IncDecS:
+  case Op::BindN:
+  case Op::UnsetN:
+  case Op::UnsetG:
+  case Op::FPushObjMethod:
+  case Op::FPassC:
+  case Op::FPassVNop:
+  case Op::FPassN:
+  case Op::FCallUnpack:
+  case Op::CufSafeArray:
+  case Op::CufSafeReturn:
+  case Op::Incl:
+  case Op::InclOnce:
+  case Op::Req:
+  case Op::ReqOnce:
+  case Op::ReqDoc:
+  case Op::Eval:
+  case Op::DefClsNop:
+  case Op::DefTypeAlias:
+  case Op::Catch:
+  case Op::HighInvalid:
     return true;
   }
-#undef NOOP
-#undef CASE
-}
 
-bool outputDependsOnInput(const Op instr) {
-  switch (instrInfo[instr].type) {
-    case OutNull:
-    case OutNullUninit:
-    case OutString:
-    case OutStringImm:
-    case OutDouble:
-    case OutBoolean:
-    case OutBooleanImm:
-    case OutInt64:
-    case OutArray:
-    case OutArrayImm:
-    case OutObject:
-    case OutResource:
-    case OutThisObject:
-    case OutUnknown:
-    case OutVUnknown:
-    case OutClassRef:
-    case OutPred:
-    case OutCns:
-    case OutStrlen:
-    case OutNone:
-      return false;
-
-    case OutAsyncAwait:
-    case OutFDesc:
-    case OutSameAsInput:
-    case OutCInput:
-    case OutVInput:
-    case OutCInputL:
-    case OutVInputL:
-    case OutFInputL:
-    case OutFInputR:
-    case OutArith:
-    case OutArithO:
-    case OutBitOp:
-    case OutSetOp:
-    case OutIncDec:
-    case OutFPushCufSafe:
-      return true;
-  }
-  not_reached();
-}
-
-/*
- * getOutputs --
- *   Builds a vector describing this instruction's outputs. Also
- *   records any write to a value that *might* alias a local.
- *
- * Throws:
- *   TranslationFailedExc:
- *     Unimplemented functionality, probably an opcode.
- */
-void Translator::getOutputs(/*inout*/ Tracelet& t,
-                            /*inout*/ NormalizedInstruction* ni,
-                            /*inout*/ int& currentStackOffset,
-                            /*out*/   bool& varEnvTaint) {
-  varEnvTaint = false;
-
-  const std::vector<DynLocation*>& inputs = ni->inputs;
-  const Op op = ni->op();
-
-  initInstrInfo();
-  assert_not_implemented(instrInfo.find(op) != instrInfo.end());
-  const Operands outLocs = instrInfo[op].out;
-  const OutTypeConstraints typeInfo = instrInfo[op].type;
-
-  SKTRACE(1, ni->source, "output flavor %d\n", typeInfo);
-  if (typeInfo == OutFInputL || typeInfo == OutFInputR ||
-      typeInfo == OutVInputL) {
-    // Variable number of outputs. If we box the loc we're reading,
-    // we need to write out its boxed-ness.
-    assert(inputs.size() >= 1);
-    const DynLocation* in = inputs[inputs.size() - 1];
-    DynLocation* outDynLoc = t.newDynLocation(in->location, in->rtt);
-    outDynLoc->location = Location(Location::Stack, currentStackOffset++);
-    bool isRef;
-    if (typeInfo == OutVInputL) {
-      isRef = true;
-    } else {
-      assert(typeInfo == OutFInputL || typeInfo == OutFInputR);
-      isRef = ni->preppedByRef;
-    }
-    if (isRef) {
-      // Locals can be KindOfUninit, so we need to convert
-      // this to KindOfNull
-      if (in->rtt.outerType() == KindOfUninit) {
-        outDynLoc->rtt = RuntimeType(KindOfRef, KindOfNull);
-      } else {
-        outDynLoc->rtt = in->rtt.box();
-      }
-      SKTRACE(1, ni->source, "boxed type: %d -> %d\n",
-              outDynLoc->rtt.outerType(), outDynLoc->rtt.innerType());
-    } else {
-      if (outDynLoc->rtt.outerType() == KindOfUninit) {
-        outDynLoc->rtt = RuntimeType(KindOfNull);
-      } else {
-        outDynLoc->rtt = outDynLoc->rtt.unbox();
-      }
-      SKTRACE(1, ni->source, "unboxed type: %d\n",
-              outDynLoc->rtt.outerType());
-    }
-    assert(outDynLoc->location.isStack());
-    ni->outStack = outDynLoc;
-
-    if (isRef && in->rtt.outerType() != KindOfRef &&
-        typeInfo != OutFInputR &&
-        in->location.isLocal()) {
-      // VGetH or FPassH boxing a local
-      DynLocation* smashedLocal =
-          t.newDynLocation(in->location, outDynLoc->rtt);
-      assert(smashedLocal->location.isLocal());
-      ni->outLocal = smashedLocal;
-    }
-    // Other things that might be getting boxed here include globals
-    // and array values; since we don't attempt to track these things'
-    // types in symbolic execution anyway, we can ignore them.
-    return;
-  }
-
-  int opnd = None;
-  for (int outLocsCopy = (int)outLocs;
-       outLocsCopy != (int)None;
-       outLocsCopy &= ~opnd) {
-    opnd = 1 << (ffs(outLocsCopy) - 1);
-    assert(opnd != None && opnd != Stack3);  // no instr produces 3 values
-    assert(opnd != FuncdRef);                // reffiness is immutable
-    Location loc;
-    switch (opnd) {
-      // Pseudo-outputs that affect translator state
-      case FStack: {
-        currentStackOffset += kNumActRecCells;
-        t.m_arState.pushFunc(*ni);
-      } continue; // no instr-associated output
-
-      case Local: {
-        if (op == OpSetN || op == OpSetOpN || op == OpIncDecN ||
-            op == OpBindN || op == OpUnsetN || op == OpVGetN) {
-          varEnvTaint = true;
-          continue;
-        }
-
-        if (op == OpVerifyParamType) {
-          assert(ni->inputs.size() == 1);
-          auto func = ni->func();
-          const auto& inRtt = ni->inputs[0]->rtt;
-          auto paramId = ni->imm[0].u_IVA;
-          const auto& tc = func->params()[paramId].typeConstraint();
-          if (tc.isArray() && !tc.isSoft() && !func->mustBeRef(paramId) &&
-              (inRtt.isVagueValue() || inRtt.isObject() || inRtt.isRef())) {
-            auto* loc = t.newDynLocation(
-              ni->inputs[0]->location,
-              inRtt.isRef() ? RuntimeType(KindOfRef, KindOfAny)
-                            : RuntimeType(KindOfAny));
-            assert(loc->location.isLocal());
-            ni->outLocal = loc;
-          }
-          continue;
-        }
-
-        ASSERT_NOT_IMPLEMENTED(op == OpSetOpL ||
-                               op == OpSetM || op == OpSetOpM ||
-                               op == OpBindM ||
-                               op == OpSetWithRefLM || op == OpSetWithRefRM ||
-                               op == OpUnsetM ||
-                               op == OpIncDecL ||
-                               op == OpVGetM || op == OpFPassM ||
-                               op == OpIncDecM ||
-                               op == OpStaticLocInit || op == OpInitThisLoc ||
-                               op == OpSetL || op == OpBindL || op == OpVGetL ||
-                               op == OpPushL || op == OpUnsetL ||
-                               op == OpIterInit || op == OpIterInitK ||
-                               op == OpMIterInit || op == OpMIterInitK ||
-                               op == OpWIterInit || op == OpWIterInitK ||
-                               op == OpIterNext || op == OpIterNextK ||
-                               op == OpMIterNext || op == OpMIterNextK ||
-                               op == OpWIterNext || op == OpWIterNextK);
-        if (op == OpFPassM && !ni->preppedByRef) {
-          // Equivalent to CGetM. Won't mutate the base.
-          continue;
-        }
-        if (op == OpIncDecL) {
-          assert(ni->inputs.size() == 1);
-          const RuntimeType &inRtt = ni->inputs[0]->rtt;
-          RuntimeType rtt =
-            IS_INT_TYPE(inRtt.valueType()) ? inRtt : RuntimeType(KindOfAny);
-          DynLocation* incDecLoc =
-            t.newDynLocation(ni->inputs[0]->location, rtt);
-          assert(incDecLoc->location.isLocal());
-          ni->outLocal = incDecLoc;
-          continue; // Doesn't mutate a loc's types for int. Carry on.
-        }
-        if (op == OpUnsetL || op == OpPushL) {
-          assert(ni->inputs.size() == 1);
-          DynLocation* inLoc = ni->inputs[0];
-          assert(inLoc->location.isLocal());
-          RuntimeType newLhsRtt = RuntimeType(KindOfUninit);
-          Location locLocation = inLoc->location;
-          SKTRACE(2, ni->source, "(%s, %" PRId64 ") <- type %d\n",
-                  locLocation.spaceName(), locLocation.offset,
-                  newLhsRtt.valueType());
-          DynLocation* unsetLoc = t.newDynLocation(locLocation, newLhsRtt);
-          assert(unsetLoc->location.isLocal());
-          ni->outLocal = unsetLoc;
-          continue;
-        }
-        if (op == OpStaticLocInit || op == OpInitThisLoc) {
-          ni->outLocal = t.newDynLocation(Location(Location::Local,
-                                                   ni->imm[0].u_LA),
-                                          KindOfAny);
-          continue;
-        }
-        if (op == OpSetM || op == OpSetOpM ||
-            op == OpVGetM || op == OpBindM ||
-            op == OpSetWithRefLM || op == OpSetWithRefRM ||
-            op == OpUnsetM || op == OpFPassM || op == OpIncDecM) {
-          switch (ni->immVec.locationCode()) {
-            case LL: {
-              const int kVecStart = (op == OpSetM ||
-                                     op == OpSetOpM ||
-                                     op == OpBindM ||
-                                     op == OpSetWithRefLM ||
-                                     op == OpSetWithRefRM) ?
-                1 : 0; // 0 is rhs for SetM/SetOpM
-              DynLocation* inLoc = ni->inputs[kVecStart];
-              assert(inLoc->location.isLocal());
-              Location locLoc = inLoc->location;
-              if (op == OpUnsetM) {
-                // UnsetM can change the value of its base local when it's an
-                // array. Output a new DynLocation with a the same type to
-                // reflect the new value.
-                ni->outLocal = t.newDynLocation(locLoc, inLoc->rtt);
-              } else if (inLoc->rtt.isString() ||
-                         inLoc->rtt.valueType() == KindOfBoolean) {
-                // Strings and bools produce value-dependent results; "" and
-                // false upgrade to an array successfully, while other values
-                // fail and leave the lhs unmodified.
-                DynLocation* baseLoc = t.newDynLocation(locLoc, KindOfAny);
-                assert(baseLoc->isLocal());
-                ni->outLocal = baseLoc;
-              } else if (inLoc->rtt.valueType() == KindOfUninit ||
-                         inLoc->rtt.valueType() == KindOfNull) {
-                RuntimeType newLhsRtt = inLoc->rtt.setValueType(
-                  mcodeIsProp(ni->immVecM[0]) ?
-                  KindOfObject : KindOfArray);
-                SKTRACE(2, ni->source, "(%s, %" PRId64 ") <- type %d\n",
-                        locLoc.spaceName(), locLoc.offset,
-                        newLhsRtt.valueType());
-                DynLocation* baseLoc = t.newDynLocation(locLoc, newLhsRtt);
-                assert(baseLoc->location.isLocal());
-                ni->outLocal = baseLoc;
-              }
-              // Note (if we start translating pseudo-mains):
-              //
-              // A SetM in pseudo-main might alias a local whose type we're
-              // remembering:
-              //
-              //   $GLOBALS['a'] = 123; // $a :: Int
-              //
-              // and more deviously:
-              //
-              //   $loc['b'][17] = $GLOBALS; $x = 'b'; $y = 17;
-              //   $loc[$x][$y]['a'] = 123; // $a :: Int
-              break;
-            }
-            case LNL:
-            case LNC:
-              varEnvTaint = true;
-              break;
-            case LGL:
-            case LGC:
-              break;
-            default:
-              break;
-          }
-          continue;
-        }
-        if (op == OpSetOpL) {
-          const int kLocIdx = 1;
-          DynLocation* inLoc = ni->inputs[kLocIdx];
-          assert(inLoc->location.isLocal());
-          DynLocation* dl = t.newDynLocation();
-          dl->location = inLoc->location;
-          dl->rtt = setOpOutputType(ni, ni->inputs);
-          if (inLoc->isRef()) {
-            dl->rtt = dl->rtt.box();
-          }
-          SKTRACE(2, ni->source, "(%s, %" PRId64 ") <- type %d\n",
-                  inLoc->location.spaceName(), inLoc->location.offset,
-                  dl->rtt.valueType());
-          assert(dl->location.isLocal());
-          ni->outLocal = dl;
-          continue;
-        }
-        if (op >= OpIterInit && op <= OpWIterNextK) {
-          assert(op == OpIterInit || op == OpIterInitK ||
-                 op == OpMIterInit || op == OpMIterInitK ||
-                 op == OpWIterInit || op == OpWIterInitK ||
-                 op == OpIterNext || op == OpIterNextK ||
-                 op == OpMIterNext || op == OpMIterNextK ||
-                 op == OpWIterNext || op == OpWIterNextK);
-          const int kValImmIdx = 2;
-          const int kKeyImmIdx = 3;
-          DynLocation* outVal = t.newDynLocation();
-          int off = ni->imm[kValImmIdx].u_IVA;
-          outVal->location = Location(Location::Local, off);
-          if (op == OpMIterInit || op == OpMIterInitK ||
-              op == OpMIterNext || op == OpMIterNextK) {
-            outVal->rtt = RuntimeType(KindOfRef, KindOfAny);
-          } else {
-            outVal->rtt = RuntimeType(KindOfAny);
-          }
-          ni->outLocal = outVal;
-          if (op == OpIterInitK || op == OpIterNextK ||
-              op == OpWIterInitK || op == OpWIterNextK ||
-              op == OpMIterInitK || op == OpMIterNextK) {
-            DynLocation* outKey = t.newDynLocation();
-            int keyOff = getImm((Op*)ni->pc(), kKeyImmIdx).u_IVA;
-            outKey->location = Location(Location::Local, keyOff);
-            outKey->rtt = RuntimeType(KindOfAny);
-            ni->outLocal2 = outKey;
-          }
-          continue;
-        }
-        assert(ni->inputs.size() == 2);
-        const int kValIdx  = 0;
-        const int kLocIdx = 1;
-        DynLocation* inLoc = ni->inputs[kLocIdx];
-        DynLocation* inVal  = ni->inputs[kValIdx];
-        Location locLocation = inLoc->location;
-        // Variant RHS possible only when binding.
-        assert(inVal->rtt.isVagueValue() ||
-               (op == OpBindL) ==
-               (inVal->rtt.outerType() == KindOfRef));
-        assert(!inVal->location.isLocal());
-        assert(inLoc->location.isLocal());
-        RuntimeType newLhsRtt = inVal->rtt.isVagueValue() || op == OpBindL ?
-          inVal->rtt :
-          inLoc->rtt.setValueType(inVal->rtt.outerType());
-        if (inLoc->rtt.outerType() == KindOfRef) {
-          assert(newLhsRtt.outerType() == KindOfRef);
-        } else {
-          assert(op == OpBindL ||
-                 newLhsRtt.outerType() != KindOfRef);
-        }
-        SKTRACE(2, ni->source, "(%s, %" PRId64 ") <- type %d\n",
-                locLocation.spaceName(), locLocation.offset,
-                inVal->rtt.valueType());
-        DynLocation* outLhsLoc = t.newDynLocation(locLocation, newLhsRtt);
-        assert(outLhsLoc->location.isLocal());
-        ni->outLocal = outLhsLoc;
-      } continue; // already pushed an output for the local
-
-      case Stack1:
-      case Stack2: {
-        loc = Location(Location::Stack, currentStackOffset++);
-        if (ni->op() == OpFPushCufSafe) {
-          // FPushCufSafe pushes its first stack input, then a bool.
-          if (opnd == Stack2) {
-            assert(ni->outStack == nullptr);
-            auto* dl = t.newDynLocation(loc, ni->inputs[0]->rtt);
-            ni->outStack = dl;
-          } else {
-            assert(ni->outStack2 == nullptr);
-            auto* dl = t.newDynLocation(loc, KindOfBoolean);
-            ni->outStack2 = dl;
-          }
-          continue;
-        }
-        if (ni->op() == OpAsyncAwait) {
-          // The second output of OpAsyncAwait is a bool.
-          if (opnd == Stack2) {
-            assert(ni->outStack == nullptr);
-            // let getDynLocType do it.
-          } else {
-            assert(ni->outStack2 == nullptr);
-            ni->outStack2 = t.newDynLocation(loc, KindOfBoolean);
-            continue;
-          }
-        }
-      } break;
-      case StackIns1: {
-        // First stack output is where the inserted element will go.
-        // The output code for the instruction will affect what we
-        // think about this location.
-        loc = Location(Location::Stack, currentStackOffset++);
-
-        // The existing top is just being moved up a notch.  This one
-        // always functions as if it were OutSameAsInput.
-        assert(ni->inputs.size() >= 1);
-        ni->outStack2 = t.newDynLocation(
-          Location(Location::Stack, currentStackOffset++),
-          ni->inputs[0]->rtt
-        );
-      } break;
-      case StackIns2: {
-        // Similar to StackIns1.
-        loc = Location(Location::Stack, currentStackOffset++);
-
-        // Move the top two locations up a slot.
-        assert(ni->inputs.size() >= 2);
-        ni->outStack2 = t.newDynLocation(
-          Location(Location::Stack, currentStackOffset++),
-          ni->inputs[1]->rtt
-        );
-        ni->outStack3 = t.newDynLocation(
-          Location(Location::Stack, currentStackOffset++),
-          ni->inputs[0]->rtt
-        );
-      } break;
-      default:
-        not_reached();
-    }
-    DynLocation* dl = t.newDynLocation();
-    dl->location = loc;
-    dl->rtt = getDynLocType(t.m_sk, ni, typeInfo, m_mode);
-    SKTRACE(2, ni->source, "recording output t(%d->%d) #(%s, %" PRId64 ")\n",
-            dl->rtt.outerType(), dl->rtt.innerType(),
-            dl->location.spaceName(), dl->location.offset);
-    assert(dl->location.isStack());
-    ni->outStack = dl;
-  }
-}
-
-void
-Translator::requestResetHighLevelTranslator() {
-  if (dbgTranslateCoin) {
-    dbgTranslateCoin->reset();
-  }
-}
-
-bool DynLocation::canBeAliased() const {
-  return isValue() &&
-    ((Translator::liveFrameIsPseudoMain() && isLocal()) || isRef());
-}
-
-// Test the type of a location without recording it as a read yet.
-RuntimeType TraceletContext::currentType(const Location& l) const {
-  auto const dl = folly::get_ptr(m_currentMap, l);
-  if (!dl) {
-    assert(!m_deletedSet.count(l));
-    assert(!m_changeSet.count(l));
-    return tx->liveType(l, *liveUnit());
-  }
-  return (*dl)->rtt;
-}
-
-DynLocation* TraceletContext::recordRead(const InputInfo& ii,
-                                         DataType staticType) {
-  if (staticType == KindOfNone) staticType = KindOfAny;
-
-  const Location& l = ii.loc;
-  auto dl = folly::get_default(m_currentMap, l, nullptr);
-  if (!dl) {
-    // We should never try to read a location that has been deleted
-    assert(!m_deletedSet.count(l));
-    // If the given location was not in m_currentMap, then it shouldn't
-    // be in m_changeSet either
-    assert(!m_changeSet.count(l));
-    if (ii.dontGuard && !l.isLiteral()) {
-      assert(staticType != KindOfRef);
-      dl = m_t->newDynLocation(l, RuntimeType(staticType));
-      if (staticType != KindOfAny) {
-        m_resolvedDeps[l] = dl;
-      }
-    } else {
-      const bool specialize = tx->mode() == TransLive &&
-        (RuntimeOption::EvalHHBCRelaxGuards ||
-         RuntimeOption::EvalHHIRRelaxGuards);
-
-      RuntimeType rtt = tx->liveType(l, *liveUnit(), specialize);
-      assert(rtt.isIter() || !rtt.isVagueValue());
-      // Allocate a new DynLocation to represent this and store it in the
-      // current map.
-      dl = m_t->newDynLocation(l, rtt);
-
-      if (!l.isLiteral()) {
-        if (m_varEnvTaint && dl->isValue() && dl->isLocal()) {
-          dl->rtt = RuntimeType(KindOfAny);
-        } else if ((m_aliasTaint && dl->canBeAliased()) ||
-                   (rtt.isValue() && rtt.isRef() && ii.dontGuardInner)) {
-          dl->rtt = rtt.setValueType(KindOfAny);
-        }
-        // Record that we depend on the live type of the specified location
-        // as well (and remember what the live type was)
-        m_dependencies[l] = dl;
-      }
-    }
-    m_currentMap[l] = dl;
-  }
-  TRACE(2, "recordRead: %s : %s\n", l.pretty().c_str(),
-        dl->rtt.pretty().c_str());
-  return dl;
-}
-
-void TraceletContext::recordWrite(DynLocation* dl) {
-  TRACE(2, "recordWrite: %s : %s\n", dl->location.pretty().c_str(),
-                                     dl->rtt.pretty().c_str());
-  m_currentMap[dl->location] = dl;
-  m_changeSet.insert(dl->location);
-  m_deletedSet.erase(dl->location);
-}
-
-void TraceletContext::recordDelete(const Location& l) {
-  // We should not be trying to delete the rtt of location that is
-  // not in m_currentMap
-  TRACE(2, "recordDelete: %s\n", l.pretty().c_str());
-  m_currentMap.erase(l);
-  m_changeSet.erase(l);
-  m_deletedSet.insert(l);
-}
-
-void TraceletContext::aliasTaint() {
-  m_aliasTaint = true;
-  for (ChangeMap::iterator it = m_currentMap.begin();
-       it != m_currentMap.end(); ++it) {
-    DynLocation* dl = it->second;
-    if (dl->canBeAliased()) {
-      TRACE(1, "(%s, %" PRId64 ") <- inner type invalidated\n",
-            it->first.spaceName(), it->first.offset);
-      RuntimeType newRtt = dl->rtt.setValueType(KindOfAny);
-      it->second = m_t->newDynLocation(dl->location, newRtt);
-    }
-  }
-}
-
-void TraceletContext::varEnvTaint() {
-  m_varEnvTaint = true;
-  for (ChangeMap::iterator it = m_currentMap.begin();
-       it != m_currentMap.end(); ++it) {
-    DynLocation* dl = it->second;
-    if (dl->isValue() && dl->isLocal()) {
-      TRACE(1, "(%s, %" PRId64 ") <- type invalidated\n",
-            it->first.spaceName(), it->first.offset);
-      it->second = m_t->newDynLocation(dl->location,
-                                       RuntimeType(KindOfAny));
-    }
-  }
-}
-
-void TraceletContext::recordJmp() {
-  m_numJmps++;
-}
-
-void Translator::postAnalyze(NormalizedInstruction* ni, SrcKey& sk,
-                             Tracelet& t, TraceletContext& tas) {
-  if (ni->op() == OpBareThis &&
-      ni->outStack->rtt.isVagueValue()) {
-    SrcKey src = sk;
-    const Unit* unit = ni->m_unit;
-    src.advance(unit);
-    Op next = *reinterpret_cast<const Op*>(unit->at(src.offset()));
-    if (next == Op::InstanceOfD
-          || (next == Op::IsTypeC &&
-              ni->imm[0].u_OA == static_cast<uint8_t>(IsTypeOp::Null))) {
-      ni->outStack->rtt = RuntimeType(KindOfObject);
-    }
-    return;
-  }
-}
-
-static bool isPop(const NormalizedInstruction* instr) {
-  auto opc = instr->op();
-  return (opc == Op::PopC ||
-          opc == Op::PopV ||
-          opc == Op::PopR);
-}
-
-GuardType::GuardType(DataType outer, DataType inner)
-  : outerType(outer), innerType(inner), klass(nullptr) {
-}
-
-GuardType::GuardType(const RuntimeType& rtt) {
-  assert(rtt.isValue());
-  outerType = rtt.outerType();
-  innerType = rtt.innerType();
-  if (rtt.hasKnownClass()) {
-    klass = rtt.knownClass();
-  } else if (rtt.hasArrayKind()) {
-    arrayKindValid = true;
-    arrayKind = rtt.arrayKind();
-  } else {
-    klass = nullptr;
-  }
-}
-
-GuardType::GuardType(const GuardType& other) {
-  *this = other;
-}
-
-const DataType GuardType::getOuterType() const {
-  return outerType;
-}
-
-const DataType GuardType::getInnerType() const {
-  return innerType;
-}
-
-const Class* GuardType::getSpecializedClass() const {
-  return klass;
-}
-
-bool GuardType::isSpecific() const {
-  return outerType > KindOfNone;
-}
-
-bool GuardType::isSpecialized() const {
-  return (outerType == KindOfObject && klass != nullptr) ||
-    (outerType == KindOfArray && arrayKindValid);
-}
-
-bool GuardType::isRelaxed() const {
-  switch (outerType) {
-    case KindOfAny:
-    case KindOfUncounted:
-    case KindOfUncountedInit:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool GuardType::isGeneric() const {
-  return outerType == KindOfAny;
-}
-
-bool GuardType::isCounted() const {
-  switch (outerType) {
-    case KindOfAny:
-    case KindOfStaticString:
-    case KindOfString:
-    case KindOfArray:
-    case KindOfObject:
-    case KindOfResource:
-    case KindOfRef:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool GuardType::isMoreRefinedThan(const GuardType& other) const {
-  return getCategory() > other.getCategory();
-}
-
-DataTypeCategory GuardType::getCategory() const {
-  switch (outerType) {
-    case KindOfAny:           return DataTypeGeneric;
-    case KindOfUncounted:     return DataTypeCountness;
-    case KindOfUncountedInit: return DataTypeCountnessInit;
-    default:                  return (klass != nullptr || arrayKindValid) ?
-                                                DataTypeSpecialized :
-                                                DataTypeSpecific;
-  }
-}
-
-bool GuardType::mayBeUninit() const {
-  switch (outerType) {
-    case KindOfAny:
-    case KindOfUncounted:
-    case KindOfUninit:
-      return true;
-    default:
-      return false;
-  }
-}
-
-GuardType GuardType::getCountness() const {
-  // Note that translations need to be able to handle KindOfString and
-  // KindOfStaticString interchangeably.  This implies that KindOfStaticString
-  // needs to be treated as KindOfString, i.e. as possibly counted.
-  assert(isSpecific());
-  switch (outerType) {
-    case KindOfUninit:
-    case KindOfNull:
-    case KindOfBoolean:
-    case KindOfInt64:
-    case KindOfDouble:  return GuardType(KindOfUncounted);
-    default:            return GuardType(outerType, innerType);
-  }
-}
-
-GuardType GuardType::dropSpecialization() const {
-  return GuardType(outerType, innerType);
-}
-
-RuntimeType GuardType::getRuntimeType() const {
-  if (outerType == KindOfObject && klass != nullptr) {
-    return RuntimeType(outerType, innerType).setKnownClass(klass);
-  }
-  if (outerType == KindOfArray && arrayKindValid) {
-    return RuntimeType(outerType, innerType).setArrayKind(arrayKind);
-  }
-  return RuntimeType(outerType, innerType);
-}
-
-bool GuardType::isEqual(GuardType other) const {
-  return outerType == other.outerType &&
-         innerType == other.innerType &&
-         klass == other.klass;
-}
-
-GuardType GuardType::getCountnessInit() const {
-  assert(isSpecific());
-  switch (outerType) {
-    case KindOfNull:
-    case KindOfBoolean:
-    case KindOfInt64:
-    case KindOfDouble:  return GuardType(KindOfUncountedInit);
-    default:            return GuardType(outerType, innerType);
-  }
-}
-
-bool GuardType::hasArrayKind() const {
-  return arrayKindValid;
-}
-
-ArrayData::ArrayKind GuardType::getArrayKind() const {
-  return arrayKind;
-}
-
-/**
- * Returns true iff loc is consumed by a Pop* instruction in the sequence
- * starting at instr.
- */
-bool isPopped(DynLocation* loc, NormalizedInstruction* instr) {
-  for (; instr ; instr = instr->next) {
-    for (size_t i = 0; i < instr->inputs.size(); i++) {
-      if (instr->inputs[i] == loc) {
-        return isPop(instr);
-      }
-    }
-  }
-  return false;
-}
-
-DataTypeCategory
-Translator::getOperandConstraintCategory(NormalizedInstruction* instr,
-                                         size_t opndIdx,
-                                         const GuardType& specType) {
-  auto opc = instr->op();
-
-  switch (opc) {
-    case OpSetS:
-    case OpSetG:
-    case OpSetL: {
-      if (opndIdx == 0) { // stack value
-        // If the output on the stack is simply popped, then we don't
-        // even care whether the type is ref-counted or not because
-        // the ref-count is transfered to the target location.
-        if (!instr->outStack || isPopped(instr->outStack, instr->next)) {
-          return DataTypeGeneric;
-        }
-        return DataTypeCountness;
-      }
-      if (opc == OpSetL) {
-        // old local value is dec-refed
-        assert(opndIdx == 1);
-        return DataTypeCountness;
-      }
-      return DataTypeSpecific;
-    }
-
-    case OpUnsetL:
-      return DataTypeCountness;
-
-    case OpCGetL:
-      return DataTypeCountnessInit;
-
-    case OpPushL:
-    case OpContEnter:
-    case OpContRaise:
-      return DataTypeGeneric;
-
-    case OpRetC:
-    case OpRetV:
-      return DataTypeCountness;
-
-    case OpFCall:
-    case OpFCallD:
-      // Note: instead of pessimizing calls that may be inlined with
-      // DataTypeSpecific, we could apply the operand constraints of
-      // the callee in constrainDep.
-      return (instr->calleeTrace && !instr->calleeTrace->m_inliningFailed)
-               ? DataTypeSpecific
-               : DataTypeGeneric;
-
-    case OpFCallArray:
-      return DataTypeGeneric;
-
-    case OpPopC:
-    case OpPopV:
-    case OpPopR:
-      return DataTypeCountness;
-
-    case OpYield:
-    case OpYieldK:
-      // The stack input is teleported to the continuation's m_value field
-      return DataTypeGeneric;
-
-    case OpAddElemC:
-      // The stack input is teleported to the array
-      return opndIdx == 0 ? DataTypeGeneric : DataTypeSpecific;
-
-    case OpIdx:
-    case OpArrayIdx:
-      // The default value (w/ opndIdx 0) is simply passed to a helper,
-      // which takes care of dec-refing it if needed
-      return opndIdx == 0 ? DataTypeGeneric : DataTypeSpecific;
-
-    //
-    // Collections and Iterator related specializations
-    //
-    case OpFPassM:
-      if (instr->preppedByRef) {
-        // This is equivalent to a VGetM.
-        return DataTypeSpecific;
-      }
-      // fallthrough
-    case OpCGetM:
-    case OpIssetM:
-      if (specType.getOuterType() == KindOfArray) {
-        if (instr->inputs.size() == 2 && opndIdx == 0) {
-          if (specType.hasArrayKind() &&
-              specType.getArrayKind() == ArrayData::ArrayKind::kPackedKind &&
-              instr->inputs[1]->isInt()) {
-            return DataTypeSpecialized;
-          }
-        }
-      } else if (specType.getOuterType() == KindOfObject) {
-        if (instr->inputs.size() == 2 && opndIdx == 0) {
-          const Class* klass = specType.getSpecializedClass();
-          if (klass != nullptr && isOptimizableCollectionClass(klass)) {
-            return DataTypeSpecialized;
-          }
-        }
-      }
-      return DataTypeSpecific;
-    case OpSetM:
-      if (specType.getOuterType() == KindOfObject) {
-        if (instr->inputs.size() == 3 && opndIdx == 1) {
-          const Class* klass = specType.getSpecializedClass();
-          // Pairs are immutable so special case that here.
-          if (klass != nullptr && isOptimizableCollectionClass(klass) &&
-              klass != c_Pair::classof()) {
-            return DataTypeSpecialized;
-          }
-        }
-      }
-      return DataTypeSpecific;
-
-    default:
-      return DataTypeSpecific;
-  }
-}
-
-GuardType
-Translator::getOperandConstraintType(NormalizedInstruction* instr,
-                                     size_t                 opndIdx,
-                                     const GuardType&       specType) {
-  DataTypeCategory dtCategory = getOperandConstraintCategory(instr,
-                                                             opndIdx,
-                                                             specType);
-  FTRACE(4, "got constraint {} for {}\n", dtCategory, *instr);
-  switch (dtCategory) {
-    case DataTypeGeneric:       return GuardType(KindOfAny);
-    case DataTypeCountness:     return specType.getCountness();
-    case DataTypeCountnessInit: return specType.getCountnessInit();
-    case DataTypeSpecific:      return specType.dropSpecialization();
-    case DataTypeSpecialized:
-                                return specType;
-  }
-  return specType;
-}
-
-void Translator::constrainOperandType(GuardType&             relxType,
-                                      NormalizedInstruction* instr,
-                                      size_t                 opndIdx,
-                                      const GuardType&       specType) {
-  if (relxType.isEqual(specType)) return; // Can't constrain any further
-
-  GuardType consType = getOperandConstraintType(instr, opndIdx, specType);
-  if (consType.isMoreRefinedThan(relxType)) {
-    FTRACE(3, "constraining from {}({}) to {}({})\n",
-           relxType.getOuterType(), relxType.getInnerType(),
-           consType.getOuterType(), consType.getInnerType());
-    relxType = consType;
-  }
-}
-
-/*
- * This method looks at every use of loc in the stream of instructions
- * starting at firstInstr and constrains the relxType towards specType
- * according to each use.  Note that this method not only looks at
- * direct uses of loc, but it also recursively looks at any other
- * DynLocs whose type depends on loc's type.
- */
-void Translator::constrainDep(const DynLocation* loc,
-                              NormalizedInstruction* firstInstr,
-                              GuardType specType,
-                              GuardType& relxType) {
-  if (relxType.isEqual(specType)) return; // can't contrain it any further
-
-  FTRACE(3, "\nconstraining dep {}\n", loc->pretty());
-  for (auto instr = firstInstr; instr; instr = instr->next) {
-    if (instr->noOp) continue;
-
-    auto opc = instr->op();
-    size_t nInputs = instr->inputs.size();
-    for (size_t i = 0; i < nInputs; i++) {
-      DynLocation* usedLoc = instr->inputs[i];
-      if (usedLoc == loc) {
-        constrainOperandType(relxType, instr, i, specType);
-
-        // If the instruction's input doesn't propagate to its output,
-        // then we're done.  Otherwise, we need to constrain relxType
-        // based on the uses of the output.
-        if (!outputDependsOnInput(opc)) {
-          FTRACE(4, "output doesn't propagate to input; stopping\n");
-          continue;
-        }
-
-        bool outputIsStackInput = false;
-        const DynLocation* outStack = instr->outStack;
-        const DynLocation* outLocal = instr->outLocal;
-
-        switch (instrInfo[opc].type) {
-          case OutSameAsInput:
-            outputIsStackInput = true;
-            break;
-
-          case OutCInput:
-            outputIsStackInput = true;
-            // fall-through
-          case OutCInputL:
-            if (specType.getOuterType() == KindOfRef &&
-                instr->isAnyOutputUsed()) {
-              // Value gets unboxed along the way. Pessimize it for now.
-              if (!relxType.isSpecialized()) {
-                relxType = specType.dropSpecialization();
-              }
-              return;
-            }
-            break;
-
-          default:
-            if (!relxType.isSpecialized()) {
-              relxType = specType.dropSpecialization();
-            }
-            return;
-        }
-
-        // The instruction input's type propagates to the outputs.
-        // So constrain the dependence further based on uses of outputs.
-        if ((i == 0           &&  outputIsStackInput) || // stack input @ [0]
-            (i == nInputs - 1 && !outputIsStackInput)) { // local input is last
-          if (outStack && !outStack->rtt.isVagueValue()) {
-            // For SetL, getOperandConstraintCategory() generates
-            // DataTypeGeneric if the stack output is popped.  In this
-            // case, don't further constrain the stack output,
-            // otherwise the Pop* would make it a DataTypeCountness.
-            if (opc != OpSetL || !relxType.isGeneric()) {
-              FTRACE(3, "constraining outStack dep {}\n", outStack->pretty());
-              constrainDep(outStack, instr->next, specType, relxType);
-            }
-          }
-
-          // PushL has a local output that doesn't depend on the input
-          // type but its stack output does, so we special case it here.
-          if (outLocal && !outLocal->rtt.isVagueValue() &&
-              opc != OpPushL) {
-            FTRACE(3, "constraining outLocal dep {}\n", outLocal->pretty());
-            constrainDep(outLocal, instr->next, specType, relxType);
-          }
-        }
-      }
-    }
-  }
-}
-
-/*
- * This method looks at all the uses of the tracelet dependencies in the
- * instruction stream and tries to relax the type associated with each location.
- */
-void Translator::relaxDeps(Tracelet& tclet, TraceletContext& tctxt) {
-  DynLocTypeMap locRelxTypeMap;
-
-  // Initialize type maps.  Relaxed types start off very relaxed, and then
-  // they may get more specific depending on how the instructions use them.
-  FTRACE(3, "starting relaxDeps\n");
-  DepMap& deps = tctxt.m_dependencies;
-  for (auto depIt = deps.begin(); depIt != deps.end(); depIt++) {
-    DynLocation*       loc = depIt->second;
-    const RuntimeType& rtt = depIt->second->rtt;
-    if (rtt.isValue() && !rtt.isVagueValue() && !rtt.isClass() &&
-        !loc->location.isThis()) {
-      GuardType relxType = GuardType(KindOfAny);
-      GuardType specType = GuardType(rtt);
-      constrainDep(loc, tclet.m_instrStream.first, specType, relxType);
-      if (!specType.isEqual(relxType)) {
-        locRelxTypeMap[loc] = relxType;
-      }
-    }
-  }
-
-  // For each dependency, if we found a more relaxed type for it, use
-  // such type.
-  FTRACE(3, "applying relaxed deps\n");
-  for (auto& kv : locRelxTypeMap) {
-    DynLocation* loc = kv.first;
-    const GuardType& relxType = kv.second;
-    TRACE(1, "relaxDeps: Loc: %s   oldType: %s   =>   newType: %s\n",
-          loc->location.pretty().c_str(),
-          deps[loc->location]->rtt.pretty().c_str(),
-          RuntimeType(relxType.getOuterType(),
-                      relxType.getInnerType(),
-                      relxType.getSpecializedClass()).pretty().c_str());
-    assert(deps[loc->location] == loc);
-    deps[loc->location]->rtt = relxType.getRuntimeType();
-  }
-  FTRACE(3, "relaxDeps finished\n");
+  always_assert_flog(0, "invalid opcode {}\n", static_cast<uint32_t>(op));
 }
 
 const StaticString s_http_response_header("http_response_header");
+const StaticString s_php_errormsg("php_errormsg");
 const StaticString s_extract("extract");
+const StaticString s_extractNative("__SystemLib\\extract");
+const StaticString s_parse_str("parse_str");
+const StaticString s_parse_strNative("__SystemLib\\parse_str");
+const StaticString s_assert("assert");
+const StaticString s_assertNative("__SystemLib\\assert");
+
+bool funcByNameDestroysLocals(const StringData* fname) {
+  if (!fname) return false;
+  return fname->isame(s_extract.get()) ||
+         fname->isame(s_extractNative.get()) ||
+         fname->isame(s_parse_str.get()) ||
+         fname->isame(s_parse_strNative.get()) ||
+         fname->isame(s_assert.get()) ||
+         fname->isame(s_assertNative.get());
+}
+
+bool builtinFuncDestroysLocals(const Func* callee) {
+  assert(callee && callee->isCPPBuiltin());
+  auto const fname = callee->name();
+  return funcByNameDestroysLocals(fname);
+}
 
 bool callDestroysLocals(const NormalizedInstruction& inst,
                         const Func* caller) {
-  auto locals = caller->localNames();
-  for (int i = 0; i < caller->numNamedLocals(); ++i) {
-    if (locals[i]->isame(s_http_response_header.get())) {
-      return true;
-    }
-  }
+  // We don't handle these two cases, because we don't compile functions
+  // containing them:
+  assert(caller->lookupVarId(s_php_errormsg.get()) == -1);
+  assert(caller->lookupVarId(s_http_response_header.get()) == -1);
 
   auto* unit = caller->unit();
   auto checkTaintId = [&](Id id) {
-    return unit->lookupLitstrId(id)->isame(s_extract.get());
+    auto const str = unit->lookupLitstrId(id);
+    return funcByNameDestroysLocals(str);
   };
 
   if (inst.op() == OpFCallBuiltin) return checkTaintId(inst.imm[2].u_SA);
@@ -3272,607 +1196,28 @@ bool callDestroysLocals(const NormalizedInstruction& inst,
   return false;
 }
 
-/*
- * Check whether the a given FCall should be analyzed for possible
- * inlining or not.
- */
-bool shouldAnalyzeCallee(const NormalizedInstruction* fcall,
-                         const FPIEnt* fpi,
-                         const Op pushOp,
-                         const int depth) {
-  auto const numArgs = fcall->imm[0].u_IVA;
-  auto const target  = fcall->funcd;
-
-  if (!RuntimeOption::RepoAuthoritative) return false;
-
-  if (pushOp != OpFPushFuncD && pushOp != OpFPushObjMethodD
-      && pushOp != OpFPushCtorD && pushOp != OpFPushCtor
-      && pushOp != OpFPushClsMethodD) {
-    FTRACE(1, "analyzeCallee: push op ({}) was not supported\n",
-           opcodeToName(pushOp));
-    return false;
-  }
-
-  if (!target) {
-    FTRACE(1, "analyzeCallee: target func not known\n");
-    return false;
-  }
-  if (target->isCPPBuiltin()) {
-    FTRACE(1, "analyzeCallee: target func is a builtin\n");
-    return false;
-  }
-
-  if (depth + 1 > RuntimeOption::EvalHHIRInliningMaxDepth) {
-    FTRACE(1, "analyzeCallee: max inlining depth reached\n");
-    return false;
-  }
-
-  if (target->hasVariadicCaptureParam()) {
-    FTRACE(1, "analyzeCallee: target func has variadic capture\n");
-    return false;
-  }
-
-  // TODO(2716400): support __call and friends
-  if (numArgs != target->numParams()) {
-    FTRACE(1, "analyzeCallee: param count mismatch {} != {}\n",
-           numArgs, target->numParams());
-    return false;
-  }
-
-  if (pushOp == OpFPushClsMethodD && target->mayHaveThis()) {
-    FTRACE(1, "analyzeCallee: not inlining static calls which may have a "
-              "this pointer\n");
-    return false;
-  }
-
-  // Find the fpush and ensure it's in this tracelet---refuse to
-  // inline if there are any calls in order to prepare arguments.
-  for (auto* ni = fcall->prev; ni; ni = ni->prev) {
-    if (ni->source.offset() == fpi->m_fpushOff) {
-      if (ni->op() == OpFPushObjMethodD ||
-          ni->op() == OpFPushObjMethod) {
-        if (!ni->inputs[ni->op() == OpFPushObjMethod]->isObject()) {
-          /*
-           * In this case, we're going to throw or fatal when we
-           * execute the FPush*. But we have statically proven that
-           * if we get to the FCall, then target is the Func that will
-           * be called. So the FCall is unreachable - but unfortunately,
-           * various assumptions by the jit will be violated if we try
-           * to inline it. So just don't inline in that case.
-           */
-          return false;
-        }
-      }
-      return true;
-    }
-    if (isFCallStar(ni->op()) || ni->op() == OpFCallBuiltin) {
-      FTRACE(1, "analyzeCallee: fpi region contained other calls\n");
-      return false;
-    }
-  }
-  FTRACE(1, "analyzeCallee: push instruction was in a different "
-            "tracelet\n");
-  return false;
-}
-
-void Translator::analyzeCallee(TraceletContext& tas,
-                               Tracelet& parent,
-                               NormalizedInstruction* fcall) {
-  auto const callerFunc  = fcall->func();
-  auto const fpi         = callerFunc->findFPI(fcall->source.offset());
-  auto const pushOp      = fcall->m_unit->getOpcode(fpi->m_fpushOff);
-
-  if (!shouldAnalyzeCallee(fcall, fpi, pushOp, analysisDepth())) return;
-
-  auto const numArgs     = fcall->imm[0].u_IVA;
-  auto const target      = fcall->funcd;
-
-  /*
-   * Prepare a map for all the known information about the argument
-   * types.
-   *
-   * Also, fill out KindOfUninit for any remaining locals.  The point
-   * here is that the subtrace can't call liveType for a local or
-   * stack location (since our ActRec is fake), so we need them all in
-   * the TraceletContext.
-   *
-   * If any of the argument types are unknown (including inner-types
-   * of KindOfRefs), we don't really try to analyze the callee.  It
-   * might be possible to do this but we'll need to modify the
-   * analyzer to support unknown input types before there are any
-   * NormalizedInstructions in the Tracelet.
-   */
-  TypeMap initialMap;
-  LocationSet callerArgLocs;
-  for (int i = 0; i < numArgs; ++i) {
-    auto callerLoc = Location(Location::Stack, fcall->stackOffset - i - 1);
-    auto calleeLoc = Location(Location::Local, numArgs - i - 1);
-    auto type      = tas.currentType(callerLoc);
-
-    callerArgLocs.insert(callerLoc);
-
-    if (type.isVagueValue()) {
-      FTRACE(1, "analyzeCallee: {} has unknown type\n", callerLoc.pretty());
-      return;
-    }
-    if (type.isValue() && type.isRef() && type.innerType() == KindOfAny) {
-      FTRACE(1, "analyzeCallee: {} has unknown inner-refdata type\n",
-             callerLoc.pretty());
-      return;
-    }
-
-    FTRACE(2, "mapping arg{} locs {} -> {} :: {}\n",
-              numArgs - i - 1,
-              callerLoc.pretty(),
-              calleeLoc.pretty(),
-              type.pretty());
-    initialMap[calleeLoc] = type;
-  }
-  for (int i = numArgs; i < target->numLocals(); ++i) {
-    initialMap[Location(Location::Local, i)] = RuntimeType(KindOfUninit);
-  }
-
-  /*
-   * When reentering analyze to generate a Tracelet for a callee,
-   * currently we handle this by creating a fake ActRec on the stack.
-   *
-   * This is mostly a compromise to deal with existing code during the
-   * analysis phase which pretty liberally inspects live VM state.
-   */
-  ActRec fakeAR;
-  fakeAR.m_sfp = liveFrame();
-  fakeAR.m_savedRip = 0xbaabaa;  // should never be inspected
-  fakeAR.m_func = fcall->funcd;
-  fakeAR.m_soff = 0xb00b00;      // should never be inspected
-  fakeAR.m_numArgsAndGenCtorFlags = numArgs;
-  fakeAR.m_varEnv = nullptr;
-
-  /*
-   * Even when inlining an object method, we can leave the m_this as
-   * null.  See outThisObjectType().
-   */
-  fakeAR.m_this = nullptr;
-
-  FTRACE(1, "analyzing sub trace =================================\n");
-  auto const oldFP = vmfp();
-  auto const oldSP = vmsp();
-  auto const oldPC = vmpc();
-  auto const oldAnalyzeCalleeDepth = m_analysisDepth++;
-  vmpc() = nullptr; // should never be used
-  vmsp() = nullptr; // should never be used
-  vmfp() = reinterpret_cast<Cell*>(&fakeAR);
-  auto restoreFrame = [&]{
-    vmfp() = oldFP;
-    vmsp() = oldSP;
-    vmpc() = oldPC;
-    m_analysisDepth = oldAnalyzeCalleeDepth;
-  };
-  SCOPE_EXIT {
-    // It's ok to restoreFrame() twice---we have it in this scope
-    // handler to ensure it still happens if we exit via an exception.
-    restoreFrame();
-    FTRACE(1, "finished sub trace ===================================\n");
-  };
-
-  auto subTrace = analyze(SrcKey(target, target->base(), false), initialMap);
-
-  /*
-   * Verify the target trace actually ended with a return, or we have
-   * no business doing anything based on it right now.
-   */
-  if (!subTrace->m_instrStream.last ||
-      (subTrace->m_instrStream.last->op() != OpRetC &&
-       subTrace->m_instrStream.last->op() != OpRetV &&
-       subTrace->m_instrStream.last->op() != OpCreateCont &&
-       subTrace->m_instrStream.last->op() != OpAsyncSuspend)) {
-    FTRACE(1, "analyzeCallee: callee did not end in a return\n");
-    return;
-  }
-
-  /*
-   * If the IR can't inline this, give up now.  Below we're going to
-   * start making changes to the tracelet that is making the call
-   * (potentially increasing the specificity of guards), and we don't
-   * want to do that unnecessarily.
-   */
-  if (!shouldIRInline(callerFunc, target, *subTrace)) {
-    if (UNLIKELY(Stats::enabledAny() && getenv("HHVM_STATS_FAILEDINL"))) {
-      subTrace->m_inliningFailed = true;
-      // Save the trace for stats purposes but don't waste time doing any
-      // further processing since we know we won't inline it.
-      fcall->calleeTrace = std::move(subTrace);
-    }
-    return;
-  }
-
-  /*
-   * Disabled for now:
-   *
-   * Propagate the return type to our caller.  If the return type is
-   * not vague, it will hold if we can inline the trace.
-   *
-   * This isn't really a sensible thing to do if we aren't also going
-   * to inline the callee, however, because the return type may only
-   * be what it is due to other output predictions (CGetMs or FCall)
-   * inside the callee.  This means we would need to check the return
-   * value in the caller still as if it were a predicted return type.
-   */
-  Location retVal(Location::Stack, 0);
-  auto it = subTrace->m_changes.find(retVal);
-  assert(it != subTrace->m_changes.end());
-  FTRACE(1, "subtrace return: {}\n", it->second->pretty());
-  if (false) {
-    if (!it->second->rtt.isVagueValue() && !it->second->rtt.isRef()) {
-      FTRACE(1, "changing callee's return type from {} to {}\n",
-                fcall->outStack->rtt.pretty(),
-                it->second->pretty());
-
-      fcall->outputPredicted = true;
-      fcall->outputPredictionStatic = false;
-      fcall->outStack = parent.newDynLocation(fcall->outStack->location,
-                                              it->second->rtt);
-      tas.recordWrite(fcall->outStack);
-    }
-  }
-
-  /*
-   * In order for relaxDeps not to relax guards on some things we may
-   * potentially have depended on here, we need to ensure that the
-   * call instruction depends on all the inputs we've used.
-   *
-   * (We could do better by letting relaxDeps look through the
-   * callee.)
-   */
-  restoreFrame();
-  for (auto& loc : callerArgLocs) {
-    fcall->inputs.push_back(tas.recordRead(InputInfo(loc)));
-  }
-
-  FTRACE(1, "analyzeCallee: inline candidate\n");
-  fcall->calleeTrace = std::move(subTrace);
-}
-
-bool instrBreaksProfileBB(const NormalizedInstruction* instr) {
-  if (instrIsNonCallControlFlow(instr->op()) ||
-      instr->outputPredicted ||
-      instr->op() == OpClsCnsD) { // side exits if misses in the RDS
+bool instrBreaksProfileBB(const NormalizedInstruction* inst) {
+  if (instrIsNonCallControlFlow(inst->op()) ||
+      inst->op() == OpAwait || // may branch to scheduler and suspend execution
+      inst->op() == OpClsCnsD) { // side exits if misses in the RDS
     return true;
   }
-  // In profiling mode, don't trace through a control flow merge point
-  if (instr->func()->anyBlockEndsAt(instr->offset())) {
+  // In profiling mode, don't trace through a control flow merge point,
+  // however, allow inlining of default parameter funclets
+  if (mcg->tx().profData()->anyBlockEndsAt(inst->func(), inst->offset()) &&
+      !inst->func()->isEntry(inst->nextSk().offset())) {
     return true;
   }
   return false;
-}
-
-/*
- * analyze --
- *
- *   Given a sequence of bytecodes, return our tracelet IR.
- *
- * The purposes of this analysis is to determine:
- *
- *  1. Pre-conditions: What locations get read before they get written to:
- *     we will need typechecks for these and we will want to load them into
- *     registers. (m_dependencies)
- *
- *  2. Post-conditions: the locations that have been written to and are
- *     still live at the end of the tracelet. We need to allocate registers
- *     of these and we need to spill them at the end of the tracelet.
- *     (m_changes)
- *
- *  3. Determine the runtime types for each instruction's input locations
- *     and output locations.
- *
- * The main analysis works by doing a single pass over the instructions. It
- * effectively simulates the execution of each instruction, updating its
- * knowledge about types as it goes.
- *
- * The TraceletContext class is used to keep track of the current state of
- * the world. Initially it is empty, and when the inputs for the first
- * instruction are analyzed we call recordRead(). The recordRead() function
- * in turn inspects the live types of the inputs and adds them to the type
- * map. This serves two purposes: (1) it figures out what typechecks this
- * tracelet needs; and (2) it guarantees that the code we generate will
- * satisfy the live types that are about to be passed in.
- *
- * Over time the TraceletContext's type map will change. However, we need to
- * record what the types _were_ right before and right after a given
- * instruction executes. This is where the NormalizedInstruction class comes
- * in. We store the RuntimeTypes from the TraceletContext right before an
- * instruction executes into the NormalizedInstruction's 'inputs' field, and
- * we store the RuntimeTypes from the TraceletContext right after the
- * instruction executes into the various output fields.
- */
-std::unique_ptr<Tracelet> Translator::analyze(SrcKey sk,
-                                              const TypeMap& initialTypes) {
-  Timer _t(Timer::analyze);
-
-  std::unique_ptr<Tracelet> retval(new Tracelet());
-  auto func = sk.func();
-  auto unit = sk.unit();
-  auto resumed = sk.resumed();
-  auto& t = *retval;
-  t.m_sk = sk;
-
-  DEBUG_ONLY const char* file = unit->filepath()->data();
-  DEBUG_ONLY const int lineNum = unit->getLineNumber(t.m_sk.offset());
-  DEBUG_ONLY const char* funcName = func->fullName()->data();
-
-  TRACE(1, "Translator::analyze %s:%d %s\n", file, lineNum, funcName);
-  TraceletContext tas(&t, initialTypes);
-  int stackFrameOffset = 0;
-  int oldStackFrameOffset = 0;
-
-  // numOpcodes counts the original number of opcodes in a tracelet
-  // before the translator does any optimization
-  t.m_numOpcodes = 0;
-  Unit::MetaHandle metaHand;
-
-  for (;; sk.advance(unit)) {
-  head:
-    NormalizedInstruction* ni = t.newNormalizedInstruction();
-    ni->source = sk;
-    ni->stackOffset = stackFrameOffset;
-    ni->funcd = t.m_arState.knownFunc();
-    ni->m_unit = unit;
-    ni->breaksTracelet = false;
-    ni->changesPC = opcodeChangesPC(ni->op());
-    ni->fuseBranch = false;
-
-    assert(!t.m_analysisFailed);
-    oldStackFrameOffset = stackFrameOffset;
-    populateImmediates(*ni);
-
-    SKTRACE(1, sk, "stack args: virtual sfo now %d\n", stackFrameOffset);
-
-    // Translation could fail entirely (because of an unknown opcode), or
-    // encounter an input that cannot be computed.
-    try {
-      if (isTypeAssert(ni->op()) || isTypePredict(ni->op())) {
-        handleAssertionEffects(t, *ni, tas, stackFrameOffset);
-      }
-      preInputApplyMetaData(metaHand, ni);
-      InputInfos inputInfos;
-      getInputsImpl(
-        t.m_sk, ni, stackFrameOffset, inputInfos, sk.func(),
-        [&](int i) {
-          return Type(
-            tas.currentType(Location(Location::Local, i)));
-        }
-      );
-
-      bool noOp = applyInputMetaData(metaHand, ni, tas, inputInfos);
-      if (noOp) {
-        t.m_instrStream.append(ni);
-        ++t.m_numOpcodes;
-        stackFrameOffset = oldStackFrameOffset;
-        continue;
-      }
-      if (inputInfos.needsRefCheck) {
-        // Drive the arState machine; if it is going to throw an input
-        // exception, do so here.
-        int argNum = ni->imm[0].u_IVA;
-        // instrSpToArDelta() returns the delta relative to the sp at the
-        // beginning of the instruction, but checkByRef() wants the delta
-        // relative to the sp at the beginning of the tracelet, so we adjust
-        // by subtracting ni->stackOff
-        int entryArDelta = instrSpToArDelta((Op*)ni->pc()) - ni->stackOffset;
-        ni->preppedByRef = t.m_arState.checkByRef(argNum, entryArDelta,
-                                                    &t.m_refDeps);
-        SKTRACE(1, sk, "passing arg%d by %s\n", argNum,
-                ni->preppedByRef ? "reference" : "value");
-      }
-
-      for (unsigned int i = 0; i < inputInfos.size(); i++) {
-        SKTRACE(2, sk, "typing input %d\n", i);
-        const InputInfo& ii = inputInfos[i];
-        DynLocation* dl = tas.recordRead(ii);
-        const RuntimeType& rtt = dl->rtt;
-        // Some instructions are able to handle an input with an unknown type
-        if (!ii.dontBreak && !ii.dontGuard) {
-          if (rtt.isVagueValue()) {
-            // Consumed a "poisoned" output: e.g., result of an array
-            // deref.
-            throwUnknownInput();
-          }
-          if (!ni->ignoreInnerType && !ii.dontGuardInner) {
-            if (rtt.isValue() && rtt.isRef() &&
-                rtt.innerType() == KindOfAny) {
-              throwUnknownInput();
-            }
-          }
-          if ((m_mode == TransProfile || m_mode == TransOptimize) &&
-              t.m_numOpcodes > 0) {
-            // We want to break blocks at every instrution that consumes a ref,
-            // so that we avoid side exits.  Therefore, instructions consume ref
-            // can only be the first in the tracelet/block.
-            if (rtt.isValue() && rtt.isRef()) {
-              throwUnknownInput();
-            }
-          }
-        }
-        ni->inputs.push_back(dl);
-      }
-    } catch (TranslationFailedExc& tfe) {
-      SKTRACE(1, sk, "Translator fail: %s\n", tfe.what());
-      if (!t.m_numOpcodes) {
-        t.m_analysisFailed = true;
-        t.m_instrStream.append(ni);
-        ++t.m_numOpcodes;
-      }
-      goto breakBB;
-    } catch (UnknownInputExc& uie) {
-      // Subtle: if this instruction consumes an unknown runtime type,
-      // break the BB on the *previous* instruction. We know that a
-      // previous instruction exists, because the KindOfAny must
-      // have come from somewhere.
-      always_assert(t.m_instrStream.last);
-      SKTRACE(2, sk, "Consumed unknown input (%s:%d); breaking BB at "
-        "predecessor\n", uie.m_file, uie.m_line);
-      goto breakBB;
-    }
-
-    SKTRACE(2, sk, "stack args: virtual sfo now %d\n", stackFrameOffset);
-
-    bool doVarEnvTaint; // initialized by reference.
-    try {
-      getOutputs(t, ni, stackFrameOffset, doVarEnvTaint);
-    } catch (TranslationFailedExc& tfe) {
-      SKTRACE(1, sk, "Translator getOutputs fail: %s\n", tfe.what());
-      if (!t.m_numOpcodes) {
-        t.m_analysisFailed = true;
-        t.m_instrStream.append(ni);
-        ++t.m_numOpcodes;
-      }
-      goto breakBB;
-    }
-
-    if (isFCallStar(ni->op())) t.m_arState.pop();
-    if (doVarEnvTaint || callDestroysLocals(*ni, func)) tas.varEnvTaint();
-
-    DynLocation* outputs[] = { ni->outStack,
-                               ni->outLocal, ni->outLocal2,
-                               ni->outStack2, ni->outStack3 };
-    for (size_t i = 0; i < sizeof(outputs) / sizeof(*outputs); ++i) {
-      if (outputs[i]) {
-        DynLocation* o = outputs[i];
-        SKTRACE(2, sk, "inserting output t(%d->%d) #(%s, %" PRId64 ")\n",
-                o->rtt.outerType(), o->rtt.innerType(),
-                o->location.spaceName(), o->location.offset);
-        tas.recordWrite(o);
-      }
-    }
-
-    SKTRACE(1, sk, "stack args: virtual sfo now %d\n", stackFrameOffset);
-
-    // This assert failing means that your instruction has an
-    // inconsistent row in the InstrInfo table; the stackDelta doesn't
-    // agree with the inputs and outputs.
-    assert(getStackDelta(*ni) == (stackFrameOffset - oldStackFrameOffset));
-    // If this instruction decreased the depth of the stack, mark the
-    // appropriate stack locations as "dead".  But we need to leave
-    // them in the TraceletContext until after analyzeCallee (if this
-    // is an FCall).
-    if (stackFrameOffset < oldStackFrameOffset) {
-      for (int i = stackFrameOffset; i < oldStackFrameOffset; ++i) {
-        ni->deadLocs.push_back(Location(Location::Stack, i));
-      }
-    }
-
-    if (ni->outputPredicted) {
-      assert(ni->outStack);
-      ni->outPred = Type(ni->outStack);
-    }
-
-    t.m_stackChange += getStackDelta(*ni);
-
-    t.m_instrStream.append(ni);
-    ++t.m_numOpcodes;
-
-    /*
-     * The annotation step attempts to track Func*'s associated with
-     * given FCalls when the FPush is in a different tracelet.
-     *
-     * When we're analyzing a callee, we can't do this because we may
-     * have class information in some of our RuntimeTypes that is only
-     * true because of who the caller was.  (Normally it is only there
-     * if it came from static analysis.)
-     */
-    if (analysisDepth() == 0) {
-      annotate(ni);
-    }
-
-    if (ni->op() == Op::FCall || ni->op() == Op::FCallD) {
-      analyzeCallee(tas, t, ni);
-    }
-
-    for (auto& l : ni->deadLocs) {
-      tas.recordDelete(l);
-    }
-
-    if (m_mode == TransProfile && instrBreaksProfileBB(ni)) {
-      SKTRACE(1, sk, "Profiling BB broken\n");
-      sk.advance(unit);
-      goto breakBB;
-    }
-
-    // Check if we need to break the tracelet.
-    //
-    // If we've gotten this far, it mostly boils down to control-flow
-    // instructions. However, we'll trace through a few unconditional jmps.
-    if (isUnconditionalJmp(ni->op()) &&
-        ni->imm[0].u_BA > 0 &&
-        tas.m_numJmps < MaxJmpsTracedThrough &&
-        m_mode != TransProfile) {
-      // Continue tracing through jumps. To prevent pathologies, only trace
-      // through a finite number of forward jumps.
-      SKTRACE(1, sk, "greedily continuing through %dth jmp + %d\n",
-              tas.m_numJmps, ni->imm[0].u_IA);
-      tas.recordJmp();
-      sk = SrcKey(func, sk.offset() + ni->imm[0].u_IA, resumed);
-      goto head; // don't advance sk
-    } else if (opcodeBreaksBB(ni->op()) ||
-               (dontGuardAnyInputs(ni->op()) && opcodeChangesPC(ni->op()))) {
-      SKTRACE(1, sk, "BB broken\n");
-      sk.advance(unit);
-      goto breakBB;
-    }
-    postAnalyze(ni, sk, t, tas);
-  }
-breakBB:
-  NormalizedInstruction* ni = t.m_instrStream.last;
-  while (ni) {
-    // We dont want to end a tracelet with a literal; it will cause the literal
-    // to be pushed on the stack, and the next tracelet will have to guard on
-    // the type. Similarly, This, Self and Parent will lose type information
-    // thats only useful in the following tracelet.
-    if (isLiteral(ni->op()) ||
-        isThisSelfOrParent(ni->op()) ||
-        isTypeAssert(ni->op()) || isTypePredict(ni->op())) {
-      ni = ni->prev;
-      continue;
-    }
-    break;
-  }
-  if (ni) {
-    while (ni != t.m_instrStream.last) {
-      t.m_stackChange -= getStackDelta(*t.m_instrStream.last);
-      sk = t.m_instrStream.last->source;
-      t.m_instrStream.remove(t.m_instrStream.last);
-      --t.m_numOpcodes;
-    }
-  }
-
-  if (RuntimeOption::EvalHHBCRelaxGuards && m_mode == TransLive) {
-    relaxDeps(t, tas);
-  } else {
-    FTRACE(3, "Not relaxing deps. HHBCRelax: {}, mode: {}\n",
-           RuntimeOption::EvalHHBCRelaxGuards, show(m_mode));
-  }
-
-  // Mark the last instruction appropriately
-  assert(t.m_instrStream.last);
-  t.m_instrStream.last->breaksTracelet = true;
-  // Populate t.m_changes, t.intermediates, t.m_dependencies
-  t.m_dependencies = tas.m_dependencies;
-  t.m_resolvedDeps = tas.m_resolvedDeps;
-  t.m_changes.clear();
-  LocationSet::iterator it = tas.m_changeSet.begin();
-  for (; it != tas.m_changeSet.end(); ++it) {
-    t.m_changes[*it] = tas.m_currentMap[*it];
-  }
-
-  TRACE(1, "Tracelet done: stack delta %d\n", t.m_stackChange);
-  return retval;
 }
 
 Translator::Translator()
   : uniqueStubs{}
   , m_createdTime(HPHP::Timer::GetCurrentTimeMicros())
-  , m_mode(TransInvalid)
+  , m_mode(TransKind::Invalid)
   , m_profData(nullptr)
-  , m_analysisDepth(0)
+  , m_useAHot(RuntimeOption::RepoAuthoritative &&
+              RuntimeOption::EvalJitAHotSize > 0)
 {
   initInstrInfo();
   if (RuntimeOption::EvalJitPGO) {
@@ -3881,21 +1226,26 @@ Translator::Translator()
 }
 
 bool
-Translator::isSrcKeyInBL(const SrcKey& sk) {
+Translator::isSrcKeyInBL(SrcKey sk) {
   auto unit = sk.unit();
   if (unit->isInterpretOnly()) return true;
   Lock l(m_dbgBlacklistLock);
   if (m_dbgBLSrcKey.find(sk) != m_dbgBLSrcKey.end()) {
     return true;
   }
-  for (PC pc = unit->at(sk.offset());
-      !opcodeBreaksBB(*reinterpret_cast<const Op*>(pc));
-      pc += instrLen((Op*)pc)) {
+
+  // Loop until the end of the basic block inclusively. This is useful for
+  // function exit breakpoints, which are implemented by blacklisting the RetC
+  // opcodes.
+  PC pc = nullptr;
+  do {
+    pc = (pc == nullptr) ?
+      unit->at(sk.offset()) : pc + instrLen((Op*) pc);
     if (m_dbgBLPC.checkPC(pc)) {
       m_dbgBLSrcKey.insert(sk);
       return true;
     }
-  }
+  } while (!opcodeBreaksBB(*reinterpret_cast<const Op*>(pc)));
   return false;
 }
 
@@ -3917,261 +1267,36 @@ Translator::addDbgBLPC(PC pc) {
   return true;
 }
 
-void populateImmediates(NormalizedInstruction& inst) {
-  for (int i = 0; i < numImmediates(inst.op()); i++) {
-    inst.imm[i] = getImm((Op*)inst.pc(), i);
+const char* show(TranslateResult r) {
+  switch (r) {
+  case TranslateResult::Failure: return "Failure";
+  case TranslateResult::Retry:   return "Retry";
+  case TranslateResult::Success: return "Success";
   }
-  if (hasImmVector(*reinterpret_cast<const Op*>(inst.pc()))) {
-    inst.immVec = getImmVector((Op*)inst.pc());
-  }
-  if (inst.op() == OpFCallArray) {
-    inst.imm[0].u_IVA = 1;
-  }
-}
-
-const char* Translator::translateResultName(TranslateResult r) {
-  static const char* const names[] = {
-    "Failure",
-    "Retry",
-    "Success",
-  };
-  return names[r];
+  not_reached();
 }
 
 /*
- * Similar to applyInputMetaData, but designed to be used during ir
- * generation. Reads and writes types of values using hhbcTrans. This will
- * eventually replace applyInputMetaData.
+ * Create a map from RegionDesc::BlockId -> IR Block* for all region blocks.
  */
-void readMetaData(Unit::MetaHandle& handle, NormalizedInstruction& inst,
-                  HhbcTranslator& hhbcTrans, bool profiling,
-                  MetaMode metaMode /* = Normal */) {
-  if (isAlwaysNop(inst.op())) {
-    inst.noOp = true;
-    return;
-  }
-
-  if (!handle.findMeta(inst.unit(), inst.offset())) return;
-
-  Unit::MetaInfo info;
-  if (!handle.nextArg(info)) return;
-
-  /*
-   * We need to adjust the indexes in MetaInfo::m_arg if this instruction takes
-   * other stack arguments than those related to the MVector.  (For example,
-   * the rhs of an assignment.)
-   */
-  auto const& iInfo = instrInfo[inst.op()];
-  if (iInfo.in & AllLocals) {
-    /*
-     * RetC/RetV dont care about their stack input, but it may have been
-     * annotated. Skip it (because RetC/RetV pretend they dont have a stack
-     * input).
-     */
-    return;
-  }
-  if (iInfo.in == FuncdRef) {
-    /*
-     * FPassC* pretend to have no inputs
-     */
-    return;
-  }
-  const int base = !(iInfo.in & MVector) ? 0 :
-                   !(iInfo.in & Stack1) ? 0 :
-                   !(iInfo.in & Stack2) ? 1 :
-                   !(iInfo.in & Stack3) ? 2 : 3;
-
-  auto stackFilter = [metaMode, &inst](Location loc) {
-    if (metaMode == MetaMode::Legacy && loc.space == Location::Stack) {
-      loc.offset = -(loc.offset + 1) + inst.stackOffset;
-    }
-    return loc;
-  };
-
-  do {
-    SKTRACE(3, inst.source, "considering MetaInfo of kind %d\n", info.m_kind);
-
-    int arg = info.m_arg & Unit::MetaInfo::VectorArg ?
-      base + (info.m_arg & ~Unit::MetaInfo::VectorArg) : info.m_arg;
-    auto updateType = [&]{
-      /* don't update input rtt for Legacy mode */
-      if (metaMode == MetaMode::Legacy) return;
-      auto& input = *inst.inputs[arg];
-      input.rtt = hhbcTrans.rttFromLocation(stackFilter(input.location));
-    };
-
-    switch (info.m_kind) {
-      case Unit::MetaInfo::Kind::GuardedCls:
-        inst.guardedCls = true;
-        break;
-      case Unit::MetaInfo::Kind::DataTypePredicted: {
-        // When we're translating a Tracelet from Translator::analyze(), the
-        // information from these predictions has been added to the
-        // NormalizedInstructions in the instruction stream, so they aren't
-        // necessary (and they caused a perf regression). HHIR guard relaxation
-        // is capable of eliminating unnecessary predictions and the
-        // information added here is valuable to it.
-        if ((metaMode == MetaMode::Legacy &&
-             !RuntimeOption::EvalHHIRRelaxGuards) || profiling) {
-          break;
-        }
-        auto const loc = stackFilter(inst.inputs[arg]->location).
-                         toLocation(inst.stackOffset);
-        auto const t = Type(DataType(info.m_data));
-        auto const offset = inst.source.offset();
-
-        // These 'predictions' mean the type is InitNull or the predicted type,
-        // so we assert InitNull | t, then guard t if the location isn't known
-        // to be null. This allows certain optimizations in the IR.
-        hhbcTrans.assertType(loc, Type::InitNull | t);
-        auto oldType = hhbcTrans.rttFromLocation(
-          stackFilter(inst.inputs[arg]->location)).valueType();
-        if (!IS_NULL_TYPE(oldType)) {
-          hhbcTrans.checkType(loc, t, offset);
-        }
-        updateType();
-        break;
-      }
-      case Unit::MetaInfo::Kind::DataTypeInferred: {
-        hhbcTrans.assertType(
-          stackFilter(inst.inputs[arg]->location).toLocation(inst.stackOffset),
-          Type(DataType(info.m_data)));
-        updateType();
-        break;
-      }
-      case Unit::MetaInfo::Kind::Class: {
-        auto& rtt = inst.inputs[arg]->rtt;
-        auto const& location = inst.inputs[arg]->location;
-
-        // We need to know the boxiness of rtt.
-        if (rtt.outerType() == KindOfAny) break;
-
-        // The previously known type may not be KindOfObject because
-        // it was relaxed.  The meta-data guarantees that the type is
-        // KindOfObject (or KindOfNull), so change rtt to KindOfObject
-        // while keeping its boxiness. Note the RuntimeType cannot
-        // express the Null possibility.  That's handled in assertClass.
-        if (rtt.valueType() != KindOfObject) {
-          RuntimeType newRtt = rtt.isRef() ?
-            RuntimeType(KindOfRef, KindOfObject) : RuntimeType(KindOfObject);;
-          SKTRACE(1, inst.source, "changing rtt from %s to %s\n",
-                  rtt.pretty().c_str(), newRtt.pretty().c_str());
-          rtt = newRtt;
-        }
-        const StringData* metaName = inst.unit()->lookupLitstrId(info.m_data);
-        const StringData* rttName =
-          rtt.valueClass() ? rtt.valueClass()->name() : nullptr;
-        // The two classes might not be exactly the same, which is ok
-        // as long as metaCls is more derived than rttCls.
-        Class* metaCls = Unit::lookupUniqueClass(metaName);
-        Class* rttCls = rttName ? Unit::lookupUniqueClass(rttName) : nullptr;
-        if (!metaCls || (rttCls && metaCls != rttCls &&
-                         !metaCls->classof(rttCls))) {
-          // Runtime type is more derived
-          metaCls = rttCls;
-        }
-        if (location.space != Location::This) {
-          hhbcTrans.assertClass(
-            stackFilter(location).toLocation(inst.stackOffset), metaCls);
-        } else {
-          assert(!metaCls || metaCls->classof(hhbcTrans.curClass()));
-        }
-        if (!metaCls) break;
-
-        if (metaCls == rttCls) break;
-        SKTRACE(1, inst.source, "replacing input %d with a MetaInfo-supplied "
-                "class of %s; old type = %s\n",
-                arg, metaName->data(), rtt.pretty().c_str());
-        if (rtt.isRef()) {
-          rtt = RuntimeType(KindOfRef, KindOfObject, metaCls);
-        } else {
-          rtt = RuntimeType(KindOfObject, KindOfNone, metaCls);
-        }
-        break;
-      }
-      case Unit::MetaInfo::Kind::MVecPropClass: {
-        const StringData* metaName = inst.unit()->lookupLitstrId(info.m_data);
-        Class* metaCls = Unit::lookupUniqueClass(metaName);
-        if (metaCls) {
-          inst.immVecClasses[arg] = metaCls;
-        }
-        break;
-      }
-
-      case Unit::MetaInfo::Kind::GuardedThis:
-        // fallthrough; these are handled in preInputApplyMetaData.
-      case Unit::MetaInfo::Kind::None:
-        break;
-    }
-  } while (handle.nextArg(info));
-}
-
-bool instrMustInterp(const NormalizedInstruction& inst) {
-  if (RuntimeOption::EvalJitAlwaysInterpOne) return true;
-
-  switch (inst.op()) {
-    // Generate a case for each instruction we support at least partially.
-# define CASE(name) case Op::name:
-  INSTRS
-# undef CASE
-# define NOTHING(...) // PSEUDOINSTR_DISPATCH has the cases in it
-  PSEUDOINSTR_DISPATCH(NOTHING)
-# undef NOTHING
-      return false;
-
-    default:
-      return true;
-  }
-}
-
-void Translator::traceStart(Offset initBcOffset, Offset initSpOffset,
-                            bool resumed, const Func* func) {
-  assert(!m_irTrans);
-
-  FTRACE(1, "{}{:-^40}{}\n",
-         color(ANSI_COLOR_BLACK, ANSI_BGCOLOR_GREEN),
-         " HHIR during translation ",
-         color(ANSI_COLOR_END));
-
-  m_irTrans.reset(new IRTranslator(initBcOffset, initSpOffset, resumed, func));
-}
-
-void Translator::traceEnd() {
-  assert(!m_irTrans->hhbcTrans().isInlining());
-  m_irTrans->hhbcTrans().end();
-  FTRACE(1, "{}{:-^40}{}\n",
-         color(ANSI_COLOR_BLACK, ANSI_BGCOLOR_GREEN),
-         "",
-         color(ANSI_COLOR_END));
-}
-
-void Translator::traceFree() {
-  FTRACE(1, "HHIR free: arena size: {}\n",
-         m_irTrans->hhbcTrans().unit().arena().size());
-  m_irTrans.reset();
-}
-
-/*
- * Create two maps for all blocks in the region:
- *   - a map from RegionDesc::BlockId -> IR Block* for all region blocks
- *   - a map from RegionDesc::BlockId -> RegionDesc::Block
- */
-void Translator::createBlockMaps(const RegionDesc&        region,
-                                 BlockIdToIRBlockMap&     blockIdToIRBlock,
-                                 BlockIdToRegionBlockMap& blockIdToRegionBlock)
-{
-  HhbcTranslator& ht = m_irTrans->hhbcTrans();
-  IRBuilder& irb = ht.irBuilder();
+static void createBlockMap(HTS& hts,
+                           const RegionDesc& region,
+                           BlockIdToIRBlockMap& blockIdToIRBlock) {
+  auto& irb = *hts.irb;
   blockIdToIRBlock.clear();
-  blockIdToRegionBlock.clear();
-  for (auto regionBlock : region.blocks) {
-    RegionDesc::Block* rBlock = regionBlock.get();
+  auto const& blocks = region.blocks();
+  for (unsigned i = 0; i < blocks.size(); i++) {
+    auto rBlock = blocks[i];
     auto id = rBlock->id();
-    Offset bcOff = rBlock->start().offset();
-    Block* iBlock = bcOff == irb.unit().bcOff() ? irb.unit().entry()
-                                                : irb.unit().defBlock();
-    blockIdToIRBlock[id]     = iBlock;
-    blockIdToRegionBlock[id] = rBlock;
+    DEBUG_ONLY Offset bcOff = rBlock->start().offset();
+    assert(IMPLIES(i == 0, bcOff == irb.unit().bcOff()));
+
+    // NB: This maps the region entry block to a new IR block, even though
+    // we've already constructed an IR entry block. We'll make the IR entry
+    // block jump to this block.
+    Block* iBlock = irb.unit().defBlock();
+
+    blockIdToIRBlock[id] = iBlock;
     FTRACE(1,
            "createBlockMaps: RegionBlock {} => IRBlock {} (BC offset = {})\n",
            id, iBlock->id(), bcOff);
@@ -4182,15 +1307,12 @@ void Translator::createBlockMaps(const RegionDesc&        region,
  * Set IRBuilder's Block associated to blockId's block according to
  * the mapping in blockIdToIRBlock.
  */
-void Translator::setIRBlock(RegionDesc::BlockId            blockId,
-                            const BlockIdToIRBlockMap&     blockIdToIRBlock,
-                            const BlockIdToRegionBlockMap& blockIdToRegionBlock)
-{
-  IRBuilder& irb = m_irTrans->hhbcTrans().irBuilder();
-  auto rit = blockIdToRegionBlock.find(blockId);
-  assert(rit != blockIdToRegionBlock.end());
-  RegionDesc::Block* rBlock = rit->second;
-
+static void setIRBlock(HTS& hts,
+                       RegionDesc::BlockId blockId,
+                       const RegionDesc& region,
+                       const BlockIdToIRBlockMap& blockIdToIRBlock) {
+  auto& irb = *hts.irb;
+  auto rBlock = region.block(blockId);
   Offset bcOffset = rBlock->start().offset();
 
   auto iit = blockIdToIRBlock.find(blockId);
@@ -4206,148 +1328,456 @@ void Translator::setIRBlock(RegionDesc::BlockId            blockId,
  * Set IRBuilder's Blocks for srcBlockId's successors' offsets within
  * the region.
  */
-void Translator::setSuccIRBlocks(
-  const RegionDesc&              region,
-  RegionDesc::BlockId            srcBlockId,
-  const BlockIdToIRBlockMap&     blockIdToIRBlock,
-  const BlockIdToRegionBlockMap& blockIdToRegionBlock)
-{
+static void setSuccIRBlocks(HTS& hts,
+                            const RegionDesc& region,
+                            RegionDesc::BlockId srcBlockId,
+                            const BlockIdToIRBlockMap& blockIdToIRBlock) {
   FTRACE(3, "setSuccIRBlocks: srcBlockId = {}\n", srcBlockId);
-  IRBuilder& irb = m_irTrans->hhbcTrans().irBuilder();
+  auto& irb = *hts.irb;
   irb.resetOffsetMapping();
-  for (auto& arc : region.arcs) {
-    if (arc.src == srcBlockId) {
-      RegionDesc::BlockId dstBlockId = arc.dst;
-      setIRBlock(dstBlockId, blockIdToIRBlock, blockIdToRegionBlock);
-    }
+  for (auto dstBlockId : region.succs(srcBlockId)) {
+    setIRBlock(hts, dstBlockId, region, blockIdToIRBlock);
   }
 }
 
 /*
- * Compute the set of bytecode offsets that may follow the execution
- * of srcBlockId in the region.
+ * Check if `i' is an FPush{Func,ClsMethod}D followed by an FCall{,D} to a
+ * function with a singleton pattern, and if so, inline it.  Returns true if
+ * this succeeds, else false.
  */
-static void findSuccOffsets(const RegionDesc&              region,
-                            RegionDesc::BlockId            srcBlockId,
-                            const BlockIdToRegionBlockMap& blockIdToRegionBlock,
-                            OffsetSet&                     set) {
-  set.clear();
-  for (auto& arc : region.arcs) {
-    if (arc.src == srcBlockId) {
-      RegionDesc::BlockId dstBlockId = arc.dst;
-      auto rit = blockIdToRegionBlock.find(dstBlockId);
-      assert(rit != blockIdToRegionBlock.end());
-      RegionDesc::Block* rDstBlock = rit->second;
-      Offset bcOffset = rDstBlock->start().offset();
-      set.insert(bcOffset);
-    }
+static bool tryTranslateSingletonInline(HTS& hts,
+                                        const NormalizedInstruction& ninst,
+                                        const Func* funcd) {
+  using Atom = BCPattern::Atom;
+  using Captures = BCPattern::CaptureVec;
+
+  if (!funcd) return false;
+
+  // Make sure we have an acceptable FPush and non-null callee.
+  assert(ninst.op() == Op::FPushFuncD ||
+         ninst.op() == Op::FPushClsMethodD);
+
+  auto fcall = ninst.nextSk();
+
+  // Check if the next instruction is an acceptable FCall.
+  if ((fcall.op() != Op::FCall && fcall.op() != Op::FCallD) ||
+      funcd->isResumable() || funcd->isReturnRef()) {
+    return false;
   }
+
+  // First, check for the static local singleton pattern...
+
+  // Lambda to check if CGetL and StaticLocInit refer to the same local.
+  auto has_same_local = [] (PC pc, const Captures& captures) {
+    if (captures.size() == 0) return false;
+
+    auto cgetl = (const Op*)pc;
+    auto sli = (const Op*)captures[0];
+
+    assert(*cgetl == Op::CGetL);
+    assert(*sli == Op::StaticLocInit);
+
+    return (getImm(sli, 0).u_IVA == getImm(cgetl, 0).u_IVA);
+  };
+
+  auto cgetl = Atom(Op::CGetL).onlyif(has_same_local);
+  auto retc  = Atom(Op::RetC);
+
+  // Look for a static local singleton pattern.
+  auto result = BCPattern {
+    Atom(Op::Null),
+    Atom(Op::StaticLocInit).capture(),
+    Atom(Op::IsTypeL),
+    Atom::alt(
+      Atom(Op::JmpZ).taken({cgetl, retc}),
+      Atom::seq(Atom(Op::JmpNZ), cgetl, retc)
+    )
+  }.ignore(
+    {Op::AssertRATL, Op::AssertRATStk}
+  ).matchAnchored(funcd);
+
+  if (result.found()) {
+    try {
+      irgen::prepareForNextHHBC(hts, nullptr, ninst.offset(), false);
+      irgen::inlSingletonSLoc(
+        hts,
+        funcd,
+        (const Op*)result.getCapture(0)
+      );
+    } catch (const FailedIRGen& e) {
+      return false;
+    } catch (const FailedCodeGen& e) {
+      return false;
+    }
+    TRACE(1, "[singleton-sloc] %s <- %s\n",
+        funcd->fullName()->data(),
+        fcall.func()->fullName()->data());
+    return true;
+  }
+
+  // Not found; check for the static property pattern.
+
+  // Factory for String atoms that are required to match another captured
+  // String opcode.
+  auto same_string_as = [&] (int i) {
+    return Atom(Op::String).onlyif([=] (PC pc, const Captures& captures) {
+      auto string1 = (const Op*)pc;
+      auto string2 = (const Op*)captures[i];
+      assert(*string1 == Op::String);
+      assert(*string2 == Op::String);
+
+      auto const unit = funcd->unit();
+      auto sd1 = unit->lookupLitstrId(getImmPtr(string1, 0)->u_SA);
+      auto sd2 = unit->lookupLitstrId(getImmPtr(string2, 0)->u_SA);
+
+      return (sd1 && sd1 == sd2);
+    });
+  };
+
+  auto stringProp = same_string_as(0);
+  auto stringCls  = same_string_as(1);
+  auto agetc = Atom(Op::AGetC);
+  auto cgets = Atom(Op::CGetS);
+
+  // Look for a class static singleton pattern.
+  result = BCPattern {
+    Atom(Op::String).capture(),
+    Atom(Op::String).capture(),
+    Atom(Op::AGetC),
+    Atom(Op::CGetS),
+    Atom(Op::IsTypeC),
+    Atom::alt(
+      Atom(Op::JmpZ).taken({stringProp, stringCls, agetc, cgets, retc}),
+      Atom::seq(Atom(Op::JmpNZ), stringProp, stringCls, agetc, cgets, retc)
+    )
+  }.ignore(
+    {Op::AssertRATL, Op::AssertRATStk}
+  ).matchAnchored(funcd);
+
+  if (result.found()) {
+    try {
+      irgen::prepareForNextHHBC(hts, nullptr, ninst.offset(), false);
+      irgen::inlSingletonSProp(
+        hts,
+        funcd,
+        (const Op*)result.getCapture(1),
+        (const Op*)result.getCapture(0)
+      );
+    } catch (const FailedIRGen& e) {
+      return false;
+    } catch (const FailedCodeGen& e) {
+      return false;
+    }
+    TRACE(1, "[singleton-sprop] %s <- %s\n",
+        funcd->fullName()->data(),
+        fcall.func()->fullName()->data());
+    return true;
+  }
+
+  return false;
 }
 
 /*
- * Returns whether or not succOffsets contains both successors of inst.
+ * Returns whether offset is a control-flow merge within region.
  */
-static bool containsBothSuccs(const OffsetSet&             succOffsets,
-                              const NormalizedInstruction& inst) {
-  assert(inst.op() == OpJmpZ || inst.op() == OpJmpNZ);
-  if (inst.breaksTracelet) return false;
-  Offset takenOffset      = inst.offset() + inst.imm[0].u_BA;
-  Offset fallthruOffset   = inst.offset() + instrLen((Op*)(inst.pc()));
-  bool   takenIncluded    = succOffsets.count(takenOffset);
-  bool   fallthruIncluded = succOffsets.count(fallthruOffset);
-  return takenIncluded && fallthruIncluded;
+static bool isMergePoint(Offset offset, const RegionDesc& region) {
+  for (auto const block : region.blocks()) {
+    auto const bid = block->id();
+    if (block->start().offset() == offset) {
+      auto inCount = region.preds(bid).size();
+      // NB: The entry block is a merge point if it has one predecessor.
+      if (block == region.entry()) ++inCount;
+      if (inCount >= 2) return true;
+    }
+  }
+  return false;
 }
 
-Translator::TranslateResult
-Translator::translateRegion(const RegionDesc& region,
-                            bool bcControlFlow,
-                            RegionBlacklist& toInterp) {
-  Timer _t(Timer::translateRegion);
+static bool blockIsLoopHeader(
+  const RegionDesc&             region,
+  RegionDesc::BlockId           blockId,
+  const RegionDesc::BlockIdSet& processedBlocks)
+{
+  for (auto predId : region.preds(blockId)) {
+    if (processedBlocks.count(predId) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
+/*
+ * Returns whether any instruction following inst (whether by fallthrough or
+ * branch target) is a merge in region.
+ */
+static bool nextIsMerge(const NormalizedInstruction& inst,
+                        const RegionDesc& region) {
+  Offset fallthruOffset = inst.offset() + instrLen((Op*)(inst.pc()));
+  if (instrHasConditionalBranch(inst.op())) {
+    auto offsetPtr = instrJumpOffset((Op*)inst.pc());
+    Offset takenOffset = inst.offset() + *offsetPtr;
+    return fallthruOffset == takenOffset
+      || isMergePoint(takenOffset, region)
+      || isMergePoint(fallthruOffset, region);
+  }
+  if (isUnconditionalJmp(inst.op())) {
+    auto offsetPtr = instrJumpOffset((Op*)inst.pc());
+    Offset takenOffset = inst.offset() + *offsetPtr;
+    return isMergePoint(takenOffset, region);
+  }
+  return isMergePoint(fallthruOffset, region);
+}
+
+//////////////////////////////////////////////////////////////////////
+
+#define IMM_MA(n)      0 /* ignored, but we need something (for commas) */
+#define IMM_BLA(n)     ni.immVec
+#define IMM_SLA(n)     ni.immVec
+#define IMM_ILA(n)     ni.immVec
+#define IMM_VSA(n)     ni.immVec
+#define IMM_IVA(n)     ni.imm[n].u_IVA
+#define IMM_I64A(n)    ni.imm[n].u_I64A
+#define IMM_LA(n)      ni.imm[n].u_LA
+#define IMM_IA(n)      ni.imm[n].u_IA
+#define IMM_DA(n)      ni.imm[n].u_DA
+#define IMM_SA(n)      ni.unit()->lookupLitstrId(ni.imm[n].u_SA)
+#define IMM_RATA(n)    ni.imm[n].u_RATA
+#define IMM_AA(n)      ni.unit()->lookupArrayId(ni.imm[n].u_AA)
+#define IMM_BA(n)      ni.imm[n].u_BA
+#define IMM_OA_IMPL(n) ni.imm[n].u_OA
+#define IMM_OA(subop)  (subop)IMM_OA_IMPL
+
+#define ONE(x0)           , IMM_##x0(0)
+#define TWO(x0,x1)        , IMM_##x0(0), IMM_##x1(1)
+#define THREE(x0,x1,x2)   , IMM_##x0(0), IMM_##x1(1), IMM_##x2(2)
+#define FOUR(x0,x1,x2,x3) , IMM_##x0(0), IMM_##x1(1), IMM_##x2(2), IMM_##x3(3)
+#define NA                   /*  */
+
+static void translateDispatch(HTS& hts,
+                              const NormalizedInstruction& ni) {
+#define O(nm, imms, ...) case Op::nm: irgen::emit##nm(hts imms); return;
+  switch (ni.op()) { OPCODES }
+#undef O
+}
+
+#undef FOUR
+#undef THREE
+#undef TWO
+#undef ONE
+#undef NA
+
+#undef IMM_MA
+#undef IMM_BLA
+#undef IMM_SLA
+#undef IMM_ILA
+#undef IMM_IVA
+#undef IMM_I64A
+#undef IMM_LA
+#undef IMM_IA
+#undef IMM_DA
+#undef IMM_SA
+#undef IMM_RATA
+#undef IMM_AA
+#undef IMM_BA
+#undef IMM_OA_IMPL
+#undef IMM_OA
+#undef IMM_VSA
+
+//////////////////////////////////////////////////////////////////////
+
+static Type flavorToType(FlavorDesc f) {
+  switch (f) {
+    case NOV: not_reached();
+
+    case CV: return Type::Cell;  // TODO(#3029148) this could be InitCell
+    case UV: return Type::Uninit;
+    case VV: return Type::BoxedInitCell;
+    case AV: return Type::Cls;
+    case RV: case FV: case CVV: case CVUV: return Type::Gen;
+  }
+  not_reached();
+}
+
+void translateInstr(HTS& hts, const NormalizedInstruction& ni) {
+  irgen::prepareForNextHHBC(
+    hts,
+    &ni,
+    ni.source.offset(),
+    ni.endsRegion && !irgen::isInlining(hts)
+  );
+
+  auto pc = reinterpret_cast<const Op*>(ni.pc());
+  for (auto i = 0, num = instrNumPops(pc); i < num; ++i) {
+    auto const type = flavorToType(instrInputFlavor(pc, i));
+    if (type != Type::Gen) {
+      // TODO(#5706706): want to use assertTypeLocation, but Location::Stack
+      // is a little unsure of itself.
+      irgen::assertTypeStack(hts, i, type);
+    }
+  }
+
+  FTRACE(1, "\n{:-^60}\n", folly::format("Translating {}: {} with stack:\n{}",
+                                         ni.offset(), ni.toString(),
+                                         show(hts)));
+
+  irgen::ringbuffer(hts, Trace::RBTypeBytecodeStart, ni.source, 2);
+  irgen::emitIncStat(hts, Stats::Instr_TC, 1);
+  if (Trace::moduleEnabledRelease(Trace::llvm, 1) ||
+      RuntimeOption::EvalJitLLVMCounters) {
+    irgen::gen(hts, CountBytecode);
+  }
+
+  if (RuntimeOption::EvalHHIRGenerateAsserts >= 2) {
+    irgen::gen(hts, DbgAssertRetAddr);
+  }
+
+  if (isAlwaysNop(ni.op())) {
+    // Do nothing
+  } else if (ni.interp || RuntimeOption::EvalJitAlwaysInterpOne) {
+    irgen::interpOne(hts, ni);
+  } else {
+    translateDispatch(hts, ni);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
+
+TranslateResult translateRegion(HTS& hts,
+                                const RegionDesc& region,
+                                RegionBlacklist& toInterp,
+                                TransFlags trflags) {
+  const Timer translateRegionTimer(Timer::translateRegion);
   FTRACE(1, "translateRegion starting with:\n{}\n", show(region));
-  HhbcTranslator& ht = m_irTrans->hhbcTrans();
-  assert(!region.blocks.empty());
-  const SrcKey startSk = region.blocks.front()->start();
-  auto profilingFunc = false;
 
-  BlockIdToIRBlockMap     blockIdToIRBlock;
-  BlockIdToRegionBlockMap blockIdToRegionBlock;
+  std::string errorMsg;
+  always_assert_log(check(region, errorMsg),
+                    [&] { return errorMsg + "\n" + show(region); });
 
-  if (bcControlFlow) {
-    ht.setGenMode(IRGenMode::CFG);
-    createBlockMaps(region, blockIdToIRBlock, blockIdToRegionBlock);
+  auto& irb = *hts.irb;
+
+  auto const startSk = region.start();
+
+  BlockIdToIRBlockMap blockIdToIRBlock;
+  if (RuntimeOption::EvalHHIRBytecodeControlFlow) {
+    hts.mode = IRGenMode::CFG;
+    createBlockMap(hts, region, blockIdToIRBlock);
+
+    // Make the IR entry block jump to the IR block we mapped the region entry
+    // block to (they are not the same!).
+
+    auto const entry = irb.unit().entry();
+    irb.startBlock(entry, entry->front().marker(), false /* isLoopHeader */);
+
+    auto const irBlock = blockIdToIRBlock[region.entry()->id()];
+    always_assert(irBlock != entry);
+
+    irgen::gen(hts, Jmp, irBlock);
   }
+
+  RegionDesc::BlockIdSet processedBlocks;
 
   Timer irGenTimer(Timer::translateRegion_irGeneration);
-  for (auto b = 0; b < region.blocks.size(); b++) {
-    auto const& block = region.blocks[b];
-    RegionDesc::BlockId blockId = block->id();
-    Unit::MetaHandle metaHand;
-    SrcKey sk = block->start();
-    const Func* topFunc = nullptr;
-    auto typePreds  = makeMapWalker(block->typePreds());
-    auto byRefs     = makeMapWalker(block->paramByRefs());
-    auto refPreds   = makeMapWalker(block->reffinessPreds());
-    auto knownFuncs = makeMapWalker(block->knownFuncs());
+  auto& blocks = region.blocks();
+  for (auto b = 0; b < blocks.size(); b++) {
+    auto const& block  = blocks[b];
+    auto const blockId = block->id();
+    auto sk            = block->start();
+    auto typePreds     = makeMapWalker(block->typePreds());
+    auto byRefs        = makeMapWalker(block->paramByRefs());
+    auto refPreds      = makeMapWalker(block->reffinessPreds());
+    auto knownFuncs    = makeMapWalker(block->knownFuncs());
+    auto skipTrans     = false;
 
-    OffsetSet succOffsets;
-    if (ht.genMode() == IRGenMode::CFG) {
-      ht.irBuilder().startBlock(blockIdToIRBlock[blockId]);
-      findSuccOffsets(region, blockId, blockIdToRegionBlock, succOffsets);
-      setSuccIRBlocks(region, blockId, blockIdToIRBlock, blockIdToRegionBlock);
+    const Func* topFunc = nullptr;
+    TransID profTransId = getTransId(blockId);
+    hts.profTransID = profTransId;
+
+    bool isLoopHeader = false;
+
+    if (hts.mode == IRGenMode::CFG) {
+      Block* irBlock = blockIdToIRBlock[blockId];
+      isLoopHeader = blockIsLoopHeader(region, blockId, processedBlocks);
+      always_assert(IMPLIES(isLoopHeader, RuntimeOption::EvalJitLoops));
+
+      BCMarker marker(sk, block->initialSpOffset(), profTransId);
+      if (!irb.startBlock(irBlock, marker, isLoopHeader)) {
+        FTRACE(1, "translateRegion: block {} is unreachable, skipping\n",
+               blockId);
+        processedBlocks.insert(blockId);
+        continue;
+      }
+      setSuccIRBlocks(hts, region, blockId, blockIdToIRBlock);
     }
-    ht.irBuilder().recordOffset(sk.offset());
 
     for (unsigned i = 0; i < block->length(); ++i, sk.advance(block->unit())) {
       // Update bcOff here so any guards or assertions from metadata are
       // attributed to this instruction.
-      ht.setBcOff(sk.offset(), false);
+      irgen::prepareForNextHHBC(hts, nullptr, sk.offset(), false);
 
       // Emit prediction guards. If this is the first instruction in the
-      // region the guards will go to a retranslate request. Otherwise, they'll
-      // go to a side exit.
-      bool isFirstRegionInstr = block == region.blocks.front() && i == 0;
-      if (isFirstRegionInstr) ht.emitRB(Trace::RBTypeTraceletGuards, sk);
+      // region, and the region's entry block is not a loop header, the guards
+      // will go to a retranslate request. Otherwise, they'll go to a side
+      // exit.
+      auto const isEntry = block == region.entry();
+      auto const useGuards = (isEntry && !isLoopHeader && i == 0);
+      if (useGuards) irgen::ringbuffer(hts, Trace::RBTypeTraceletGuards, sk);
 
+      // Emit type guards.
       while (typePreds.hasNext(sk)) {
         auto const& pred = typePreds.next();
         auto type = pred.type;
         auto loc  = pred.location;
         if (type <= Type::Cls) {
-          // Do not generate guards for class; instead assert the type
+          // Do not generate guards for class; instead assert the type.
           assert(loc.tag() == RegionDesc::Location::Tag::Stack);
-          ht.assertType(loc, type);
-        } else if (isFirstRegionInstr) {
-          bool checkOuterTypeOnly = m_mode != TransProfile;
-          ht.guardTypeLocation(loc, type, checkOuterTypeOnly);
+          irgen::assertTypeLocation(hts, loc, type);
+        } else if (useGuards) {
+          bool checkOuterTypeOnly = mcg->tx().mode() != TransKind::Profile;
+          irgen::guardTypeLocation(hts, loc, type, checkOuterTypeOnly);
         } else {
-          ht.checkType(loc, type, sk.offset());
+          irgen::checkTypeLocation(hts, loc, type, sk.offset());
         }
       }
 
-      // Emit reffiness guards. For now, we only support reffiness guards at
-      // the beginning of the region.
       while (refPreds.hasNext(sk)) {
-        assert(sk == startSk);
         auto const& pred = refPreds.next();
-        ht.guardRefs(pred.arSpOffset, pred.mask, pred.vals);
+        if (useGuards) {
+          irgen::guardRefs(hts, pred.arSpOffset, pred.mask, pred.vals);
+        } else {
+          irgen::checkRefs(hts, pred.arSpOffset, pred.mask, pred.vals,
+            sk.offset());
+        }
       }
 
-      if (isFirstRegionInstr) {
+      // Finish emitting guards, and emit profiling counters.
+      if (useGuards) {
+        irgen::gen(hts, EndGuards);
         if (RuntimeOption::EvalJitTransCounters) {
-          ht.emitIncTransCounter();
+          irgen::incTransCounter(hts);
         }
 
-        if (m_mode == TransProfile) {
+        if (mcg->tx().mode() == TransKind::Profile) {
           if (block->func()->isEntry(block->start().offset())) {
-            ht.emitCheckCold(m_profData->curTransID());
-            profilingFunc = true;
+            irgen::checkCold(hts, mcg->tx().profData()->curTransID());
           } else {
-            ht.emitIncProfCounter(m_profData->curTransID());
+            irgen::incProfCounter(hts, mcg->tx().profData()->curTransID());
           }
         }
+        irgen::ringbuffer(hts, Trace::RBTypeTraceletBody, sk);
+      }
 
-        ht.emitRB(Trace::RBTypeTraceletBody, sk);
+      // In the entry block, hhbc-translator gets a chance to emit some code
+      // immediately after the initial guards/checks on the first instruction.
+      if (isEntry && i == 0) {
+        switch (arch()) {
+        case Arch::X64:
+          irgen::prepareEntry(hts);
+          break;
+        case Arch::ARM:
+          // Don't do this for ARM, because it can lead to interpOne on the
+          // first SrcKey in a translation, which isn't allowed.
+          break;
+        }
       }
 
       // Update the current funcd, if we have a new one.
@@ -4356,73 +1786,46 @@ Translator::translateRegion(const RegionDesc& region,
       }
 
       // Create and initialize the instruction.
-      NormalizedInstruction inst;
-      inst.source = sk;
-      inst.m_unit = block->unit();
-      inst.breaksTracelet =
-        i == block->length() - 1 && block == region.blocks.back();
-      inst.changesPC = opcodeChangesPC(inst.op());
+      NormalizedInstruction inst(sk, block->unit());
       inst.funcd = topFunc;
-      inst.nextOffset = kInvalidOffset;
-      if (instrIsNonCallControlFlow(inst.op()) && !inst.breaksTracelet) {
-        assert(b < region.blocks.size());
-        inst.nextOffset = region.blocks[b+1]->start().offset();
-      }
-      inst.outputPredicted = false;
-      populateImmediates(inst);
-      if (inst.op() == OpJmpZ || inst.op() == OpJmpNZ) {
-        // TODO(t3730617): Could extend this logic to other
-        // conditional control flow ops, e.g., IterNext, etc.
-        inst.includeBothPaths = containsBothSuccs(succOffsets, inst);
+      if (i == block->length() - 1) {
+        inst.endsRegion = region.isExit(blockId);
+        inst.nextIsMerge = nextIsMerge(inst, region);
+        if (hts.mode == IRGenMode::Trace &&
+            instrIsNonCallControlFlow(inst.op()) &&
+            b < blocks.size() - 1) {
+          inst.nextOffset = blocks[b+1]->start().offset();
+        }
       }
 
       // We can get a more precise output type for interpOne if we know all of
       // its inputs, so we still populate the rest of the instruction even if
       // this is true.
-      inst.interp = toInterp.count(sk);
+      inst.interp = toInterp.count(ProfSrcKey{profTransId, sk});
 
-      // Apply the first round of metadata from the repo and get a list of
-      // input locations.
-      preInputApplyMetaData(metaHand, &inst);
-
-      InputInfos inputInfos;
-      getInputs(startSk, inst, inputInfos, block->func(), [&](int i) {
-          return ht.irBuilder().localType(i, DataTypeGeneric);
-        });
+      auto const inputInfos = getInputs(startSk, inst);
 
       // Populate the NormalizedInstruction's input vector, using types from
       // HhbcTranslator.
       std::vector<DynLocation> dynLocs;
       dynLocs.reserve(inputInfos.size());
-      auto newDynLoc = [&](const InputInfo& ii) {
-        dynLocs.emplace_back(ii.loc, ht.rttFromLocation(ii.loc));
-        FTRACE(2, "rttFromLocation: {} -> {}\n",
-               ii.loc.pretty(), dynLocs.back().rtt.pretty());
+      auto newDynLoc = [&] (const InputInfo& ii) {
+        dynLocs.emplace_back(
+          ii.loc,
+          irgen::predictedTypeFromLocation(hts, ii.loc)
+        );
+        FTRACE(2, "predictedTypeFromLocation: {} -> {}\n",
+               ii.loc.pretty(), dynLocs.back().rtt);
         return &dynLocs.back();
       };
       FTRACE(2, "populating inputs for {}\n", inst.toString());
       for (auto const& ii : inputInfos) {
         inst.inputs.push_back(newDynLoc(ii));
       }
-
-      // Apply the remaining metadata. This may change the types of some of
-      // inst's inputs.
-      readMetaData(metaHand, inst, ht, m_mode == TransProfile);
-      if (!inst.noOp && inputInfos.needsRefCheck) {
+      if (inputInfos.needsRefCheck) {
         assert(byRefs.hasNext(sk));
         inst.preppedByRef = byRefs.next();
       }
-
-      // Check for a type prediction. Put it in the NormalizedInstruction so
-      // the emit* method can use it if needed.
-      // In PGO mode, we don't really need the values coming from the
-      // interpreter type profiler.  TransProfile translations end whenever
-      // there's a side-exit, and type predictions incur side-exits.  And when
-      // we stitch multiple TransProfile translations together to form a
-      // larger region (in TransOptimize mode), the guard for the top of the
-      // stack essentially does the role of type prediction.  And, if the value
-      // is also inferred, then the guard is omitted.
-      auto const doPrediction = mode() == TransLive && outputIsPredicted(inst);
 
       // If this block ends with an inlined FCall, we don't emit anything for
       // the FCall and instead set up HhbcTranslator for inlining. Blocks from
@@ -4436,48 +1839,116 @@ Translator::translateRegion(const RegionDesc& region,
                block->func()->fullName()->data(),
                callee->fullName()->data(),
                inst.imm[0].u_IVA,
-               ht.showStack());
+               show(hts));
         auto returnSk = inst.nextSk();
         auto returnFuncOff = returnSk.offset() - block->func()->base();
-        ht.beginInlining(inst.imm[0].u_IVA, callee, returnFuncOff,
-                         doPrediction ? inst.outPred : Type::Gen);
+        irgen::beginInlining(hts, inst.imm[0].u_IVA, callee, returnFuncOff);
+        // "Fallthrough" into the callee's first block
+        irgen::endBlock(hts, blocks[b + 1]->start().offset(), inst.nextIsMerge);
         continue;
+      }
+
+      // Singleton inlining optimization.
+      if (RuntimeOption::EvalHHIRInlineSingletons) {
+        bool didInlineSingleton = [&] {
+          if (!RuntimeOption::RepoAuthoritative) return false;
+
+          // I don't really want to inline my arm, thanks.
+          if (arch() != Arch::X64) return false;
+
+          // Don't inline if we're retranslating due to a side-exit from an
+          // inlined call.
+          if (trflags.noinlineSingleton && startSk == inst.source) return false;
+
+          // Bail early if this isn't a push.
+          if (inst.op() != Op::FPushFuncD &&
+              inst.op() != Op::FPushClsMethodD) {
+            return false;
+          }
+
+          // ...and also if this is the end of the block.
+          if (i == block->length() - 1) return false;
+
+          auto nextSK = inst.nextSk();
+
+          // If the normal machinery is already inlining this function, don't
+          // do anything here.
+          if (i == block->length() - 2 &&
+              (nextSK.op() == Op::FCall || nextSK.op() == Op::FCallD) &&
+              block->inlinedCallee()) {
+            return false;
+          }
+
+          // This is safe to do even if singleton inlining fails; we just won't
+          // change topFunc in the next pass since hasNext() will return false.
+          if (knownFuncs.hasNext(nextSK)) {
+            topFunc = knownFuncs.next();
+
+            // Detect a singleton pattern and inline it if found.
+            return tryTranslateSingletonInline(hts, inst, topFunc);
+          }
+
+          return false;
+        }();
+
+        // Skip the translation of this instruction (the FPush) -and- the next
+        // instruction (the FCall) if we succeeded at singleton inlining.  We
+        // still want the fallthrough and prediction logic, though.
+        if (didInlineSingleton) {
+          skipTrans = true;
+          continue;
+        }
       }
 
       // Emit IR for the body of the instruction.
       try {
-        m_irTrans->translateInstr(inst);
+        if (!skipTrans) translateInstr(hts, inst);
       } catch (const FailedIRGen& exn) {
+        ProfSrcKey psk{profTransId, sk};
         always_assert_log(
-          !toInterp.count(sk),
+          !toInterp.count(psk),
           [&] {
             std::ostringstream oss;
             oss << folly::format("IR generation failed with {}\n", exn.what());
-            print(oss, m_irTrans->hhbcTrans().unit());
+            print(oss, hts.unit);
             return oss.str();
           });
-        toInterp.insert(sk);
-        return Retry;
+        toInterp.insert(psk);
+        return TranslateResult::Retry;
       }
 
-      // Insert a fallthrough jump
-      if (ht.genMode() == IRGenMode::CFG &&
-          i == block->length() - 1 && block != region.blocks.back()) {
+      skipTrans = false;
+
+      // In CFG mode, insert a fallthrough jump at the end of each block.
+      if (hts.mode == IRGenMode::CFG && i == block->length() - 1) {
         if (instrAllowsFallThru(inst.op())) {
-          auto nextOffset = inst.nextOffset != kInvalidOffset
-            ? inst.nextOffset
-            : inst.offset() + instrLen((Op*)(inst.pc()));
-          ht.endBlock(nextOffset);
+          auto nextOffset = inst.offset() + instrLen((Op*)(inst.pc()));
+          // prepareForSideExit is done later in Trace mode, but it
+          // needs to happen here or else we generate the SpillStack
+          // after the fallthrough jump, which is just weird.
+          if (b < blocks.size() - 1 && region.isSideExitingBlock(blockId)) {
+            irgen::prepareForSideExit(hts);
+          }
+          irgen::endBlock(hts, nextOffset, inst.nextIsMerge);
+        } else if (b < blocks.size() - 1 &&
+                   (isRet(inst.op()) || inst.op() == OpNativeImpl)) {
+          // "Fallthrough" from inlined return to the next block
+          irgen::endBlock(hts, blocks[b + 1]->start().offset(),
+                          inst.nextIsMerge);
+        }
+        if (region.isExit(blockId)) {
+          irgen::endRegion(hts);
         }
       }
+    }
 
-      // Check the prediction. If the predicted type is less specific than what
-      // is currently on the eval stack, checkType won't emit any code.
-      if (doPrediction) {
-        ht.checkTypeStack(0, inst.outPred,
-                          sk.advanced(block->unit()).offset());
+    if (hts.mode == IRGenMode::Trace) {
+      if (b < blocks.size() - 1 && region.isSideExitingBlock(blockId)) {
+        irgen::prepareForSideExit(hts);
       }
     }
+
+    processedBlocks.insert(blockId);
 
     assert(!typePreds.hasNext());
     assert(!byRefs.hasNext());
@@ -4485,27 +1956,41 @@ Translator::translateRegion(const RegionDesc& region,
     assert(!knownFuncs.hasNext());
   }
 
-  traceEnd();
+  if (hts.mode == IRGenMode::Trace) irgen::endRegion(hts);
+
   irGenTimer.end();
 
   try {
-    translatorTraceCodeGen();
-    if (profilingFunc) profData()->setProfiling(startSk.func()->getFuncId());
+    mcg->traceCodeGen(hts);
+    if (mcg->tx().mode() == TransKind::Profile) {
+      mcg->tx().profData()->setProfiling(startSk.func()->getFuncId());
+    }
   } catch (const FailedCodeGen& exn) {
     SrcKey sk{exn.vmFunc, exn.bcOff, exn.resumed};
+    ProfSrcKey psk{exn.profTransId, sk};
     always_assert_log(
-      !toInterp.count(sk),
+      !toInterp.count(psk),
       [&] {
         std::ostringstream oss;
         oss << folly::format("code generation failed with {}\n", exn.what());
-        print(oss, m_irTrans->hhbcTrans().unit());
+        print(oss, hts.irb->unit());
         return oss.str();
       });
-    toInterp.insert(sk);
-    return Retry;
+    toInterp.insert(psk);
+    return TranslateResult::Retry;
+  } catch (const DataBlockFull& dbFull) {
+    if (dbFull.name == "hot") {
+      assert(mcg->tx().useAHot());
+      mcg->tx().setUseAHot(false);
+      // We can't return Retry here because the code block selection
+      // will still say hot.
+      return TranslateResult::Failure;
+    } else {
+      always_assert_flog(0, "data block = {}\nmessage: {}\n",
+                         dbFull.name, dbFull.what());
+    }
   }
-
-  return Success;
+  return TranslateResult::Success;
 }
 
 uint64_t* Translator::getTransCounterAddr() {
@@ -4535,20 +2020,20 @@ void Translator::addTranslation(const TransRec& transRec) {
                           transRec.src.getFuncId(),
                           transRec.src.offset()).str().c_str(),
                         transRec.aLen,
-                        transRec.astubsLen,
+                        transRec.acoldLen,
                         transRec.kind);
   }
 
   if (!isTransDBEnabled()) return;
   uint32_t id = getCurrentTransID();
-  m_translations.push_back(transRec);
-  m_translations[id].setID(id);
+  m_translations.emplace_back(transRec);
+  m_translations[id].id = id;
 
   if (transRec.aLen > 0) {
     m_transDB[transRec.aStart] = id;
   }
-  if (transRec.astubsLen > 0) {
-    m_transDB[transRec.astubsStart] = id;
+  if (transRec.acoldLen > 0) {
+    m_transDB[transRec.acoldStart] = id;
   }
 }
 
@@ -4567,209 +2052,9 @@ uint64_t Translator::getTransCounter(TransID transId) const {
   return counter;
 }
 
-namespace {
-
-struct DeferredPathInvalidate : public DeferredWorkItem {
-  const std::string m_path;
-  explicit DeferredPathInvalidate(const std::string& path) : m_path(path) {
-    assert(m_path.size() >= 1 && m_path[0] == '/');
-  }
-  void operator()() {
-    String spath(m_path);
-    /*
-     * inotify saw this path change. Now poke the file repository;
-     * it will notice the underlying PhpFile* has changed.
-     *
-     * We don't actually need to *do* anything with the PhpFile* from
-     * this lookup; since the path has changed, the file we'll get out is
-     * going to be some new file, not the old file that needs invalidation.
-     */
-    (void)g_context->lookupPhpFile(spath.get(), "");
-  }
-};
-
-}
-
-static const char *transKindStr[] = {
-#define DO(KIND) #KIND,
-  TRANS_KINDS
-#undef DO
-};
-
-const char *getTransKindName(TransKind kind) {
-  assert(kind >= 0 && kind < TransInvalid);
-  return transKindStr[kind];
-}
-
-TransRec::TransRec(SrcKey                   s,
-                   MD5                      _md5,
-                   TransKind                _kind,
-                   const Tracelet*          t,
-                   TCA                      _aStart,
-                   uint32_t                 _aLen,
-                   TCA                      _astubsStart,
-                   uint32_t                 _astubsLen,
-                   std::vector<TransBCMapping>   _bcMapping)
-    : id(0)
-    , kind(_kind)
-    , src(s)
-    , md5(_md5)
-    , bcStopOffset(t ? t->nextSk().offset() : 0)
-    , aStart(_aStart)
-    , aLen(_aLen)
-    , astubsStart(_astubsStart)
-    , astubsLen(_astubsLen)
-    , bcMapping(_bcMapping) {
-  if (t != nullptr) {
-    for (auto dep : t->m_dependencies) {
-      dependencies.push_back(*dep.second);
-    }
-  }
-}
-
-
-std::string
-TransRec::print(uint64_t profCount) const {
-  std::string ret;
-
-  // Split up the call to prevent template explosion
-  ret += folly::format(
-           "Translation {} {{\n"
-           "  src.md5 = {}\n"
-           "  src.funcId = {}\n"
-           "  src.startOffset = {}\n"
-           "  src.stopOffset = {}\n"
-           "  src.resumed = {}\n",
-           id, md5, src.getFuncId(), src.offset(), bcStopOffset,
-           (int32_t)src.resumed()).str();
-
-  ret += folly::format(
-           "  kind = {} ({})\n"
-           "  aStart = {}\n"
-           "  aLen = {:#x}\n"
-           "  stubStart = {}\n"
-           "  stubLen = {:#x}\n",
-           static_cast<uint32_t>(kind), getTransKindName(kind),
-           aStart, aLen, astubsStart, astubsLen).str();
-
-  ret += folly::format(
-           "  profCount = {}\n"
-           "  bcMapping = {}\n",
-           profCount, bcMapping.size()).str();
-
-  for (auto const& info : bcMapping) {
-    ret += folly::format(
-      "    {} {} {} {}\n",
-      info.md5, info.bcStart,
-      info.aStart, info.astubsStart).str();
-  }
-
-  ret += "}\n\n";
-  return ret;
-}
-
-void
-ActRecState::pushFunc(const NormalizedInstruction& inst) {
-  assert(isFPush(inst.op()));
-  if (inst.op() == OpFPushFuncD || inst.op() == OpFPushFuncU) {
-    const Unit& unit = *inst.unit();
-    Id funcId = inst.imm[1].u_SA;
-    auto const& nep = unit.lookupNamedEntityPairId(funcId);
-    auto const func = Unit::lookupFunc(nep.second);
-    if (func) func->validate();
-    if (func && func->isNameBindingImmutable(&unit)) {
-      pushFuncD(func);
-      return;
-    }
-  }
-  pushDynFunc();
-}
-
-void
-ActRecState::pushFuncD(const Func* func) {
-  TRACE(2, "ActRecState: pushStatic func %p(%s)\n", func, func->name()->data());
-  func->validate();
-  Record r;
-  r.m_state = State::KNOWN;
-  r.m_topFunc = func;
-  r.m_entryArDelta = InvalidEntryArDelta;
-  m_arStack.push_back(r);
-}
-
-void
-ActRecState::pushDynFunc() {
-  TRACE(2, "ActRecState: pushDynFunc\n");
-  Record r;
-  r.m_state = State::UNKNOWABLE;
-  r.m_topFunc = nullptr;
-  r.m_entryArDelta = InvalidEntryArDelta;
-  m_arStack.push_back(r);
-}
-
-void
-ActRecState::pop() {
-  if (!m_arStack.empty()) {
-    m_arStack.pop_back();
-  }
-}
-
-/**
- * checkByRef() returns true if the parameter specified by argNum is pass
- * by reference, otherwise it returns false. This function may also throw an
- * UnknownInputException if the reffiness cannot be determined.
- *
- * Note that the 'entryArDelta' parameter specifies the delta between sp at
- * the beginning of the tracelet and ar.
- */
-bool
-ActRecState::checkByRef(int argNum, int entryArDelta, RefDeps* refDeps) {
-  FTRACE(2, "ActRecState: getting reffiness for arg {}, arDelta {}\n",
-         argNum, entryArDelta);
-  if (m_arStack.empty()) {
-    // The ActRec in question was pushed before the beginning of the
-    // tracelet, so we can make a guess about parameter reffiness and
-    // record our assumptions about parameter reffiness as tracelet
-    // guards.
-    const ActRec* ar = arFromSpOffset((ActRec*)vmsp(), entryArDelta);
-    Record r;
-    r.m_state = State::GUESSABLE;
-    r.m_entryArDelta = entryArDelta;
-    ar->m_func->validate();
-    r.m_topFunc = ar->m_func;
-    m_arStack.push_back(r);
-  }
-  Record& r = m_arStack.back();
-  if (r.m_state == State::UNKNOWABLE) {
-    TRACE(2, "ActRecState: unknowable, throwing in the towel\n");
-    throwUnknownInput();
-    not_reached();
-  }
-  assert(r.m_topFunc);
-  bool retval = r.m_topFunc->byRef(argNum);
-  if (r.m_state == State::GUESSABLE) {
-    assert(r.m_entryArDelta != InvalidEntryArDelta);
-    TRACE(2, "ActRecState: guessing arg%d -> %d\n", argNum, retval);
-    refDeps->addDep(r.m_entryArDelta, argNum, retval);
-  }
-  return retval;
-}
-
-const Func*
-ActRecState::knownFunc() {
-  if (currentState() != State::KNOWN) return nullptr;
-  assert(!m_arStack.empty());
-  return m_arStack.back().m_topFunc;
-}
-
-ActRecState::State
-ActRecState::currentState() {
-  if (m_arStack.empty()) return State::GUESSABLE;
-  return m_arStack.back().m_state;
-}
-
 const Func* lookupImmutableMethod(const Class* cls, const StringData* name,
                                   bool& magicCall, bool staticLookup,
-                                  Class* ctx) {
+                                  const Class* ctx) {
   if (!cls || RuntimeOption::EvalJitEnableRenameFunction) return nullptr;
   if (cls->attrs() & AttrInterface) return nullptr;
   bool privateOnly = false;
@@ -4835,34 +2120,25 @@ const Func* lookupImmutableMethod(const Class* cls, const StringData* name,
   return func;
 }
 
-std::string traceletShape(const Tracelet& trace) {
-  std::string ret;
-
-  for (auto ni = trace.m_instrStream.first; ni; ni = ni->next) {
-    using folly::toAppend;
-
-    toAppend(opcodeToName(ni->op()), &ret);
-    if (ni->immVec.isValid()) {
-      toAppend(
-        "<",
-        locationCodeString(ni->immVec.locationCode()),
-        &ret);
-      for (auto& mc : ni->immVecM) {
-        toAppend(" ", memberCodeString(mc), &ret);
-      }
-      toAppend(">", &ret);
-    }
-    toAppend(" ", &ret);
-  }
-
-  return ret;
+///////////////////////////////////////////////////////////////////////////////
 }
-
-} // HPHP::JIT
 
 void invalidatePath(const std::string& path) {
   TRACE(1, "invalidatePath: abspath %s\n", path.c_str());
-  PendQ::defer(new JIT::DeferredPathInvalidate(path));
+  assert(path.size() >= 1 && path[0] == '/');
+  Treadmill::enqueue([path] {
+    /*
+     * inotify saw this path change. Now poke the unit loader; it will
+     * notice the underlying php file has changed.
+     *
+     * We don't actually need to *do* anything with the Unit* from
+     * this lookup; since the path has changed, the file we'll get out is
+     * going to be some new file, not the old file that needs invalidation.
+     */
+    String spath(path);
+    lookupUnit(spath.get(), "", nullptr /* initial_opt */);
+  });
 }
 
-} // HPHP
+///////////////////////////////////////////////////////////////////////////////
+}

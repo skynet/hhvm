@@ -1,6 +1,4 @@
 <?php
-ini_set('open_basedir', .);
-
 require_once "open_basedir.inc";
 $initdir = getcwd();
 test_open_basedir_before("link");
@@ -24,6 +22,7 @@ var_dump(link($target, $link));
 var_dump(unlink($link));
 test_open_basedir_after("link");
 ?>
+<?php error_reporting(0); ?>
 <?php
 require_once "open_basedir.inc";
 delete_directories();

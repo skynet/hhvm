@@ -30,6 +30,8 @@ var_dump( filesize($dir) );
 
 echo "*** Done ***\n";
 ?>
+
+<?php error_reporting(0); ?>
 <?php
 unlink(dirname(__FILE__)."/copy_variation13_dir.tmp");
 rmdir(dirname(__FILE__)."/copy_variation13");

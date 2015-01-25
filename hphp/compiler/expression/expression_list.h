@@ -36,13 +36,12 @@ public:
 
   explicit ExpressionList(EXPRESSION_CONSTRUCTOR_PARAMETERS,
                           ListKind kind = ListKindParam);
-
+  ~ExpressionList();
   // change case to lower so to make it case insensitive
   void toLower();
 
   DECLARE_EXPRESSION_VIRTUAL_FUNCTIONS;
   ExpressionPtr preOptimize(AnalysisResultConstPtr ar);
-  ExpressionPtr postOptimize(AnalysisResultConstPtr ar);
 
   virtual void setContext(Context context);
   void setListKind(ListKind kind) { m_kind = kind; }
@@ -75,6 +74,8 @@ public:
   void markParams(bool noRefWrapper);
 
   void setCollectionType(Collection::Type cType);
+  void setContainsUnpack() { m_argUnpack = true; };
+  bool containsUnpack() const { return m_argUnpack; }
 
   virtual bool canonCompare(ExpressionPtr e) const;
 
@@ -92,6 +93,7 @@ private:
   ExpressionPtrVec m_exps;
   bool m_arrayElements;
   int m_collectionType;
+  bool m_argUnpack;
   ListKind m_kind;
 };
 

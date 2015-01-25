@@ -13,11 +13,13 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
-
 #include "parser.h"
+
+#include <folly/Conv.h>
+#include <folly/Format.h>
+
 #include "hphp/util/hash.h"
 
-#include <boost/lexical_cast.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 
 namespace HPHP {
@@ -28,15 +30,26 @@ bool ParserBase::IsClosureName(const std::string &name) {
 }
 
 std::string ParserBase::newClosureName(
+    const std::string &namespaceName,
     const std::string &className,
     const std::string &funcName) {
+  // Closure names must be globally unique.  The easiest way to do
+  // this is include a hash of the filename.
+  int64_t hash = hash_string_cs(m_fileName, strlen(m_fileName));
+
   std::string name = "Closure$";
   if (!className.empty()) {
     name += className + "::";
+  } else if (!namespaceName.empty()) {
+    // If className is present, it already includes the namespace
+    name += namespaceName + "\\";
   }
   name += funcName;
 
   int id = ++m_seenClosures[name];
+
+  folly::format(&name, ";{}", hash);
+
   if (id > 1) {
     // we've seen the same name before, uniquify
     name = name + '#' + std::to_string(id);
@@ -59,12 +72,18 @@ ParserBase::ParserBase(Scanner &scanner, const char *fileName)
 ParserBase::~ParserBase() {
 }
 
-std::string ParserBase::getMessage(bool filename /* = false */) const {
+std::string ParserBase::getMessage(bool filename /* = false */,
+                                   bool rawPosWhenNoError /* = false */
+                                  ) const {
   std::string ret = m_scanner.getError();
+
   if (!ret.empty()) {
     ret += " ";
   }
-  ret += getMessage(m_scanner.getLocation(), filename);
+  if (!ret.empty() || rawPosWhenNoError) {
+    ret += getMessage(m_scanner.getLocation(), filename);
+  }
+
   return ret;
 }
 
@@ -76,13 +95,13 @@ std::string ParserBase::getMessage(Location *loc,
   if (filename) {
     ret += std::string("File: ") + file() + ", ";
   }
-  ret += std::string("Line: ") + boost::lexical_cast<std::string>(line);
-  ret += ", Char: " + boost::lexical_cast<std::string>(column) + ")";
+  ret += std::string("Line: ") + folly::to<std::string>(line);
+  ret += ", Char: " + folly::to<std::string>(column) + ")";
   return ret;
 }
 
 LocationPtr ParserBase::getLocation() const {
-  LocationPtr location(new Location());
+  auto location = std::make_shared<Location>();
   location->file  = file();
   location->line0 = line0();
   location->char0 = char0();

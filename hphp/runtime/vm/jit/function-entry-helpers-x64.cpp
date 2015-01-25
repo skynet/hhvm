@@ -22,18 +22,19 @@
 #include "hphp/vixl/a64/simulator-a64.h"
 
 namespace HPHP {
-namespace JIT {
+namespace jit {
 
 static void setupAfterPrologue(ActRec* fp, void* sp) {
-  g_context->m_fp = fp;
-  g_context->m_stack.top() = (Cell*)sp;
+  auto& regs = vmRegsUnsafe();
+  regs.fp = fp;
+  regs.stack.top() = (Cell*)sp;
   int nargs = fp->numArgs();
   int nparams = fp->m_func->numNonVariadicParams();
   Offset firstDVInitializer = InvalidAbsoluteOffset;
   if (nargs < nparams) {
     const Func::ParamInfoVec& paramInfo = fp->m_func->params();
     for (int i = nargs; i < nparams; ++i) {
-      Offset dvInitializer = paramInfo[i].funcletOff();
+      Offset dvInitializer = paramInfo[i].funcletOff;
       if (dvInitializer != InvalidAbsoluteOffset) {
         firstDVInitializer = dvInitializer;
         break;
@@ -41,17 +42,16 @@ static void setupAfterPrologue(ActRec* fp, void* sp) {
     }
   }
   if (firstDVInitializer != InvalidAbsoluteOffset) {
-    g_context->m_pc = fp->m_func->unit()->entry() + firstDVInitializer;
+    regs.pc = fp->m_func->unit()->entry() + firstDVInitializer;
   } else {
-    g_context->m_pc = fp->m_func->getEntry();
+    regs.pc = fp->m_func->getEntry();
   }
 }
 
 TCA fcallHelper(ActRec* ar, void* sp) {
   try {
     assert(!ar->resumed());
-    TCA tca =
-      mcg->getFuncPrologue((Func*)ar->m_func, ar->numArgs(), ar);
+    TCA tca = mcg->getFuncPrologue((Func*)ar->m_func, ar->numArgs(), ar);
     if (tca) {
       return tca;
     }
@@ -63,8 +63,8 @@ TCA fcallHelper(ActRec* ar, void* sp) {
        * dv funclets. Dont run the prologue again.
        */
       VMRegAnchor _(ar);
-      if (g_context->doFCall(ar, g_context->m_pc)) {
-        return tx->uniqueStubs.resumeHelperRet;
+      if (doFCall(ar, vmpc())) {
+        return mcg->tx().uniqueStubs.resumeHelperRet;
       }
       // We've been asked to skip the function body
       // (fb_intercept). frame, stack and pc have
@@ -73,8 +73,8 @@ TCA fcallHelper(ActRec* ar, void* sp) {
       return (TCA)-ar->m_savedRip;
     }
     setupAfterPrologue(ar, sp);
-    assert(ar == g_context->m_fp);
-    return tx->uniqueStubs.resumeHelper;
+    assert(ar == vmRegsUnsafe().fp);
+    return mcg->tx().uniqueStubs.resumeHelper;
   } catch (...) {
     /*
       The return address is set to __fcallHelperThunk,
@@ -95,10 +95,11 @@ TCA fcallHelper(ActRec* ar, void* sp) {
 }
 
 /*
- * This is used to generate an entry point for the entry
- * to a function, after the prologue has run.
+ * This is used to generate an entry point for the entry to a function, after
+ * the prologue has run.
  */
 TCA funcBodyHelper(ActRec* fp, void* sp) {
+  assert_native_stack_aligned();
   setupAfterPrologue(fp, sp);
   tl_regState = VMRegState::CLEAN;
   Func* func = const_cast<Func*>(fp->m_func);
@@ -106,7 +107,7 @@ TCA funcBodyHelper(ActRec* fp, void* sp) {
   TCA tca = mcg->getCallArrayPrologue(func);
 
   if (!tca) {
-    tca = tx->uniqueStubs.resumeHelper;
+    tca = mcg->tx().uniqueStubs.resumeHelper;
   }
   tl_regState = VMRegState::DIRTY;
   return tca;
@@ -140,4 +141,4 @@ int64_t decodeCufIterHelper(Iter* it, TypedValue func) {
   return true;
 }
 
-} } // HPHP::JIT
+} } // HPHP::jit

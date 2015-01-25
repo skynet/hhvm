@@ -1,214 +1,144 @@
 # Copyright (c) 2014, Facebook, Inc.
 # All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the "hack" directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
 
-##############################################################################
-# Variables
-##############################################################################
-TOP=$(shell pwd)
-TARGET=hack
+################################################################################
+#                            Variables to override                             #
+################################################################################
+
+EXTRA_INCLUDE_PATHS=
+EXTRA_LIB_PATHS=
+EXTRA_CC_FLAGS=
+
+################################################################################
+#                              OS-dependent stuff                              #
+################################################################################
 
 OS=$(shell uname -s)
-
-#------------------------------------------------------------------------------
-#package dependencies
-#------------------------------------------------------------------------------
-BUILD_DIRS=stubs
-BUILD_CMAS=stubs/lib.cma
-EXTRA_INCLUDEDIRS=
-FILTER_FROM_INCLUDE=
-ifneq ($(wildcard facebook/Makefile.include),)
-  ifndef CMAKE
-    # None of this stuff can build without some crazy ENV vars. Killing until it is fixed.
-    -include facebook/Makefile.include
-
-    # Want to open source this but no need to force everyone to have js_of_ocaml
-    BUILD_DIRS+=js
-
-    # We filter js/ because it contains an incompatible str.ml file
-    # that would then confuse ocamldepend
-    FILTER_FROM_INCLUDE=js
-  endif
-endif
-
-#------------------------------------------------------------------------------
-# Program related variables
-#------------------------------------------------------------------------------
-ifeq ($(OS), Linux)
-  PROGS=hh_single hh_server hh_client
-else
-  PROGS=hh_single
-endif
-
-#------------------------------------------------------------------------------
-# Main variables
-#------------------------------------------------------------------------------
-SYSLIBS=nums.cma bigarray.cma str.cma unix.cma
+ROOT=$(shell pwd)
 
 ifeq ($(OS), Linux)
-  INOTIFY=inotify
-  INOTIFYLIB=inotify/inotify.cma
+  INOTIFY=third-party/inotify
+  FSNOTIFY=fsnotify_linux
+  ELF=elf
+  FRAMEWORKS=
+  SECTCREATE=
+endif
+ifeq ($(OS), Darwin)
+  INOTIFY=fsevents
+  FSNOTIFY=fsnotify_darwin
+  ELF=
+  FRAMEWORKS=CoreServices CoreFoundation
+  SECTCREATE=-cclib -sectcreate -cclib __text -cclib hhi -cclib $(ROOT)/../bin/hhi.tar.gz
 endif
 
-LIBS=$(INOTIFYLIB) \
- utils/lib.cma \
- avl/lib.cma \
- dfind/lib.cma \
- globals/lib.cma \
- heap/heap.cma procs/lib.cma \
- deps/lib.cma parsing/lib.cma naming/lib.cma typing/lib.cma \
- server/lib.cma \
- socket/lib.cma \
- $(BUILD_CMAS) \
- client/lib.cma
+################################################################################
+#                                 Definitions                                  #
+################################################################################
 
-MAKESUBDIRS=$(INOTIFY) avl dfind \
- utils globals \
- heap procs \
- deps parsing naming typing \
- server \
- socket \
- client \
- $(BUILD_DIRS)
+MODULES=\
+  utils\
+  client\
+  socket\
+  server\
+  stubs\
+  typing\
+  naming\
+  parsing\
+  format\
+  deps\
+  heap\
+  globals\
+  procs\
+  search\
+  hhi\
+  dfind\
+  h2tp/common\
+  h2tp/mapper\
+  h2tp/unparser\
+  h2tp/test\
+  h2tp\
+  third-party/avl\
+  $(INOTIFY)\
+  $(FSNOTIFY)
 
-INCLUDEDIRS=$(filter-out $(FILTER_FROM_INCLUDE),$(MAKESUBDIRS)) \
- $(EXTRA_INCLUDEDIRS)
+NATIVE_OBJECT_FILES=\
+  heap/hh_shared.o\
+  utils/realpath.o\
+  $(INOTIFY)/$(notdir $(INOTIFY))_stubs.o\
+  utils/nproc.o\
+  hhi/hhi_elf.o\
+  utils/get_build_id.gen.o\
+  utils/get_build_id.o
 
-##############################################################################
-# Generic
-##############################################################################
--include $(TOP)/Makefile.common
+OCAML_LIBRARIES=\
+  unix\
+  str
 
-##############################################################################
-# Top rules
-##############################################################################
+NATIVE_LIBRARIES=\
+  $(ELF)\
+  pthread
 
-.PHONY:: all all.opt opt top clean distclean bin
+################################################################################
+#                                    Rules                                     #
+################################################################################
 
-all:: opt
-opt:
-	$(MAKE) rec.opt
-	$(MAKE) $(PROGS:=.opt)
-	$(MAKE) bin
-bc:
-	$(MAKE) rec
-	$(MAKE) $(PROGS:=.bc)
-top: $(TARGET).top
+INCLUDE_OPTS=$(foreach dir,$(MODULES),-I $(dir))
+LIB_OPTS=$(foreach lib,$(OCAML_LIBRARIES),-lib $(lib))
+NATIVE_LIB_OPTS=$(foreach lib, $(NATIVE_LIBRARIES),-cclib -l$(lib))
+EXTRA_NATIVE_LIB_OPTS=$(foreach lib, $(EXTRA_NATIVE_LIBRARIES),-cclib -l$(lib))
+EXTRA_INCLUDE_OPTS=$(foreach dir, $(EXTRA_INCLUDE_PATHS),-ccopt -I$(dir))
+EXTRA_CC_OPTS=$(foreach opt, $(EXTRA_CC_FLAGS),-ccopt $(opt))
+EXTRA_LIB_OPTS=$(foreach dir, $(EXTRA_LIB_PATHS),-cclib -L$(dir))
+FRAMEWORK_OPTS=$(foreach framework, $(FRAMEWORKS),-cclib -framework -cclib $(framework))
 
+LINKER_FLAGS=$(NATIVE_OBJECT_FILES) $(NATIVE_LIB_OPTS) $(EXTRA_LIB_OPTS) \
+	     $(EXTRA_NATIVE_LIB_OPTS) $(FRAMEWORK_OPTS) $(SECTCREATE)
 
-rec:
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i all || exit 1; done
+all: build-hhi-archive build-hack copy-hack-files
 
-rec.opt:
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i all.opt || exit 1; done
+clean:
+	ocamlbuild -clean
+	find ../bin -mindepth 1 -not -path ../bin/README -delete
+	rm -f utils/get_build_id.gen.c
 
-hack.top: $(LIBS) $(OBJS)
-	$(OCAMLMKTOP) -o $@ $(SYSLIBS) threads.cma $^
+build-hack: build-hack-native-deps build-hhi-archive
+	ocamlbuild -no-links $(INCLUDE_OPTS) $(LIB_OPTS) \
+		-lflags "$(LINKER_FLAGS)" \
+		hh_server.native hh_client.native hh_single_type_check.native \
+		hh_format.native h2tp.native test_unparser.native
 
+build-hack-native-deps: build-hack-stubs
+	# ocamlbuild before 4.00 does not pass thru cflags when building native C
+	# objects, because they're not important, right? So use this super ugly hack.
+	ocamlbuild -ocamlc "ocamlopt $(EXTRA_INCLUDE_OPTS) $(EXTRA_CC_OPTS)" $(NATIVE_OBJECT_FILES)
 
-top_single: $(LIBS) $(OBJS) hh_single_type_check.cmo
-	$(OCAMLMKTOP) -custom -o $@ $(SYSLIBS) $^
+build-hack-stubs:
+	echo "const char* const BuildInfo_kRevision = \"$$(git rev-parse HEAD)\";" > utils/get_build_id.gen.c
 
-hh_single.bc: $(LIBS) $(OBJS) hh_single_type_check.cmo
-	$(OCAMLC) -custom -o $@ $(SYSLIBS) $^
-hh_single.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_single_type_check.cmx
-	$(OCAMLOPT) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
+build-hhi-archive:
+	mkdir -p ../bin
+	$(MAKE) -C ../hhi
 
-
-hh_server.bc: $(LIBS) $(OBJS) hh_server.cmo
-	$(OCAMLC) -custom -o $@ $(SYSLIBS) $^
-hh_server.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_server.cmx
-	$(OCAMLOPT) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
-
-hh_client.bc: $(LIBS) $(OBJS) hh_client.cmo
-	$(OCAMLC) -custom -o $@ $(SYSLIBS) $^
-hh_client.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_client.cmx
-	$(OCAMLOPT) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
-
-
-hh_server.cmo: hh_server.ml
-	$(OCAMLC) -c $<
-
-hh_server.cmx: hh_server.ml
-	$(OCAMLOPT) -c $<
-
-
-clean::
-	rm -f *.bc *.opt *.top
-
-clean::
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i clean; done
-
-depend::
-	ocamldep $(INCLUDES) *.ml *.mli > .depend
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i depend; done
-
-distclean:: clean
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i $@; done
-	rm -f .depend
-
-##############################################################################
-# Install
-##############################################################################
+copy-hack-files: build-hack
+	mkdir -p ../bin
 ifeq ($(OS), Linux)
-bin:
-	cp -f hh_server.opt ../bin/hh_server
-	cp hh_client.opt ../bin/hh_client
-	cp hh_single.opt ../bin/hh_single_type_check
+	objcopy --add-section hhi=../bin/hhi.tar.gz _build/hh_server.native ../bin/hh_server
 else
-bin:
-	cp hh_single.opt ../bin/hh_single_type_check
+	cp _build/hh_server.native ../bin/hh_server
 endif
+	cp _build/hh_client.native ../bin/hh_client
+	cp _build/hh_single_type_check.native ../bin/hh_single_type_check
+	cp _build/hh_format.native ../bin/hh_format
+	cp _build/h2tp/h2tp.native ../bin/h2tp
 
-stamp:
-	rm -f utils/build_id.ml
-	$(MAKE) -C utils build_id.ml
-
-deploy:
-	$(MAKE) stamp
-	$(MAKE)
-ifneq ($(wildcard facebook/deploy.sh),)
-	./facebook/deploy.sh
-else
-	@echo
-	@echo "**********************************************************"
-	@echo "../bin/hh_server and ../bin/hh_client ready for deployment"
-	@echo "**********************************************************"
-endif
-
-##############################################################################
-# Developer rules
-##############################################################################
-
-test:
-	# Make sure we have no shift/reduce conflicts
-	ocamlyacc -v parsing/parser.mly 2>&1 | grep -L conflict | grep -q .
-	rm -f parsing/parser.mli parsing/parser.ml
-	# Run tests
-	../test/more_tests/verify_quick_hack
-	../test/suggest/verify_quick_hack
-
-wwwtest:
-	../bin/hh_server --check /var/www
-
-DIRS=$(INCLUDEDIRS)
-ifdef TEST
-debug:
-	make hh_single.bc
-	$(info Debugging $(TEST))
-	ocamldebug $(patsubst %,-I %,$(DIRS)) ./hh_single.bc $(TEST)
-else
-debug:
-	$(info Set the TEST env variable to the test you want to debug)
-	$(info For example: export TEST=../test/more_tests/my_test.php)
-endif
-
-debug_client:
-	make hh_client.bc
-	ocamldebug $(patsubst %,-I %,$(DIRS)) ./hh_client.bc
-
-# everybody can customize in its own repo his own Makefile.user
--include Makefile.user
+test: build-hack copy-hack-files
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/color
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/coverage
+	python3 ../test/verify.py --program ../bin/hh_format ../test/format
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/suggest
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/typecheck
+	python3 ../test/verify.py --program ../bin/hh_format ../test/typecheck \
+		--disabled-extension .no_format \
+		--out-extension .format_out \
+		--expect-extension '' \
+		--flags --root .

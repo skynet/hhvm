@@ -21,20 +21,30 @@
 #include "hphp/util/ringbuffer.h"
 
 #include "hphp/runtime/base/types.h"
-#include "hphp/runtime/vm/jit/phys-reg.h"
-#include "hphp/runtime/vm/jit/translator.h"
-#include "hphp/runtime/vm/jit/code-gen-helpers.h"
-#include "hphp/runtime/vm/jit/service-requests.h"
-#include "hphp/runtime/vm/jit/service-requests-x64.h"
 #include "hphp/runtime/vm/jit/abi-x64.h"
-#include "hphp/runtime/vm/jit/ir.h"
+#include "hphp/runtime/vm/jit/code-gen-helpers.h"
+#include "hphp/runtime/vm/jit/cpp-call.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
+#include "hphp/runtime/vm/jit/phys-reg.h"
+#include "hphp/runtime/vm/jit/service-requests-x64.h"
+#include "hphp/runtime/vm/jit/service-requests.h"
+#include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
 namespace HPHP {
-struct Func;
-namespace JIT {
-struct SSATmp;
-namespace X64 {
+//////////////////////////////////////////////////////////////////////
 
+struct Func;
+
+namespace jit {
+//////////////////////////////////////////////////////////////////////
+
+struct Fixup;
+struct SSATmp;
+
+namespace x64 {
 //////////////////////////////////////////////////////////////////////
 
 typedef X64Assembler Asm;
@@ -43,56 +53,53 @@ constexpr size_t kJmpTargetAlign = 16;
 
 void moveToAlign(CodeBlock& cb, size_t alignment = kJmpTargetAlign);
 
-void emitEagerSyncPoint(Asm& as, const Op* pc);
-void emitEagerVMRegSave(Asm& as, RegSaveFlags flags);
+void emitEagerSyncPoint(Vout& v, const Op* pc, Vreg rds, Vreg vmfp, Vreg vmsp);
+void emitEagerVMRegSave(Asm& as, PhysReg rds, RegSaveFlags flags);
+void emitEagerVMRegSave(Vout& as, Vreg rds, RegSaveFlags flags);
 void emitGetGContext(Asm& as, PhysReg dest);
+void emitGetGContext(Vout& as, Vreg dest);
 
 void emitTransCounterInc(Asm& a);
+void emitTransCounterInc(Vout&);
 
 void emitIncRef(Asm& as, PhysReg base);
+void emitIncRef(Vout& v, Vreg base);
 void emitIncRefCheckNonStatic(Asm& as, PhysReg base, DataType dtype);
 void emitIncRefGenericRegSafe(Asm& as, PhysReg base, int disp, PhysReg tmpReg);
 
-void emitAssertFlagsNonNegative(Asm& as);
-void emitAssertRefCount(Asm& as, PhysReg base);
+void emitAssertFlagsNonNegative(Vout& v, Vreg sf);
+void emitAssertRefCount(Vout& v, Vreg base);
 
 void emitMovRegReg(Asm& as, PhysReg srcReg, PhysReg dstReg);
 void emitLea(Asm& as, MemoryRef mr, PhysReg dst);
 
-void emitLdObjClass(Asm& as, PhysReg objReg, PhysReg dstReg);
-void emitLdClsCctx(Asm& as, PhysReg srcReg, PhysReg dstReg);
+Vreg emitLdObjClass(Vout& v, Vreg objReg, Vreg dstReg);
+Vreg emitLdClsCctx(Vout& v, Vreg srcReg, Vreg dstReg);
 
-void emitCall(Asm& as, TCA dest);
-void emitCall(Asm& as, CppCall call);
+void emitCall(Asm& as, TCA dest, RegSet args);
+void emitCall(Asm& as, CppCall call, RegSet args);
+void emitCall(Vout& v, CppCall call, RegSet args);
 
 // store imm to the 8-byte memory location at ref. Warning: don't use this
 // if you wanted an atomic store; large imms cause two stores.
-template<class Ref>
-void emitImmStoreq(Asm& as, Immed64 imm, Ref ref) {
-  if (imm.fits(sz::dword)) {
-    as.storeq(imm.l(), ref); // sign-extend to 64-bit then storeq
-  } else {
-    as.storel(int32_t(imm.q()), ref);
-    as.storel(int32_t(imm.q() >> 32), Ref(ref.r + 4));
-  }
-}
+void emitImmStoreq(Vout& v, Immed64 imm, Vptr ref);
+void emitImmStoreq(Asm& as, Immed64 imm, MemoryRef ref);
 
-void emitJmpOrJcc(Asm& as, ConditionCode cc, TCA dest);
+void emitRB(Vout& v, Trace::RingBufferType t, const char* msgm);
 
-void emitRB(Asm& a, Trace::RingBufferType t, const char* msgm,
-            RegSet toSave = RegSet());
-
-void emitTraceCall(CodeBlock& cb, int64_t pcOff);
+void emitTraceCall(CodeBlock& cb, Offset pcOff);
 
 /*
  * Tests the surprise flags for the current thread. Should be used
  * before a jnz to surprise handling code.
  */
-void emitTestSurpriseFlags(Asm& as);
+void emitTestSurpriseFlags(Asm& as, PhysReg rds);
+Vreg emitTestSurpriseFlags(Vout& v, Vreg rds);
 
-void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& stubsCode,
-                                 bool inTracelet, FixupMap& fixupMap,
+void emitCheckSurpriseFlagsEnter(Vout& main, Vout& cold, Vreg rds,
                                  Fixup fixup);
+void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
+                                 PhysReg rds, Fixup fixup);
 
 #ifdef USE_GCC_FAST_TLS
 
@@ -117,20 +124,43 @@ void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& stubsCode,
  */
 template<typename T>
 inline void
-emitTLSLoad(X64Assembler& a, const ThreadLocalNoCheck<T>& datum,
-            RegNumber reg) {
+emitTLSLoad(Vout& v, const ThreadLocalNoCheck<T>& datum, Vreg reg) {
   uintptr_t virtualAddress = uintptr_t(&datum.m_node.m_p) - tlsBase();
-  a.    fs().loadq(baseless(virtualAddress), r64(reg));
+  Vptr addr{baseless(virtualAddress), Vptr::FS};
+  v << load{addr, reg};
+}
+
+template<typename T>
+inline void
+emitTLSLoad(X64Assembler& a, const ThreadLocalNoCheck<T>& datum, Reg64 reg) {
+  uintptr_t virtualAddress = uintptr_t(&datum.m_node.m_p) - tlsBase();
+  a.fs().loadq(baseless(virtualAddress), reg);
 }
 
 #else // USE_GCC_FAST_TLS
 
 template<typename T>
 inline void
-emitTLSLoad(X64Assembler& a, const ThreadLocalNoCheck<T>& datum,
-            RegNumber reg) {
+emitTLSLoad(Vout& v, const ThreadLocalNoCheck<T>& datum, Vreg dest) {
+  PhysRegSaver(v, kGPCallerSaved); // we don't know for sure what's alive
+  v << ldimmq{datum.m_key, argNumToRegName[0]};
+  const CodeAddress addr = (CodeAddress)pthread_getspecific;
+  if (deltaFits((uintptr_t)addr, sz::dword)) {
+    v << call{addr, argSet(1)};
+  } else {
+    v << ldimmq{addr, reg::rax};
+    v << callr{reg::rax, argSet(1)};
+  }
+  if (dest != Vreg(reg::rax)) {
+    v << copy{reg::rax, dest};
+  }
+}
+
+template<typename T>
+inline void
+emitTLSLoad(X64Assembler& a, const ThreadLocalNoCheck<T>& datum, Reg64 dest) {
   PhysRegSaver(a, kGPCallerSaved); // we don't know for sure what's alive
-  a.    emitImmReg(&datum.m_key, argNumToRegName[0]);
+  a.    emitImmReg(datum.m_key, argNumToRegName[0]);
   const TCA addr = (TCA)pthread_getspecific;
   if (deltaFits((uintptr_t)addr, sz::dword)) {
     a.    call(addr);
@@ -138,88 +168,24 @@ emitTLSLoad(X64Assembler& a, const ThreadLocalNoCheck<T>& datum,
     a.    movq(addr, reg::rax);
     a.    call(reg::rax);
   }
-  if (reg != reg::rax) {
-    a.    movq(reg::rax, r64(reg));
+  if (dest != reg::rax) {
+    a.    movq(reg::rax, dest);
   }
 }
 
 #endif // USE_GCC_FAST_TLS
 
+// Emit a load of a low pointer.
+void emitLdLowPtr(Vout& v, Vptr mem, Vreg reg, size_t size);
 
-template<class Mem>
-void emitLoadReg(Asm& as, Mem mem, PhysReg reg) {
-  assert(reg != InvalidReg);
-  if (reg.isGP()) {
-    as. loadq(mem, reg);
-  } else {
-    as. movsd(mem, reg);
-  }
-}
+void emitCmpClass(Vout& v, Vreg sf, const Class* c, Vptr mem);
+void emitCmpClass(Vout& v, Vreg sf, Vreg reg, Vptr mem);
+void emitCmpClass(Vout& v, Vreg sf, Vreg reg1, Vreg reg2);
 
-template<class Mem>
-void emitStoreReg(Asm& as, PhysReg reg, Mem mem) {
-  assert(reg != InvalidReg);
-  if (reg.isGP()) {
-    as. storeq(reg, mem);
-  } else {
-    as. movsd(reg, mem);
-  }
-}
+void copyTV(Vout& v, Vloc src, Vloc dst, Type destType);
+void pack2(Vout& v, Vreg s0, Vreg s1, Vreg d0);
 
-/**
- * Emit a load of a low pointer.
- */
-template<class Mem>
-void emitLdLowPtr(Asm& as, Mem mem, PhysReg reg, size_t size) {
-  assert(reg != InvalidReg && reg.isGP());
-  if (size == 8) {
-    as.loadq(mem, reg);
-  } else if (size == 4) {
-    as.loadl(mem, r32(reg));
-  } else {
-    not_implemented();
-  }
-}
-
-template<class Mem>
-void emitCmpClass(Asm& as, const Class* c, Mem mem) {
-  auto size = sizeof(LowClassPtr);
-  auto imm = Immed64(c);
-
-  if (size == 8) {
-    if (imm.fits(sz::dword)) {
-      as.cmpq(imm.l(), mem);
-    } else {
-      // Use a scratch.  We could do this without rAsm using two immediate
-      // 32-bit compares (and two branches).
-      as.emitImmReg(imm, rAsm);
-      as.cmpq(rAsm, mem);
-    }
-  } else if (size == 4) {
-    as.cmpl(imm.l(), mem);
-  } else {
-    not_implemented();
-  }
-}
-
-template<class Mem>
-void emitCmpClass(Asm& as, Reg64 reg, Mem mem) {
-  auto size = sizeof(LowClassPtr);
-
-  if (size == 8) {
-    as.   cmpq    (reg, mem);
-  } else if (size == 4) {
-    as.   cmpl    (r32(reg), mem);
-  } else {
-    not_implemented();
-  }
-}
-
-void shuffle2(Asm& as, PhysReg s0, PhysReg s1, PhysReg d0, PhysReg d1);
-
-void zeroExtendIfBool(Asm& as, const SSATmp* src, PhysReg reg);
-
-ConditionCode opToConditionCode(Opcode opc);
+Vreg zeroExtendIfBool(Vout& v, const SSATmp* src, Vreg reg);
 
 template<ConditionCode Jcc, class Lambda>
 void jccBlock(Asm& a, Lambda body) {
@@ -230,63 +196,43 @@ void jccBlock(Asm& a, Lambda body) {
 }
 
 /*
- * callDestructor/jumpDestructor --
+ * lookupDestructor --
  *
- * Emit a call or jump to the appropriate destructor for a dynamically
- * typed value.
- *
- * No registers are saved; most translated code should be using
- * emitDecRefGeneric{Reg,} instead of this.
- *
- *   Inputs:
- *
- *     - typeReg is destroyed and may not be argNumToRegName[0].
- *     - argNumToRegName[0] should contain the m_data for this value.
- *     - scratch is destoyed.
+ * Return a MemoryRef pointer to the destructor for the type in typeReg.
  */
 
-inline IndexedMemoryRef lookupDestructor(X64Assembler& a,
-                                         PhysReg typeReg,
-                                         PhysReg scratch) {
-  assert(typeReg != r32(argNumToRegName[0]));
-  assert(scratch != argNumToRegName[0]);
-
+inline MemoryRef lookupDestructor(X64Assembler& a, PhysReg typeReg) {
+  auto const table = reinterpret_cast<intptr_t>(g_destructors);
+  always_assert_flog(deltaFits(table, sz::dword),
+    "Destructor function table is expected to be in the data "
+    "segment, with addresses less than 2^31"
+  );
   static_assert((KindOfString        >> kShiftDataTypeToDestrIndex == 1) &&
                 (KindOfArray         >> kShiftDataTypeToDestrIndex == 2) &&
                 (KindOfObject        >> kShiftDataTypeToDestrIndex == 3) &&
                 (KindOfResource      >> kShiftDataTypeToDestrIndex == 4) &&
                 (KindOfRef           >> kShiftDataTypeToDestrIndex == 5),
                 "lookup of destructors depends on KindOf* values");
-
   a.    shrl   (kShiftDataTypeToDestrIndex, r32(typeReg));
-  a.    movq   (&g_destructors, scratch);
-  return scratch[typeReg * 8];
+  return baseless(typeReg*8 + table);
 }
 
-inline void callDestructor(Asm& a, PhysReg typeReg, PhysReg scratch) {
-  a.    call   (lookupDestructor(a, typeReg, scratch));
-}
-
-inline void jumpDestructor(Asm& a, PhysReg typeReg, PhysReg scratch) {
-  a.    jmp    (lookupDestructor(a, typeReg, scratch));
-}
-
-inline void loadDestructorFunc(X64Assembler& a,
-                               PhysReg typeReg,
-                               PhysReg dstReg) {
+inline Vptr lookupDestructor(Vout& v, Vreg typeReg) {
+  auto const table = reinterpret_cast<intptr_t>(g_destructors);
+  always_assert_flog(deltaFits(table, sz::dword),
+    "Destructor function table is expected to be in the data "
+    "segment, with addresses less than 2^31"
+  );
   static_assert((KindOfString        >> kShiftDataTypeToDestrIndex == 1) &&
                 (KindOfArray         >> kShiftDataTypeToDestrIndex == 2) &&
                 (KindOfObject        >> kShiftDataTypeToDestrIndex == 3) &&
                 (KindOfResource      >> kShiftDataTypeToDestrIndex == 4) &&
                 (KindOfRef           >> kShiftDataTypeToDestrIndex == 5),
                 "lookup of destructors depends on KindOf* values");
-
-  a.    movsbl (rbyte(typeReg), r32(typeReg));
-  a.    shrl   (kShiftDataTypeToDestrIndex, r32(typeReg));
-  a.    movq   (&g_destructors, dstReg);
-  a.    loadq  (dstReg[typeReg * 8], dstReg);
+  auto shiftedType = v.makeReg();
+  v << shrli{kShiftDataTypeToDestrIndex, typeReg, shiftedType, v.makeReg()};
+  return Vptr{Vreg{}, shiftedType, 8, safe_cast<int>(table)};
 }
-
 
 //////////////////////////////////////////////////////////////////////
 

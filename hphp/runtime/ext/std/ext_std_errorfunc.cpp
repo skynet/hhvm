@@ -18,10 +18,16 @@
 
 #include <iostream>
 
+#include <folly/Likely.h>
+#include <folly/Format.h>
+
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/exceptions.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/base/thread-info.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/base/backtrace.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/util/logger.h"
 
 namespace HPHP {
@@ -56,9 +62,10 @@ Array HHVM_FUNCTION(debug_backtrace, int64_t options /* = 1 */,
                                      int64_t limit /* = 0 */) {
   bool provide_object = options & k_DEBUG_BACKTRACE_PROVIDE_OBJECT;
   bool ignore_args = options & k_DEBUG_BACKTRACE_IGNORE_ARGS;
-  return g_context->debugBacktrace(
-    false, false, provide_object, nullptr, ignore_args, limit
-  );
+  return createBacktrace(BacktraceArgs()
+                         .withThis(provide_object)
+                         .ignoreArgs(ignore_args)
+                         .setLimit(limit));
 }
 
 /**
@@ -73,16 +80,13 @@ Array HHVM_FUNCTION(debug_backtrace, int64_t options /* = 1 */,
  * "callee".
  */
 Array HHVM_FUNCTION(hphp_debug_caller_info) {
-  if (RuntimeOption::InjectedStackTrace) {
-    return g_context->getCallerInfo();
-  }
-  return Array::Create();
+  return g_context->getCallerInfo();
 }
 
 void HHVM_FUNCTION(debug_print_backtrace, int64_t options /* = 0 */,
                                           int64_t limit /* = 0 */) {
   bool ignore_args = options & k_DEBUG_BACKTRACE_IGNORE_ARGS;
-  echo(debug_string_backtrace(false, ignore_args, limit));
+  g_context->write(debug_string_backtrace(false, ignore_args, limit));
 }
 
 const StaticString
@@ -96,56 +100,53 @@ const StaticString
 
 String debug_string_backtrace(bool skip, bool ignore_args /* = false */,
                               int64_t limit /* = 0 */) {
-  if (RuntimeOption::InjectedStackTrace) {
-    Array bt;
-    StringBuffer buf;
-    bt = g_context->debugBacktrace(skip, false, false, nullptr,
-                                     ignore_args, limit);
-    int i = 0;
-    for (ArrayIter it = bt.begin(); !it.end(); it.next(), i++) {
-      Array frame = it.second().toArray();
-      buf.append('#');
-      buf.append(i);
-      if (i < 10) buf.append(' ');
-      buf.append(' ');
-      if (frame.exists(s_class)) {
-        buf.append(frame->get(s_class).toString());
-        buf.append(frame->get(s_type).toString());
-      }
-      buf.append(frame->get(s_function).toString());
-      buf.append("(");
-      if (!ignore_args) {
-        bool first = true;
-        for (ArrayIter it(frame->get(s_args).toArray());
-            !it.end();
-            it.next()) {
-          if (!first) {
-            buf.append(", ");
-          } else {
-            first = false;
-          }
-          try {
-            buf.append(it.second().toString());
-          } catch (FatalErrorException& fe) {
-            buf.append(fe.getMessage());
-          }
+  Array bt;
+  StringBuffer buf;
+  bt = createBacktrace(BacktraceArgs()
+                       .skipTop(skip)
+                       .ignoreArgs(ignore_args)
+                       .setLimit(limit));
+  int i = 0;
+  for (ArrayIter it = bt.begin(); !it.end(); it.next(), i++) {
+    Array frame = it.second().toArray();
+    buf.append('#');
+    buf.append(i);
+    if (i < 10) buf.append(' ');
+    buf.append(' ');
+    if (frame.exists(s_class)) {
+      buf.append(frame->get(s_class).toString());
+      buf.append(frame->get(s_type).toString());
+    }
+    buf.append(frame->get(s_function).toString());
+    buf.append("(");
+    if (!ignore_args) {
+      bool first = true;
+      for (ArrayIter it(frame->get(s_args).toArray());
+          !it.end();
+          it.next()) {
+        if (!first) {
+          buf.append(", ");
+        } else {
+          first = false;
+        }
+        try {
+          buf.append(it.second().toString());
+        } catch (FatalErrorException& fe) {
+          buf.append(fe.getMessage());
         }
       }
-      buf.append(")");
-      if (frame.exists(s_file)) {
-        buf.append(" called at [");
-        buf.append(frame->get(s_file).toString());
-        buf.append(':');
-        buf.append(frame->get(s_line).toString());
-        buf.append(']');
-      }
-      buf.append('\n');
     }
-    return buf.detach();
-  } else {
-    StackTrace st;
-    return String(st.toString());
+    buf.append(")");
+    if (frame.exists(s_file)) {
+      buf.append(" called at [");
+      buf.append(frame->get(s_file).toString());
+      buf.append(':');
+      buf.append(frame->get(s_line).toString());
+      buf.append(']');
+    }
+    buf.append('\n');
   }
+  return buf.detach();
 }
 
 Array HHVM_FUNCTION(error_get_last) {
@@ -175,13 +176,13 @@ bool HHVM_FUNCTION(error_log, const String& message, int message_type /* = 0 */,
   }
   case 3:
   {
-    Variant outfile = f_fopen(destination, "a"); // open for append only
+    Variant outfile = HHVM_FN(fopen)(destination, "a"); // open for append only
     if (outfile.isNull()) {
       Logger::Error("can't open error_log file!\n");
       return false;
     }
-    f_fwrite(outfile.toResource(), message);
-    f_fclose(outfile.toResource());
+    HHVM_FN(fwrite)(outfile.toResource(), message);
+    HHVM_FN(fclose)(outfile.toResource());
     return true;
   }
   case 2: // not used per PHP
@@ -238,11 +239,13 @@ void HHVM_FUNCTION(hphp_clear_unflushed) {
 bool HHVM_FUNCTION(trigger_error, const String& error_msg,
                                   int error_type /* = k_E_USER_NOTICE */) {
   std::string msg = error_msg.data();
-  if (g_context->getThrowAllErrors()) throw error_type;
+  if (UNLIKELY(g_context->getThrowAllErrors())) {
+    throw Exception(folly::sformat("throwAllErrors: {}", error_type));
+  }
   if (error_type == k_E_USER_ERROR) {
     g_context->handleError(msg, error_type, true,
                        ExecutionContext::ErrorThrowMode::IfUnhandled,
-                       "HipHop Recoverable error: ");
+                       "\nFatal error: ");
   } else if (error_type == k_E_USER_WARNING) {
     g_context->handleError(msg, error_type, true,
                        ExecutionContext::ErrorThrowMode::Never,
@@ -254,10 +257,23 @@ bool HHVM_FUNCTION(trigger_error, const String& error_msg,
   } else if (error_type == k_E_USER_DEPRECATED) {
     g_context->handleError(msg, error_type, true,
                        ExecutionContext::ErrorThrowMode::Never,
-                       "HipHop Deprecated: ");
+                       "\nDeprecated: ");
   } else {
+    ActRec* fp = g_context->getStackFrame();
+    if (fp->m_func->isBuiltin() && error_type == k_E_ERROR) {
+      raise_error_without_first_frame(msg);
+    } else if (fp->m_func->isBuiltin() && error_type == k_E_WARNING) {
+      raise_warning_without_first_frame(msg);
+    } else if (fp->m_func->isBuiltin() && error_type == k_E_NOTICE) {
+      raise_notice_without_first_frame(msg);
+    } else if (fp->m_func->isBuiltin() && error_type == k_E_DEPRECATED) {
+      raise_deprecated_without_first_frame(msg);
+    } else if (fp->m_func->isBuiltin() && error_type == k_E_RECOVERABLE_ERROR) {
+      raise_recoverable_error_without_first_frame(msg);
+    } else {
     raise_warning("Invalid error type specified");
     return false;
+    }
   }
   return true;
 }

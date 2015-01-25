@@ -18,30 +18,92 @@
 #include <string>
 #include <vector>
 
-#include "hphp/runtime/base/program-functions.h"
-#include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/base/runtime-option.h"
-#include "hphp/util/timer.h"
-#include "hphp/runtime/server/static-content-cache.h"
-#include "hphp/runtime/server/dynamic-content-cache.h"
-#include "hphp/runtime/server/server-stats.h"
-#include "hphp/util/network.h"
-#include "hphp/runtime/base/preg.h"
-#include "hphp/runtime/ext/ext_function.h"
-#include "hphp/runtime/server/access-log.h"
-#include "hphp/runtime/server/source-root-info.h"
-#include "hphp/runtime/server/request-uri.h"
-#include "hphp/runtime/server/http-protocol.h"
-#include "hphp/runtime/server/files-match.h"
 #include "hphp/runtime/base/datetime.h"
+#include "hphp/runtime/base/execution-context.h"
+#include "hphp/runtime/base/preg.h"
+#include "hphp/runtime/base/program-functions.h"
+#include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/debugger/debugger.h"
+#include "hphp/runtime/ext/std/ext_std_function.h"
+#include "hphp/runtime/server/access-log.h"
+#include "hphp/runtime/server/dynamic-content-cache.h"
+#include "hphp/runtime/server/files-match.h"
+#include "hphp/runtime/server/http-protocol.h"
+#include "hphp/runtime/server/request-uri.h"
+#include "hphp/runtime/server/server-stats.h"
+#include "hphp/runtime/server/source-root-info.h"
+#include "hphp/runtime/server/static-content-cache.h"
+#include "hphp/runtime/vm/debugger-hook.h"
 #include "hphp/util/alloc.h"
+#include "hphp/util/lock.h"
+#include "hphp/util/mutex.h"
+#include "hphp/util/network.h"
 #include "hphp/util/service-data.h"
+#include "hphp/util/timer.h"
 
 namespace HPHP {
 
 using std::string;
 using std::vector;
+
+///////////////////////////////////////////////////////////////////////////////
+
+static ReadWriteMutex s_proxyMutex;
+static __thread unsigned int s_randState = 0xfaceb00c;
+
+static bool matchAnyPattern(const std::string &path,
+                            const std::vector<std::string> &patterns) {
+  String spath(path.c_str(), path.size(), CopyString);
+  for (unsigned int i = 0; i < patterns.size(); i++) {
+    Variant ret = preg_match(String(patterns[i].c_str(), patterns[i].size(),
+                                    CopyString),
+                             spath);
+    if (ret.toInt64() > 0) return true;
+  }
+  return false;
+}
+
+/*
+ * Returns true iff a request to the given path should be delegated to the
+ * proxy origin.
+ */
+static bool shouldProxyPath(const std::string& path) {
+  ReadLock lock(s_proxyMutex);
+
+  if (RuntimeOption::ProxyOriginRaw.empty()) return false;
+
+  if (RuntimeOption::UseServeURLs && RuntimeOption::ServeURLs.count(path)) {
+    return true;
+  }
+
+  if (RuntimeOption::UseProxyURLs) {
+    if (RuntimeOption::ProxyURLs.count(path)) return true;
+    if (matchAnyPattern(path, RuntimeOption::ProxyPatterns)) return true;
+  }
+
+  if (RuntimeOption::ProxyPercentageRaw > 0) {
+    if ((abs(rand_r(&s_randState)) % 100) < RuntimeOption::ProxyPercentageRaw) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static std::string getProxyPath(const char* origPath) {
+  ReadLock lock(s_proxyMutex);
+
+  return RuntimeOption::ProxyOriginRaw + origPath;
+}
+
+void setProxyOriginPercentage(const std::string& origin, int percentage) {
+  WriteLock lock(s_proxyMutex);
+
+  RuntimeOption::ProxyOriginRaw = origin;
+  RuntimeOption::ProxyPercentageRaw = percentage;
+  Logger::Warning("Updated proxy origin to `%s' and percentage to %d\n",
+                  origin.c_str(), percentage);
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -117,14 +179,52 @@ void HttpRequestHandler::sendStaticContent(Transport *transport,
   transport->sendRaw((void*)data, len, 200, compressed);
 }
 
+void HttpRequestHandler::logToAccessLog(Transport* transport) {
+  GetAccessLog().onNewRequest();
+  GetAccessLog().log(transport, VirtualHost::GetCurrent());
+}
+
+void HttpRequestHandler::setupRequest(Transport* transport) {
+  MemoryManager::requestInit();
+
+  g_context.getCheck();
+  GetAccessLog().onNewRequest();
+
+  // Set current virtual host.
+  HttpProtocol::GetVirtualHost(transport);
+}
+
+void HttpRequestHandler::teardownRequest(Transport* transport) noexcept {
+  SCOPE_EXIT { always_assert(MM().empty()); };
+
+  const VirtualHost *vhost = VirtualHost::GetCurrent();
+  GetAccessLog().log(transport, vhost);
+
+  // HPHP logs may need to access data in ServerStats, so we have to clear the
+  // hashtable after writing the log entry.
+  ServerStats::Reset();
+  m_sourceRootInfo.clear();
+
+  if (is_hphp_session_initialized()) {
+    hphp_session_exit();
+  } else {
+    // Even though there are no sessions, memory is allocated to perform
+    // INI setting bindings when the thread is initialized.
+    hphp_memory_cleanup();
+  }
+
+  MemoryManager::requestShutdown();
+}
+
 void HttpRequestHandler::handleRequest(Transport *transport) {
   ExecutionProfiler ep(ThreadInfo::RuntimeFunctions);
 
   Logger::OnNewRequest();
-  GetAccessLog().onNewRequest();
   transport->enableCompression();
 
-  ServerStatsHelper ssh("all", ServerStatsHelper::TRACK_MEMORY);
+  ServerStatsHelper ssh("all",
+                        ServerStatsHelper::TRACK_MEMORY |
+                        ServerStatsHelper::TRACK_HWINST);
   Logger::Verbose("receiving %s", transport->getCommand().c_str());
 
   // will clear all extra logging when this function goes out of scope
@@ -132,11 +232,12 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
   StackTraceNoHeap::AddExtraLogging("URL", transport->getUrl());
 
   // resolve virtual host
-  const VirtualHost *vhost = HttpProtocol::GetVirtualHost(transport);
+  const VirtualHost *vhost = VirtualHost::GetCurrent();
   assert(vhost);
   if (vhost->disabled() ||
       vhost->isBlocking(transport->getCommand(), transport->getRemoteHost())) {
     transport->sendString("Not Found", 404);
+    transport->onSendEnd();
     return;
   }
 
@@ -151,6 +252,7 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
 
     if (gettime_diff_us(queueTime, now) > requestTimeoutSeconds * 1000000) {
       transport->sendString("Service Unavailable", 503);
+      transport->onSendEnd();
       m_requestTimedOutOnQueue->addValue(1);
       return;
     }
@@ -161,17 +263,18 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
                             vhost->getName().c_str());
 
   // resolve source root
-  SourceRootInfo sourceRootInfo(transport);
-
-  if (sourceRootInfo.error()) {
-    sourceRootInfo.handleError(transport);
+  always_assert(!m_sourceRootInfo.hasValue());
+  m_sourceRootInfo.emplace(transport);
+  if (m_sourceRootInfo->error()) {
+    m_sourceRootInfo->handleError(transport);
     return;
   }
 
   // request URI
   string pathTranslation = m_pathTranslation ?
     vhost->getPathTranslation().c_str() : "";
-  RequestURI reqURI(vhost, transport, pathTranslation, sourceRootInfo.path());
+  RequestURI reqURI(vhost, transport, pathTranslation,
+                    m_sourceRootInfo->path());
   if (reqURI.done()) {
     return; // already handled with redirection or 404
   }
@@ -186,10 +289,11 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
 
   if (reqURI.forbidden()) {
     transport->sendString("Forbidden", 403);
+    transport->onSendEnd();
     return;
   }
 
-  bool cachableDynamicContent =
+  bool cacheableDynamicContent =
     (!RuntimeOption::StaticFileGenerators.empty() &&
      RuntimeOption::StaticFileGenerators.find(path) !=
      RuntimeOption::StaticFileGenerators.end());
@@ -223,7 +327,6 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
       }
       sendStaticContent(transport, data, len, 0, compressed, path, ext);
       ServerStats::LogPage(path, 200);
-      GetAccessLog().log(transport, vhost);
       return;
     }
 
@@ -238,36 +341,26 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
           sendStaticContent(transport, sb.data(), sb.size(), st.st_mtime,
                             false, path, ext);
           ServerStats::LogPage(path, 200);
-          GetAccessLog().log(transport, vhost);
           return;
         }
       }
     }
 
     // check static contents that were generated by dynamic pages
-    if (cachableDynamicContent) {
+    if (cacheableDynamicContent) {
       // check against dynamic content cache
       assert(transport->getUrl());
       string key = path + transport->getUrl();
       if (DynamicContentCache::TheCache.find(key, data, len, compressed)) {
         sendStaticContent(transport, data, len, 0, compressed, path, ext);
         ServerStats::LogPage(path, 200);
-        GetAccessLog().log(transport, vhost);
         return;
       }
     }
   }
 
   // proxy any URLs that not specified in ServeURLs
-  if (!RuntimeOption::ProxyOrigin.empty() &&
-      ((RuntimeOption::UseServeURLs &&
-        RuntimeOption::ServeURLs.find(path) ==
-        RuntimeOption::ServeURLs.end()) ||
-       (RuntimeOption::UseProxyURLs &&
-        (RuntimeOption::ProxyURLs.find(path) !=
-         RuntimeOption::ProxyURLs.end() ||
-         MatchAnyPattern(path, RuntimeOption::ProxyPatterns) ||
-         (abs(rand()) % 100) < RuntimeOption::ProxyPercentage)))) {
+  if (shouldProxyPath(path)) {
     for (int i = 0; i < RuntimeOption::ProxyRetry; i++) {
       bool force = (i == RuntimeOption::ProxyRetry - 1); // last one
       if (handleProxyRequest(transport, force)) break;
@@ -285,52 +378,50 @@ void HttpRequestHandler::handleRequest(Transport *transport) {
 
   bool ret = false;
   try {
-    ret = executePHPRequest(transport, reqURI, sourceRootInfo,
-                            cachableDynamicContent);
+    ret = executePHPRequest(transport, reqURI, m_sourceRootInfo.value(),
+                            cacheableDynamicContent);
   } catch (...) {
+    string emsg;
+    string response;
+    int code = 500;
     try {
       throw;
     } catch (const Eval::DebuggerException &e) {
-      transport->sendString(e.what(), 200);
-      transport->onSendEnd();
+      code = 200;
+      response = e.what();
     } catch (Object &e) {
-      string emsg;
       try {
         emsg = e.toString().data();
       } catch (...) {
         emsg = "Unknown";
       }
-      Logger::Error("Unhandled server exception: %s", emsg.c_str());
     } catch (const std::exception &e) {
-      Logger::Error("Unhandled server exception: %s", e.what());
+      emsg = e.what();
     } catch (...) {
-      Logger::Error("Unhandled unknown server exception.");
+      emsg = "Unknown";
     }
-    hphp_context_exit(g_context.getNoCheck(), true, true, transport->getUrl());
+    g_context->onShutdownPostSend();
+    Eval::Debugger::InterruptPSPEnded(transport->getUrl());
+    if (code != 200) {
+      Logger::Error("Unhandled server exception: %s", emsg.c_str());
+    }
+    transport->sendString(response, code);
+    transport->onSendEnd();
+    hphp_context_exit();
   }
-  GetAccessLog().log(transport, vhost);
-  /*
-   * HPHP logs may need to access data in ServerStats, so we have to
-   * clear the hashtable after writing the log entry.
-   */
-  ServerStats::Reset();
-  hphp_session_exit();
-
   HttpProtocol::ClearRecord(ret, tmpfile);
 }
 
-void HttpRequestHandler::abortRequest(Transport *transport) {
-  GetAccessLog().onNewRequest();
-  const VirtualHost *vhost = HttpProtocol::GetVirtualHost(transport);
-  assert(vhost);
+void HttpRequestHandler::abortRequest(Transport* transport) {
+  // TODO: t5284137 add some tests for abortRequest
   transport->sendString("Service Unavailable", 503);
-  GetAccessLog().log(transport, vhost);
+  transport->onSendEnd();
 }
 
 bool HttpRequestHandler::executePHPRequest(Transport *transport,
                                            RequestURI &reqURI,
                                            SourceRootInfo &sourceRootInfo,
-                                           bool cachableDynamicContent) {
+                                           bool cacheableDynamicContent) {
   ExecutionContext *context = hphp_context_init();
   if (RuntimeOption::ImplicitFlush) {
     context->obSetImplicitFlush(true);
@@ -362,6 +453,9 @@ bool HttpRequestHandler::executePHPRequest(Transport *transport,
   int code;
   bool ret = true;
 
+  // Let the debugger initialize.
+  // FIXME: hphpd can be initialized this way as well
+  DEBUGGER_ATTACHED_ONLY(phpDebuggerRequestInitHook());
   if (RuntimeOption::EnableDebugger) {
     Eval::Debugger::InterruptRequestStarted(transport->getUrl());
   }
@@ -371,11 +465,14 @@ bool HttpRequestHandler::executePHPRequest(Transport *transport,
   ret = hphp_invoke(context, file, false, Array(), uninit_null(),
                     RuntimeOption::RequestInitFunction,
                     RuntimeOption::RequestInitDocument,
-                    error, errorMsg);
+                    error, errorMsg,
+                    true /* once */,
+                    false /* warmupOnly */,
+                    false /* richErrorMessage */);
 
   if (ret) {
     String content = context->obDetachContents();
-    if (cachableDynamicContent && !content.empty()) {
+    if (cacheableDynamicContent && !content.empty()) {
       assert(transport->getUrl());
       string key = file + transport->getUrl();
       DynamicContentCache::TheCache.store(key, content.data(),
@@ -398,7 +495,10 @@ bool HttpRequestHandler::executePHPRequest(Transport *transport,
       ret = hphp_invoke(context, errorPage, false, Array(), uninit_null(),
                         RuntimeOption::RequestInitFunction,
                         RuntimeOption::RequestInitDocument,
-                        error, errorMsg);
+                        error, errorMsg,
+                        true /* once */,
+                        false /* warmupOnly */,
+                        false /* richErrorMessage */);
       if (ret) {
         String content = context->obDetachContents();
         transport->sendRaw((void*)content.data(), content.size());
@@ -418,21 +518,34 @@ bool HttpRequestHandler::executePHPRequest(Transport *transport,
     }
   } else {
     code = 404;
-    transport->sendString("Not Found", 404);
+    transport->sendString("RequestInitDocument Not Found", 404);
   }
 
   if (RuntimeOption::EnableDebugger) {
     Eval::Debugger::InterruptRequestEnded(transport->getUrl());
   }
 
-  transport->onSendEnd();
-  hphp_context_exit(context, true, true, transport->getUrl());
+  // If we have registered post-send shutdown functions, end the request before
+  // executing them. If we don't, be compatible with Zend by allowing usercode
+  // in hphp_context_shutdown to run before we end the request.
+  bool hasPostSend =
+    context->hasShutdownFunctions(ExecutionContext::ShutdownType::PostSend);
+  if (hasPostSend) {
+    transport->onSendEnd();
+  }
+  context->onShutdownPostSend();
+  Eval::Debugger::InterruptPSPEnded(transport->getUrl());
+  hphp_context_shutdown();
+  if (!hasPostSend) {
+    transport->onSendEnd();
+  }
+  hphp_context_exit(false);
   ServerStats::LogPage(file, code);
   return ret;
 }
 
 bool HttpRequestHandler::handleProxyRequest(Transport *transport, bool force) {
-  string url = RuntimeOption::ProxyOrigin + transport->getServerObject();
+  auto const url = getProxyPath(transport->getServerObject());
 
   int code = 0;
   std::string error;
@@ -452,18 +565,6 @@ bool HttpRequestHandler::handleProxyRequest(Transport *transport, bool force) {
   }
   transport->sendRaw((void*)respData, response.size(), code);
   return true;
-}
-
-bool HttpRequestHandler::MatchAnyPattern
-(const std::string &path, const std::vector<std::string> &patterns) {
-  String spath(path.c_str(), path.size(), CopyString);
-  for (unsigned int i = 0; i < patterns.size(); i++) {
-    Variant ret = preg_match(String(patterns[i].c_str(), patterns[i].size(),
-                                    CopyString),
-                             spath);
-    if (ret.toInt64() > 0) return true;
-  }
-  return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

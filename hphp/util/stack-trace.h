@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "hphp/util/portability.h"
+#include "hphp/util/compatibility.h"
 
 #include <dlfcn.h>
 
@@ -46,6 +47,8 @@ public:
 
 public:
   static bool Enabled;
+  static const char** FunctionBlacklist;
+  static unsigned int FunctionBlacklistCount;
 
 protected:
   StackTraceBase();
@@ -150,8 +153,8 @@ public:
   /**
    * Log stacktrace into the given file.
    */
-  void log(const char *errorType, const char * fname, const char *pid,
-           const char *buildId, int debuggerCount) const;
+  void log(const char *errorType, int fd, const char *buildId,
+           int debuggerCount) const;
 
   /**
    * Add extra information to log together with a crash stacktrace log.

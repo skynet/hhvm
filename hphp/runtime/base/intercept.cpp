@@ -31,7 +31,7 @@
 #include "hphp/parser/parser.h"
 #include "hphp/util/lock.h"
 
-#include "hphp/runtime/base/file-repository.h"
+#include "hphp/runtime/base/unit-cache.h"
 #include "hphp/util/trace.h"
 
 using namespace HPHP::Trace;
@@ -92,7 +92,7 @@ bool register_intercept(const String& name, const Variant& callback, const Varia
   StringIMap<Variant> &handlers = s_intercept_data->m_intercept_handlers;
   if (!callback.toBoolean()) {
     if (name.empty()) {
-      s_intercept_data->m_global_handler = Variant();
+      s_intercept_data->m_global_handler.unset();
       handlers.clear();
     } else {
       handlers.erase(name);
@@ -190,8 +190,8 @@ void unregister_intercept_flag(const String& name, char *flag) {
 void rename_function(const String& old_name, const String& new_name) {
   auto const old = old_name.get();
   auto const n3w = new_name.get();
-  auto const oldNe = const_cast<NamedEntity*>(Unit::GetNamedEntity(old));
-  auto const newNe = const_cast<NamedEntity*>(Unit::GetNamedEntity(n3w));
+  auto const oldNe = const_cast<NamedEntity*>(NamedEntity::get(old));
+  auto const newNe = const_cast<NamedEntity*>(NamedEntity::get(n3w));
 
   Func* func = Unit::lookupFunc(oldNe);
   if (!func) {
@@ -228,7 +228,7 @@ void rename_function(const String& old_name, const String& new_name) {
   newNe->setCachedFunc(func);
 
   if (RuntimeOption::EvalJit) {
-    JIT::invalidateForRenameFunction(old);
+    jit::invalidateForRenameFunction(old);
   }
 }
 

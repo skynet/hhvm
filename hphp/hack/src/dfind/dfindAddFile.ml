@@ -14,6 +14,7 @@
 (*****************************************************************************)
 open DfindEnv
 open DfindMaybe
+open Utils
 
 (*****************************************************************************)
 (* helpers *)
@@ -82,7 +83,7 @@ let blacklist = List.map Str.regexp [
   ".*/.hg";
 ]
 
-let rec is_blacklisted path =
+let is_blacklisted path =
   try
     List.iter begin fun re ->
       if Str.string_match re path 0
@@ -99,30 +100,19 @@ let rec add_file links env path =
   | false when not (SSet.mem path env.new_files) -> add_new_file links env path
   | _ -> return ()
 
-and ignore_add_watch links env path = ignore (add_watch links env path)
-
 and add_watch links env path =
-  call (add_inotify_watch env) path >>= fun watch ->
-  if WMap.mem watch env.wnames
-  then
-    if WMap.find watch env.wnames = path
-    then return ()
-    else add_new_watch links env path watch
-  else add_new_watch links env path watch
+  call (add_fsnotify_watch env) path >>= function
+  | None -> return ()
+  | Some watch -> add_file links env path
 
-and add_inotify_watch env path =
-  return (Inotify.add_watch env.inotify path DfindEnv.events)
-
-
-and add_new_watch links env path watch =
-  env.wnames <- WMap.add watch path env.wnames;
-  add_file links env path
+and add_fsnotify_watch env path = 
+  return (Fsnotify.add_watch env.fsnotify path)
 
 and add_new_file links env path =
   let time = Time.get() in
   env.files <- TimeFiles.add (time, path) env.files;
   env.new_files <- SSet.add path env.new_files;
-  call (wrap Unix.lstat) path >>= fun ({ Unix.st_kind = kind } as st) ->
+  call (wrap Unix.lstat) path >>= fun ({ Unix.st_kind = kind; _ } as st) ->
   if ISet.mem st.Unix.st_ino links then return () else
   let links = ISet.add st.Unix.st_ino links in
   match kind with
@@ -138,12 +128,12 @@ and add_new_file links env path =
       SSet.iter (fun x -> ignore (add_file links env x)) files;
       (try Unix.closedir dir_handle with _ -> ());
       let prev_files = 
-        try SMap.find path env.dirs 
+        try SMap.find_unsafe path env.dirs
         with Not_found -> SSet.empty in
       let prev_files = SSet.union files prev_files in
       let files = SSet.fold begin fun file all_files ->
         try
-          let sub_dir = SMap.find file env.dirs in
+          let sub_dir = SMap.find_unsafe file env.dirs in
           SSet.union sub_dir all_files
         with Not_found -> 
           SSet.add file all_files

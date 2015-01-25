@@ -13,47 +13,59 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/server/admin-request-handler.h"
+
+#include "hphp/runtime/base/apc-file-storage.h"
+#include "hphp/runtime/base/apc-stats.h"
+#include "hphp/runtime/base/datetime.h"
+#include "hphp/runtime/base/http-client.h"
+#include "hphp/runtime/base/memory-manager.h"
+#include "hphp/runtime/base/preg.h"
+#include "hphp/runtime/base/program-functions.h"
+#include "hphp/runtime/base/rds.h"
+#include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/base/thread-hooks.h"
+#include "hphp/runtime/base/unit-cache.h"
+#include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/repo.h"
+
+#include "hphp/runtime/ext/apc/ext_apc.h"
+#include "hphp/runtime/ext/array-tracer/ext_array_tracer.h"
+#include "hphp/runtime/ext/ext_fb.h"
+#include "hphp/runtime/ext/mysql/mysql_stats.h"
+#include "hphp/runtime/server/http-request-handler.h"
+#include "hphp/runtime/server/http-server.h"
+#include "hphp/runtime/server/memory-stats.h"
+#include "hphp/runtime/server/pagelet-server.h"
+#include "hphp/runtime/server/server-stats.h"
+
+#include "hphp/util/alloc.h"
+#include "hphp/util/logger.h"
+#include "hphp/util/mutex.h"
+#include "hphp/util/process.h"
+#include "hphp/util/repo-schema.h"
+#include "hphp/util/stacktrace-profiler.h"
+#include "hphp/util/timer.h"
+
+#include <folly/Conv.h>
+
+#include <boost/lexical_cast.hpp>
 
 #include <string>
 #include <sstream>
 #include <iomanip>
 
-#include <boost/lexical_cast.hpp>
+#include <unistd.h>
 
 #ifdef GOOGLE_CPU_PROFILER
 #include <google/profiler.h>
+#include "hphp/runtime/base/file-util.h"
 #endif
-
-#include "hphp/runtime/base/file-repository.h"
-#include "hphp/runtime/server/http-server.h"
-#include "hphp/runtime/server/pagelet-server.h"
-#include "hphp/runtime/base/http-client.h"
-#include "hphp/runtime/server/server-stats.h"
-#include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/preg.h"
-#include "hphp/util/process.h"
-#include "hphp/util/logger.h"
-#include "hphp/util/mutex.h"
-#include "hphp/runtime/base/datetime.h"
-#include "hphp/runtime/base/memory-manager.h"
-#include "hphp/runtime/base/program-functions.h"
-#include "hphp/runtime/base/shared-store-base.h"
-#include "hphp/runtime/ext/mysql/mysql_stats.h"
-#include "hphp/runtime/vm/repo.h"
-#include "hphp/runtime/vm/jit/mc-generator.h"
-#include "hphp/runtime/base/rds.h"
-#include "hphp/util/alloc.h"
-#include "hphp/util/timer.h"
-#include "hphp/util/repo-schema.h"
-#include "hphp/runtime/ext/ext_fb.h"
-#include "hphp/runtime/ext/ext_apc.h"
-#include "hphp/util/stacktrace-profiler.h"
 
 namespace HPHP {
 
 using std::endl;
-using boost::lexical_cast;
 using std::string;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -112,10 +124,26 @@ static void malloc_write_cb(void *cbopaque, const char *s) {
   memcpy(&mw->s[mw->slen], s, slen+1);
   mw->slen += slen;
 }
+
+extern unsigned low_arena;
 #endif
 
-void AdminRequestHandler::handleRequest(Transport *transport) {
+void AdminRequestHandler::logToAccessLog(Transport* transport) {
   GetAccessLog().onNewRequest();
+  GetAccessLog().log(transport, nullptr);
+}
+
+void AdminRequestHandler::setupRequest(Transport* transport) {
+  g_context.getCheck();
+  GetAccessLog().onNewRequest();
+}
+
+void AdminRequestHandler::teardownRequest(Transport* transport) noexcept {
+  SCOPE_EXIT { hphp_memory_cleanup(); };
+  GetAccessLog().log(transport, nullptr);
+}
+
+void AdminRequestHandler::handleRequest(Transport *transport) {
   transport->addHeader("Content-Type", "text/plain");
   std::string cmd = transport->getCommand();
 
@@ -150,6 +178,10 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         "/status.json:     show server status in JSON\n"
         "/status.html:     show server status in HTML\n"
 
+        "/memory.xml:      show memory status in XML\n"
+        "/memory.json:     show memory status in JSON\n"
+        "/memory.html:     show memory status in HTML\n"
+
         "/stats-on:        main switch: enable server stats\n"
         "/stats-off:       main switch: disable server stats\n"
         "/stats-clear:     clear all server stats\n"
@@ -181,13 +213,19 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         "/const-ss:        get const_map_size\n"
         "/static-strings:  get number of static strings\n"
         "/dump-apc:        dump all current value in APC to /tmp/apc_dump\n"
-        "/dump-apc-meta:   dump meta infomration for all objects in APC to\n"
+        "/dump-apc-info:   show basic APC stats\n"
+        "/dump-apc-meta:   dump meta information for all objects in APC to\n"
         "                  /tmp/apc_dump_meta\n"
+        "/advise-out-apc:  forcibly madvise out APC prime data\n"
         "/dump-const:      dump all constant value in constant map to\n"
         "                  /tmp/const_map_dump\n"
-        "/dump-file-repo:  dump file repository to /tmp/file_repo_dump\n"
+        "/random-apc:      dump the key and size of a random APC entry\n"
+        "                  optionally set count for number of entries returned"
 
         "/pcre-cache-size: get pcre cache map size\n"
+        "/dump-pcre-cache: dump cached pcre's to /tmp/pcre_cache\n"
+        "/dump-array-info: dump array tracer info to /tmp/array_tracer_dump\n"
+
         "/start-stacktrace-profiler: set enable_stacktrace_profiler to true\n"
 
 #ifdef GOOGLE_CPU_PROFILER
@@ -202,6 +240,10 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         "/vm-dump-tc:      dump translation cache to /tmp/tc_dump_a and\n"
         "                  /tmp/tc_dump_astub\n"
         "/vm-namedentities:show size of the NamedEntityTable\n"
+        "/thread-mem-usage:show memory usage per thread\n"
+        "/proxy:           set up request proxy\n"
+        "    origin        URL to proxy requests to\n"
+        "    percentage    percentage of requests to proxy\n"
         ;
 #ifdef USE_TCMALLOC
         if (MallocExtensionInstance) {
@@ -209,7 +251,7 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
               "/free-mem:        ask tcmalloc to release memory to system\n"
               "/tcmalloc-stats:  get internal tcmalloc stats\n"
               "/tcmalloc-set-tc: set max mem tcmalloc thread-cache can use\n"
-              );
+          );
         }
 #endif
 
@@ -227,7 +269,11 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
               "/jemalloc-prof-dump:\n"
               "                  dump heap profile\n"
               "    file          optional, filesystem path\n"
-              );
+              "/jemalloc-prof-request:\n"
+              "                  dump thread-local heap profile in\n"
+              "                  the next request that runs\n"
+              "    file          optional, filesystem path\n"
+          );
         }
 #endif
 
@@ -319,6 +365,10 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         handleStatusRequest(cmd, transport)) {
       break;
     }
+    if (strncmp(cmd.c_str(),"memory", 6) == 0 &&
+        handleMemoryRequest(cmd, transport)) {
+      break;
+    }
     if (strncmp(cmd.c_str(), "stats", 5) == 0 &&
         handleStatsRequest(cmd, transport)) {
       break;
@@ -327,7 +377,7 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         handleProfileRequest(cmd, transport)) {
       break;
     }
-    if (strncmp(cmd.c_str(), "dump", 4) == 0 &&
+    if (strncmp(cmd.c_str(), "dump-apc", 8) == 0 &&
         handleDumpCacheRequest(cmd, transport)) {
       break;
     }
@@ -335,12 +385,20 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         handleConstSizeRequest(cmd, transport)) {
       break;
     }
-    if (strcmp(cmd.c_str(), "static-strings") == 0 &&
+    if (strncmp(cmd.c_str(), "static-strings", 14) == 0 &&
         handleStaticStringsRequest(cmd, transport)) {
       break;
     }
     if (strncmp(cmd.c_str(), "vm-", 3) == 0 &&
         handleVMRequest(cmd, transport)) {
+      break;
+    }
+    if (cmd == "proxy") {
+      handleProxyRequest(cmd, transport);
+      break;
+    }
+    if (!strcmp(cmd.c_str(), "thread-mem")) {
+      transport->sendString(get_thread_mem_usage());
       break;
     }
 
@@ -351,9 +409,44 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
       break;
     }
 
+    if (cmd == "dump-pcre-cache") {
+      auto filename = transport->getParam("file");
+      if (filename == "") filename = "/tmp/pcre_cache";
+      pcre_dump_cache(filename);
+      transport->sendString("OK\n");
+      break;
+    }
+
+    if (cmd == "dump-array-info") {
+      if (!RuntimeOption::EvalTraceArrays) {
+        transport->sendString("Eval.TraceArrays not enabled.\n");
+        break;
+      }
+      auto filename = transport->getParam("file");
+      if (filename == "") filename = "/tmp/array_tracer_dump";
+      array_tracer_dump(filename);
+      transport->sendString("OK\n");
+      break;
+    }
+
     if (cmd == "start-stacktrace-profiler") {
       enable_stacktrace_profiler = true;
       transport->sendString("OK\n");
+      break;
+    }
+
+    if (cmd == "advise-out-apc") {
+      if (!apcExtension::Enable) {
+        transport->sendString("No APC\n");
+        break;
+      }
+      s_apc_file_storage.adviseOut();
+      transport->sendString("Done\n");
+      break;
+    }
+
+    if (strncmp(cmd.c_str(), "random-apc", 10) == 0 &&
+        handleRandomApcRequest(cmd, transport)) {
       break;
     }
 
@@ -438,23 +531,50 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
       if (cmd == "jemalloc-stats") {
         // Force jemalloc to update stats cached for use by mallctl().
         uint64_t epoch = 1;
-        mallctl("epoch", nullptr, nullptr, &epoch, sizeof(epoch));
+        uint32_t error = 0;
+        if (mallctl("epoch", nullptr, nullptr, &epoch, sizeof(epoch)) != 0) {
+          error = 1;
+        }
 
-        size_t allocated = 0; // Initialize in case stats aren't enabled.
-        size_t sz = sizeof(size_t);
-        mallctl("stats.allocated", &allocated, &sz, nullptr, 0);
+        auto call_mallctl = [&](const char* statName) {
+          size_t value = 0;
+          size_t sz = sizeof(value);
+          if (mallctl(statName, &value, &sz, nullptr, 0) != 0){
+            error = 1;
+          }
+          return value;
+        };
+        size_t allocated = call_mallctl("stats.allocated");
+        size_t active = call_mallctl("stats.active");
+        size_t mapped = call_mallctl("stats.mapped");
+        size_t low_mapped = call_mallctl(
+            folly::format("stats.arenas.{}.mapped",
+              low_arena).str().c_str());
+        size_t low_small_allocated = call_mallctl(
+            folly::format("stats.arenas.{}.small.allocated",
+              low_arena).str().c_str());
+        size_t low_large_allocated = call_mallctl(
+            folly::format("stats.arenas.{}.large.allocated",
+              low_arena).str().c_str());
+        size_t low_active = call_mallctl(
+            folly::format("stats.arenas.{}.pactive",
+              low_arena).str().c_str()) *
+            sysconf(_SC_PAGESIZE);
 
-        size_t active = 0;
-        mallctl("stats.active", &active, &sz, nullptr, 0);
-
-        size_t mapped = 0;
-        mallctl("stats.mapped", &mapped, &sz, nullptr, 0);
 
         std::ostringstream stats;
         stats << "<jemalloc-stats>" << endl;
         stats << "  <allocated>" << allocated << "</allocated>" << endl;
         stats << "  <active>" << active << "</active>" << endl;
         stats << "  <mapped>" << mapped << "</mapped>" << endl;
+        stats << "  <low_mapped>" << low_mapped << "</low_mapped>" << endl;
+        stats << "  <low_allocated>"
+              << (low_small_allocated + low_large_allocated)
+              << "</low_allocated>" << endl;
+        stats << "  <low_active>"
+              << low_active
+              << "</low_active>" << endl;
+        stats << "  <error>" << error << "</error>" << endl;
         stats << "</jemalloc-stats>" << endl;
         transport->sendString(stats.str());
         break;
@@ -514,19 +634,29 @@ void AdminRequestHandler::handleRequest(Transport *transport) {
         transport->sendString("OK\n");
         break;
       }
+      if (cmd == "jemalloc-prof-request") {
+        auto f = transport->getParam("file");
+        bool success = MemoryManager::triggerProfiling(f);
+
+        if (success) {
+          transport->sendString("OK\n");
+        } else {
+          transport->sendString("Request profiling already triggered\n");
+        }
+        break;
+      }
     }
 #endif
 
     transport->sendString("Unknown command: " + cmd + "\n", 404);
   } while (0);
   transport->onSendEnd();
-  GetAccessLog().log(transport, nullptr);
 }
 
 void AdminRequestHandler::abortRequest(Transport *transport) {
-  GetAccessLog().onNewRequest();
+  g_context.getCheck();
   transport->sendString("Service Unavailable", 503);
-  GetAccessLog().log(transport, nullptr);
+  transport->onSendEnd();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -538,7 +668,7 @@ static bool toggle_switch(Transport *transport, bool &setting) {
   return true;
 }
 
-static bool send_report(Transport *transport, ServerStats::Format format,
+static bool send_report(Transport *transport, Writer::Format format,
                         const char *mime) {
   int64_t  from   = transport->getInt64Param ("from");
   int64_t  to     = transport->getInt64Param ("to");
@@ -551,17 +681,17 @@ static bool send_report(Transport *transport, ServerStats::Format format,
   std::string out;
   ServerStats::Report(out, format, from, to, agg, keys, url, code, prefix);
 
-  transport->addHeader("Content-Type", mime);
+  transport->replaceHeader("Content-Type", mime);
   transport->sendString(out);
   return true;
 }
 
-static bool send_status(Transport *transport, ServerStats::Format format,
+static bool send_status(Transport *transport, Writer::Format format,
                         const char *mime) {
   string out;
   ServerStats::ReportStatus(out, format);
 
-  transport->addHeader("Content-Type", mime);
+  transport->replaceHeader("Content-Type", mime);
   transport->sendString(out);
   return true;
 }
@@ -572,18 +702,18 @@ bool AdminRequestHandler::handleCheckRequest(const std::string &cmd,
                                              Transport *transport) {
   if (cmd == "check-load") {
     int count = HttpServer::Server->getPageServer()->getActiveWorker();
-    transport->sendString(boost::lexical_cast<std::string>(count));
+    transport->sendString(folly::to<std::string>(count));
     return true;
   }
   if (cmd == "check-ev") {
     int count =
       HttpServer::Server->getPageServer()->getLibEventConnectionCount();
-    transport->sendString(lexical_cast<string>(count));
+    transport->sendString(folly::to<string>(count));
     return true;
   }
   if (cmd == "check-queued") {
     int count = HttpServer::Server->getPageServer()->getQueuedJobs();
-    transport->sendString(lexical_cast<string>(count));
+    transport->sendString(folly::to<string>(count));
     return true;
   }
   if (cmd == "check-health") {
@@ -598,7 +728,7 @@ bool AdminRequestHandler::handleCheckRequest(const std::string &cmd,
     HPHP::Server* server = HttpServer::Server->getPageServer();
     appendStat("load", server->getActiveWorker());
     appendStat("queued", server->getQueuedJobs());
-    auto* mCGenerator = JIT::mcg;
+    auto* mCGenerator = jit::mcg;
     appendStat("hhbc-roarena-capac", hhbc_arena_capacity());
     mCGenerator->code.forEachBlock([&](const char* name, const CodeBlock& a) {
       auto isMain = strncmp(name, "main", 4) == 0;
@@ -608,7 +738,7 @@ bool AdminRequestHandler::handleCheckRequest(const std::string &cmd,
     });
     appendStat("targetcache", RDS::usedBytes());
     appendStat("rds", RDS::usedBytes()); // TODO(#2966387): temp double logging
-    appendStat("units", Eval::FileRepository::getLoadedFiles());
+    appendStat("units", numLoadedUnits());
     appendStat("funcs", Func::nextFuncId());
     out << "}" << endl;
     transport->sendString(out.str());
@@ -616,12 +746,12 @@ bool AdminRequestHandler::handleCheckRequest(const std::string &cmd,
   }
   if (cmd == "check-pl-load") {
     int count = PageletServer::GetActiveWorker();
-    transport->sendString(lexical_cast<string>(count));
+    transport->sendString(folly::to<string>(count));
     return true;
   }
   if (cmd == "check-pl-queued") {
     int count = PageletServer::GetQueuedJobs();
-    transport->sendString(lexical_cast<string>(count));
+    transport->sendString(folly::to<string>(count));
     return true;
   }
   if (cmd == "check-sat") {
@@ -655,14 +785,38 @@ bool AdminRequestHandler::handleCheckRequest(const std::string &cmd,
 bool AdminRequestHandler::handleStatusRequest(const std::string &cmd,
                                               Transport *transport) {
   if (cmd == "status.xml") {
-    return send_status(transport, ServerStats::Format::XML, "application/xml");
+    return send_status(transport, Writer::Format::XML, "application/xml");
   }
   if (cmd == "status.json") {
-    return send_status(transport, ServerStats::Format::JSON,
+    return send_status(transport, Writer::Format::JSON,
                        "application/json");
   }
   if (cmd == "status.html" || cmd == "status.htm") {
-    return send_status(transport, ServerStats::Format::HTML, "text/html");
+    return send_status(transport, Writer::Format::HTML, "text/html");
+  }
+  return false;
+}
+
+bool AdminRequestHandler::handleMemoryRequest(const std::string &cmd,
+                                              Transport *transport){
+  std::string out;
+  if (cmd == "memory.xml") {
+      MemoryStats::GetInstance()->ReportMemory(out, Writer::Format::XML);
+      transport->replaceHeader("Content-Type","application/xml");
+      transport->sendString(out);
+      return true;
+  }
+  if (cmd == "memory.json") {
+      MemoryStats::GetInstance()->ReportMemory(out, Writer::Format::JSON);
+      transport->replaceHeader("Content-Type","application/json");
+      transport->sendString(out);
+      return true;
+  }
+  if (cmd == "memory.html" || cmd == "memory.htm") {
+      MemoryStats::GetInstance()->ReportMemory(out, Writer::Format::XML);
+      transport->replaceHeader("Content-Type","application/html");
+      transport->sendString(out);
+      return true;
   }
   return false;
 }
@@ -715,17 +869,17 @@ bool AdminRequestHandler::handleStatsRequest(const std::string &cmd,
     return true;
   }
   if (cmd == "stats.xml") {
-    return send_report(transport, ServerStats::Format::XML, "application/xml");
+    return send_report(transport, Writer::Format::XML, "application/xml");
   }
   if (cmd == "stats.json") {
-    return send_report(transport, ServerStats::Format::JSON,
+    return send_report(transport, Writer::Format::JSON,
                        "application/json");
   }
   if (cmd == "stats.kvp") {
-    return send_report(transport, ServerStats::Format::KVP, "text/plain");
+    return send_report(transport, Writer::Format::KVP, "text/plain");
   }
   if (cmd == "stats.html" || cmd == "stats.htm") {
-    return send_report(transport, ServerStats::Format::HTML, "text/html");
+    return send_report(transport, Writer::Format::HTML, "text/html");
   }
 
   if (cmd == "stats.xsl") {
@@ -736,7 +890,7 @@ bool AdminRequestHandler::handleStatsRequest(const std::string &cmd,
           200) {
         xsl = response.data();
         if (!xsl.empty()) {
-          transport->addHeader("Content-Type", "application/xml");
+          transport->replaceHeader("Content-Type", "application/xml");
           transport->sendString(xsl);
           return true;
         }
@@ -761,8 +915,8 @@ bool AdminRequestHandler::handleProfileRequest(const std::string &cmd,
     string res = "[ ";
     for (std::map<ThreadInfo::Executing, int>::const_iterator iter =
            counts.begin(); iter != counts.end(); ++iter) {
-      res += lexical_cast<string>(iter->first) + ", " +
-        lexical_cast<string>(iter->second) + ", ";
+      res += folly::to<string>(iter->first) + ", " +
+        folly::to<string>(iter->second) + ", ";
     }
     res += "-1 ]";
     transport->sendString(res);
@@ -838,21 +992,21 @@ typedef std::map<int, PCInfo> InfoMap;
 bool AdminRequestHandler::handleVMRequest(const std::string &cmd,
                                           Transport *transport) {
   if (cmd == "vm-tcspace") {
-    transport->sendString(JIT::mcg->getUsage());
+    transport->sendString(jit::mcg->getUsageString());
     return true;
   }
   if (cmd == "vm-tcaddr") {
-    transport->sendString(JIT::mcg->getTCAddrs());
+    transport->sendString(jit::mcg->getTCAddrs());
     return true;
   }
   if (cmd == "vm-namedentities") {
     std::ostringstream result;
-    result << Unit::GetNamedEntityTableSize();
+    result << NamedEntity::tableSize();
     transport->sendString(result.str());
     return true;
   }
   if (cmd == "vm-dump-tc") {
-    if (HPHP::JIT::tc_dump()) {
+    if (HPHP::jit::tc_dump()) {
       transport->sendString("Done");
     } else {
       transport->sendString("Error dumping the translation cache");
@@ -862,10 +1016,24 @@ bool AdminRequestHandler::handleVMRequest(const std::string &cmd,
   return false;
 }
 
+void AdminRequestHandler::handleProxyRequest(const std::string& cmd,
+                                             Transport* transport) {
+  try {
+    auto const percentStr = transport->getParam("percentage");
+    auto const percent    = percentStr.empty() ? 0 : folly::to<int>(percentStr);
+    if (percent < 0 || percent > 100) {
+      throw std::range_error("must be in [0, 100]");
+    }
+
+    setProxyOriginPercentage(transport->getParam("origin"), percent);
+    transport->sendString("Origin and percentage updated");
+  } catch (const std::range_error& re) {
+    transport->sendString(folly::sformat("Invalid percentage: {}", re.what()));
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Dump cache content
-
-bool (*file_dump)(const char *filename) = nullptr;
 
 bool AdminRequestHandler::handleDumpCacheRequest(const std::string &cmd,
                                                  Transport *transport) {
@@ -888,11 +1056,12 @@ bool AdminRequestHandler::handleDumpCacheRequest(const std::string &cmd,
     transport->sendString("Done");
     return true;
   }
-  if (cmd == "dump-file-repo") {
-    if (file_dump) {
-      (*file_dump)("/tmp/file_repo_dump");
+  if (cmd == "dump-apc-info") {
+    if (!apcExtension::Enable) {
+      transport->sendString("No APC\n");
+      return true;
     }
-    transport->sendString("Done");
+    transport->sendString(APCStats::getAPCStats().getStatsInfo());
     return true;
   }
   if (cmd == "dump-apc-meta") {
@@ -913,4 +1082,23 @@ bool AdminRequestHandler::handleDumpCacheRequest(const std::string &cmd,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+
+bool AdminRequestHandler::handleRandomApcRequest(const std::string &cmd,
+                                                 Transport *transport){
+  std::ostringstream out;
+  uint32_t keyCount = 1;
+  std::string count = transport->getParam("count");
+  if (count != "") {
+    try {
+      keyCount = folly::to<int64_t>(count);
+    } catch (const std::invalid_argument& ia) {
+      // set keyCount to 1 if an invalid string is passed
+      keyCount = 1;
+    }
+  }
+  apc_get_random_entries(out, keyCount);
+  transport->sendString(out.str());
+
+  return true;
+}
 }

@@ -41,3 +41,64 @@ function ezc_throw_nonstd(): mixed;
  */
 <<__Native("ZendCompat")>>
 function ezc_realpath(mixed $path): mixed;
+
+/* Varadic argument test, equivalent to min()
+ */
+<<__Native("ZendCompat")>>
+  function ezc_min(): mixed;
+
+/* Create a hash which maps string keys to string values. When a value is
+ * deleted from the hash, it is written to the current output buffer.
+ */
+<<__Native("ZendCompat")>>
+function ezc_hash_create(): mixed;
+
+/* Create a hash which maps string keys to string values. When a value is
+ * deleted from the hash, it is written to the current output buffer.
+ */
+<<__Native("ZendCompat")>>
+function ezc_hash_set(mixed $table, string $key, string $value): mixed;
+
+/* Get a hash item
+ */
+<<__Native("ZendCompat")>>
+function ezc_hash_get(mixed $table, string $key): mixed;
+
+/* Append a value to the hash, with the next-highest available numeric
+ * key.
+ */
+<<__Native("ZendCompat")>>
+function ezc_hash_append(mixed $table, string $value): mixed;
+
+/* Set an element of an array by modifying the data pointer returned by
+ * zend_hash_find(). The array is passed by value, so this shouldn't have
+ * any visible effect.
+ */
+<<__Native("ZendCompat")>>
+function ezc_array_val_set(array $a, mixed $key, mixed $value): mixed;
+
+/* Set an element of an array passed by reference, by modifying the data
+ * pointer returned by zend_hash_find().
+ */
+<<__Native("ZendCompat")>>
+function ezc_array_set(array &$a, mixed $key, mixed $value): mixed;
+
+<<__NativeData("ZendCompat")>> class EzcTestCloneable {}
+<<__NativeData("ZendCompat")>> class EzcTestUncloneable1 {}
+<<__NativeData("ZendCompat")>> class EzcTestUncloneable2 {}
+
+/** Create an array with a TestCloneable object in it. Test of
+ * object_init_ex(). */
+<<__Native("ZendCompat")>>
+function ezc_create_cloneable_in_array(): mixed;
+
+/* Get the EG(error_reporting) value.
+ */
+<<__Native("ZendCompat")>>
+function ezc_get_error_reporting(): mixed;
+
+/* Set the EG(error_reporting) value, returning the old value.
+ */
+<<__Native("ZendCompat")>>
+function ezc_set_error_reporting(int $error_reporting): mixed;
+

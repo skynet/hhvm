@@ -17,6 +17,9 @@
 #include "hphp/runtime/server/rpc-request-handler.h"
 
 #include "hphp/runtime/server/http-request-handler.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/server/server-stats.h"
@@ -25,11 +28,14 @@
 #include "hphp/runtime/server/source-root-info.h"
 #include "hphp/runtime/server/request-uri.h"
 #include "hphp/runtime/ext/json/ext_json.h"
+#include "hphp/runtime/ext/std/ext_std_output.h"
 #include "hphp/runtime/base/php-globals.h"
+#include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/util/process.h"
 #include "hphp/runtime/server/satellite-server.h"
+#include "hphp/system/constants.h"
 
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 
 using std::set;
 
@@ -42,7 +48,6 @@ RPCRequestHandler::RPCRequestHandler(int timeout, bool info)
     m_reset(false),
     m_logResets(info),
     m_returnEncodeType(ReturnEncodeType::Json) {
-  initState();
 }
 
 RPCRequestHandler::~RPCRequestHandler() {
@@ -72,12 +77,13 @@ void RPCRequestHandler::initState() {
 }
 
 void RPCRequestHandler::cleanupState() {
-  hphp_context_exit(m_context, false);
+  hphp_context_exit();
   hphp_session_exit();
 }
 
 bool RPCRequestHandler::needReset() const {
   return (m_reset ||
+          !vmStack().isAllocated() ||
           m_serverInfo->alwaysReset() ||
           ((time(0) - m_lastReset) > m_serverInfo->getMaxDuration()) ||
           (m_requestsSinceReset >= m_serverInfo->getMaxRequest()));
@@ -85,7 +91,7 @@ bool RPCRequestHandler::needReset() const {
 
 void RPCRequestHandler::handleRequest(Transport *transport) {
   if (needReset()) {
-    cleanupState();
+    if (vmStack().isAllocated()) cleanupState();
     initState();
   }
   ++m_requestsSinceReset;
@@ -153,7 +159,8 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   auto& reqData = ThreadInfo::s_threadInfo->m_reqInjectionData;
   reqData.setTimeout(vhost->getRequestTimeoutSeconds(getDefaultTimeout()));
   SCOPE_EXIT {
-    reqData.setTimeout(0);
+    reqData.setTimeout(0);  // can't throw when you pass zero
+    reqData.setCPUTimeout(0);
     reqData.reset();
   };
 
@@ -295,7 +302,9 @@ bool RPCRequestHandler::executePHPFunction(Transport *transport,
         rpcFile = (std::string) canonicalize_path(rpcFile, "", 0);
         rpcFile = getSourceFilename(rpcFile, sourceRootInfo);
         ret = hphp_invoke(m_context, rpcFile, false, Array(), uninit_null(),
-                          reqInitFunc, reqInitDoc, error, errorMsg, runOnce);
+                          reqInitFunc, reqInitDoc, error, errorMsg, runOnce,
+                          false /* warmupOnly */,
+                          false /* richErrorMessage */);
       }
       // no need to do the initialization for a second time
       reqInitFunc.clear();
@@ -303,7 +312,10 @@ bool RPCRequestHandler::executePHPFunction(Transport *transport,
     }
     if (ret && !rpcFunc.empty()) {
       ret = hphp_invoke(m_context, rpcFunc, true, params, ref(funcRet),
-                        reqInitFunc, reqInitDoc, error, errorMsg);
+                        reqInitFunc, reqInitDoc, error, errorMsg,
+                        true /* once */,
+                        false /* warmupOnly */,
+                        false /* richErrorMessage */);
     }
     if (ret) {
       bool serializeFailed = false;
@@ -314,7 +326,7 @@ bool RPCRequestHandler::executePHPFunction(Transport *transport,
                  returnEncodeType == ReturnEncodeType::Serialize);
           try {
             response = (returnEncodeType == ReturnEncodeType::Json) ?
-                       HHVM_FN(json_encode)(funcRet) :
+                       HHVM_FN(json_encode)(funcRet).toString() :
                        f_serialize(funcRet);
           } catch (...) {
             serializeFailed = true;
@@ -326,7 +338,7 @@ bool RPCRequestHandler::executePHPFunction(Transport *transport,
           response =
             HHVM_FN(json_encode)(
               make_map_array(s_output, m_context->obDetachContents(),
-                                      s_return, HHVM_FN(json_encode)(funcRet)));
+                             s_return, HHVM_FN(json_encode)(funcRet)));
           break;
         case 3: response = f_serialize(funcRet); break;
       }
@@ -359,7 +371,11 @@ bool RPCRequestHandler::executePHPFunction(Transport *transport,
   ServerStats::LogPage(isFile ? rpcFile : rpcFunc, code);
 
   m_context->onShutdownPostSend();
-  m_context->obClean(); // in case postsend/cleanup output something
+  // in case postsend/cleanup output something
+  // PHP5 always provides _START.
+  m_context->obClean(k_PHP_OUTPUT_HANDLER_START |
+                     k_PHP_OUTPUT_HANDLER_CLEAN |
+                     k_PHP_OUTPUT_HANDLER_END);
   m_context->restoreSession();
   return !error;
 }

@@ -38,7 +38,7 @@
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-class-entry.h"
-#include "hphp/runtime/ext_zend_compat/hhvm/ZendExceptionStore.h"
+#include "hphp/runtime/ext_zend_compat/hhvm/zend-exception-store.h"
 namespace HPHP {
   void zBoxAndProxy(TypedValue* arg);
 }
@@ -57,7 +57,7 @@ ZEND_API int zend_lookup_class(const char *name, int name_length, zend_class_ent
 }
 
 ZEND_API const char *get_active_function_name(TSRMLS_D) {
-  HPHP::JIT::VMRegAnchor _;
+  HPHP::VMRegAnchor _;
   return HPHP::liveFunc()->name()->data();
 }
 
@@ -76,7 +76,7 @@ ZEND_API const char *get_active_class_name(const char **space TSRMLS_DC) {
 }
 
 ZEND_API const char *zend_get_executed_filename(TSRMLS_D) {
-  return HPHP::g_context->getContainingFileName().data();
+  return HPHP::g_context->getContainingFileName()->data();
 }
 
 ZEND_API uint zend_get_executed_lineno(TSRMLS_D) {
@@ -125,50 +125,73 @@ ZEND_API int call_user_function_ex(HashTable *function_table, zval **object_pp, 
   return zend_call_function(&fci, NULL TSRMLS_CC);
 }
 
-static void zend_handle_cpp_exception(TSRMLS_D)
-{
-  ZendExceptionStore::getInstance().setPointer(std::current_exception());
+namespace {
+  static void zend_handle_cpp_exception(TSRMLS_D)
+  {
+    HPHP::ZendExceptionStore::getInstance().setPointer(std::current_exception());
 
-  try {
-    throw;
-  }
+    try {
+      throw;
+    }
 
-  catch (HPHP::Object& e) {
-    HPHP::TypedValue tv = HPHP::make_tv<HPHP::KindOfObject>(e.get());
-    EG(exception) = HPHP::RefData::Make(tv);
-  }
+    catch (HPHP::Object& e) {
+      HPHP::TypedValue tv = HPHP::make_tv<HPHP::KindOfObject>(e.get());
+      EG(exception) = HPHP::RefData::Make(tv);
+    }
 
-  catch (std::exception& e) {
-    std::string message(typeid(e).name());
-    message += ": ";
-    message += e.what();
-    EG(exception) = HPHP::RefData::Make(HPHP::make_tv<HPHP::KindOfObject>(
-        HPHP::SystemLib::AllocExceptionObject(HPHP::Variant(message))));
-  }
+    catch (std::exception& e) {
+      std::string message(typeid(e).name());
+      message += ": ";
+      message += e.what();
+      EG(exception) = HPHP::RefData::Make(HPHP::make_tv<HPHP::KindOfObject>(
+          HPHP::SystemLib::AllocExceptionObject(HPHP::Variant(message))));
+    }
 
-  catch (...) {
-    std::string message("unexpected C++ exception");
-    EG(exception) = HPHP::RefData::Make(HPHP::make_tv<HPHP::KindOfObject>(
-        HPHP::SystemLib::AllocExceptionObject(HPHP::Variant(message))));
+    catch (...) {
+      std::string message("unexpected C++ exception");
+      EG(exception) = HPHP::RefData::Make(HPHP::make_tv<HPHP::KindOfObject>(
+          HPHP::SystemLib::AllocExceptionObject(HPHP::Variant(message))));
+    }
+    tvIncRef(EG(exception)->tv());
   }
-  tvIncRef(EG(exception)->tv());
 }
 
 int zend_call_function(zend_fcall_info *fci, zend_fcall_info_cache *fci_cache TSRMLS_DC) /* {{{ */
 {
-  assert(fci->object_ptr == nullptr);
-
   // mostly from vm_call_user_func
-  HPHP::ObjectData* obj = nullptr;
+  HPHP::ObjectData* inferred_obj = nullptr;
   HPHP::Class* cls = nullptr;
-  HPHP::JIT::CallerFrame cf;
+
+  if (fci->object_ptr != nullptr) {
+    HPHP::TypedValue *tv = fci->object_ptr->tv();
+    if (tv->m_type == HPHP::KindOfObject) {
+      inferred_obj = tv->m_data.pobj;
+      if (inferred_obj) {
+        cls = inferred_obj->getVMClass();
+      }
+    } else {
+      assert(!"zend_call_function not given an object");
+    }
+  }
+
+  HPHP::ObjectData* obj = inferred_obj;
+
+  HPHP::CallerFrame cf;
   HPHP::StringData* invName = nullptr;
+  /*
+   * WATCHOUT! obj and cls are passed by reference to vm_decode_function,
+   * and may get overwritten.
+   */
   const HPHP::Func* f = HPHP::vm_decode_function(
     HPHP::tvAsCVarRef(fci->function_name->tv()), cf(), false, obj, cls, invName
   );
   if (f == nullptr) {
     return FAILURE;
   }
+  if (obj == nullptr && inferred_obj != nullptr) {
+    obj = inferred_obj;  /* restore value inferred above */
+  }
+
   *fci->retval_ptr_ptr = NULL;
 
   HPHP::PackedArrayInit ad_params(fci->param_count);
@@ -216,7 +239,7 @@ ZEND_API zend_class_entry *zend_fetch_class_by_name(
     return NULL;
   }
   HPHP::StringData * sd = HPHP::makeStaticString(class_name, class_name_len);
-  zend_class_entry * zce = zend_hphp_get_internal_class_entry(sd);
+  zend_class_entry * zce = HPHP::zend_hphp_get_internal_class_entry(sd);
   if (zce) {
     return zce;
   }
@@ -235,6 +258,6 @@ ZEND_API zend_class_entry *zend_fetch_class_by_name(
     }
     return NULL;
   }
-  return zend_hphp_class_to_class_entry(cls);
+  return HPHP::zend_hphp_class_to_class_entry(cls);
 }
 

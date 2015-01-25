@@ -76,8 +76,13 @@ void FunctionStatement::onParse(AnalysisResultConstPtr ar, FileScopePtr scope) {
     return;
   }
 
-  if (Option::PersistenceHook) {
-    fs->setPersistent(Option::PersistenceHook(fs, scope));
+  fs->setPersistent(false);
+
+  if (m_name == "__autoload") {
+    if (m_params && m_params->getCount() != 1) {
+      parseTimeFatal(Compiler::InvalidMagicMethod,
+                     "__autoload() must take exactly 1 argument");
+    }
   }
 
   if (fs->isNative()) {
@@ -88,8 +93,10 @@ void FunctionStatement::onParse(AnalysisResultConstPtr ar, FileScopePtr scope) {
     if (m_params) {
       int nParams = m_params->getCount();
       for (int i = 0; i < nParams; ++i) {
+        // Variadic capture params don't need types
+        // since they'll be Arrays as far as HNI is concerned.
         auto param = dynamic_pointer_cast<ParameterExpression>((*m_params)[i]);
-        if (!param->hasUserType()) {
+        if (!param->hasUserType() && !param->isVariadic()) {
           parseTimeFatal(Compiler::InvalidAttribute,
                          "Native function calls must have type hints "
                          "on all args");
@@ -126,9 +133,6 @@ void FunctionStatement::analyzeProgram(AnalysisResultPtr ar) {
     }
   }
   MethodStatement::analyzeProgram(ar);
-}
-
-void FunctionStatement::inferTypes(AnalysisResultPtr ar) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////

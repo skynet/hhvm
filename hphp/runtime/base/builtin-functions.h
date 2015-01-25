@@ -17,18 +17,12 @@
 #ifndef incl_HPHP_BUILTIN_FUNCTIONS_H_
 #define incl_HPHP_BUILTIN_FUNCTIONS_H_
 
-#include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/base/request-event-handler.h"
-#include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/base/intercept.h"
-#include "hphp/runtime/base/runtime-error.h"
-#include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/variable-unserializer.h"
-#include "hphp/runtime/base/request-local.h"
-#include "hphp/runtime/base/strings.h"
-#include "hphp/util/functional.h"
+#include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/type-conversions.h"
+#include "hphp/runtime/base/variable-unserializer.h"
+#include "hphp/runtime/vm/bytecode.h"
+#include "hphp/util/functional.h"
 
 #if defined(__APPLE__) || defined(__USE_BSD)
 /**
@@ -44,21 +38,6 @@
 #  undef isset
 # endif
 #endif
-
-/**
- * This file contains a list of functions that HPHP generates to wrap
- * around different expressions to maintain semantics. If we read
- * through all types of expressions in
- * compiler/expression/expression.h, we can find most of them can be
- * directly transformed into C/C++ counterpart without too much
- * syntactical changes. The functions in this file happen to be the
- * ones that are somewhat special.
- *
- * Another way to think about this file is that this file has a list of C-style
- * functions, and the rest of run-time has object/classes for other tasks,
- * although we do have some global functions defined in other files as well,
- * when they are closer to the classes/objects in the same files.
- */
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -78,21 +57,8 @@ String concat4(const String& s1, const String& s2, const String& s3,
                const String& s4);
 
 ///////////////////////////////////////////////////////////////////////////////
-// output functions
 
-inline void echo(const char *s) {
-  g_context->write(s);
-}
-inline void echo(const char *s, int len) {
-  g_context->write(s, len);
-}
-inline void echo(const String& s) {
-  g_context->write(s);
-}
-
-void NEVER_INLINE throw_invalid_property_name(const String& name)
-  ATTRIBUTE_NORETURN;
-void NEVER_INLINE throw_null_object_prop();
+void NEVER_INLINE throw_invalid_property_name(const String& name);
 void NEVER_INLINE throw_null_get_object_prop();
 void NEVER_INLINE raise_null_object_prop();
 void throw_exception(const Object& e);
@@ -107,7 +73,16 @@ inline bool is_int(const Variant& v)    { return v.isInteger();}
 inline bool is_double(const Variant& v) { return v.is(KindOfDouble);}
 inline bool is_string(const Variant& v) { return v.isString();}
 inline bool is_array(const Variant& v)  { return v.is(KindOfArray);}
-inline bool is_object(const Variant& var) { return var.is(KindOfObject); }
+
+inline bool is_object(const Variant& var) {
+  if (!var.is(KindOfObject)) {
+    return false;
+  }
+  auto cls = var.toObject().get()->getVMClass();
+  auto incompleteClass = SystemLib::s___PHP_Incomplete_ClassClass;
+  return cls != incompleteClass;
+}
+
 inline bool is_empty_string(const Variant& v) {
   return v.isString() && v.getStringData()->empty();
 }
@@ -116,9 +91,6 @@ inline bool is_empty_string(const Variant& v) {
 // misc functions
 
 bool array_is_valid_callback(const Array& arr);
-
-Variant f_call_user_func_array(const Variant& function, const Array& params,
-                               bool bound = false);
 
 const HPHP::Func*
 vm_decode_function(const Variant& function,
@@ -139,45 +111,15 @@ vm_decode_function(const Variant& function,
                                 ctx.invName, warn);
 }
 
-ActRec* vm_get_previous_frame();
 Variant vm_call_user_func(const Variant& function, const Variant& params,
                           bool forwarding = false);
 
-/**
- * Invoking an arbitrary static method.
- */
 Variant invoke_static_method(const String& s, const String& method,
                              const Variant& params, bool fatal = true);
-
-/**
- * Fallback when a dynamic function call fails to find a user function
- * matching the name.  If no handlers are able to
- * invoke the function, throw an InvalidFunctionCallException.
- */
-Variant invoke_failed(const char *func,
-                      bool fatal = true);
-Variant invoke_failed(const Variant& func,
-                      bool fatal = true);
 
 Variant o_invoke_failed(const char *cls, const char *meth,
                         bool fatal = true);
 
-/**
- * When fatal coding errors are transformed to this function call.
- */
-inline Variant throw_fatal(const char *msg, void *dummy = nullptr) {
-  throw FatalErrorException(msg);
-}
-inline Variant throw_missing_class(const char *cls) {
-  throw ClassNotFoundException((std::string("unknown class ") + cls).c_str());
-}
-
-inline Variant throw_missing_file(const char *file) {
-  if (file[0] == '\0') {
-    throw NoFileSpecifiedException();
-  }
-  throw PhpFileDoesNotExistException(file);
-}
 void throw_instance_method_fatal(const char *name);
 
 void throw_iterator_not_valid() ATTRIBUTE_NORETURN;
@@ -193,6 +135,7 @@ void check_collection_cast_to_array();
 
 Object create_object_only(const String& s);
 Object create_object(const String& s, const Array &params, bool init = true);
+Object init_object(const String& s, const Array &params, ObjectData* o);
 
 /**
  * Argument count handling.
@@ -200,15 +143,19 @@ Object create_object(const String& s, const Array &params, bool init = true);
  *   - When level is 1, it's from system funcs that turn both into warnings
  *   - When level is 0, it's from user funcs that turn missing arg in warnings
  */
+void throw_wrong_argument_count_nr(const char *fn, int expected, int got,
+                                   const char *expectDesc, int level = 0,
+                                   TypedValue *rv = nullptr)
+  __attribute__((__cold__));
 void throw_missing_arguments_nr(const char *fn, int expected, int got,
                                 int level = 0, TypedValue *rv = nullptr)
-  __attribute__((cold));
-void throw_toomany_arguments_nr(const char *fn, int num, int level = 0,
-                                TypedValue *rv = nullptr)
-  __attribute__((cold));
+  __attribute__((__cold__));
+void throw_toomany_arguments_nr(const char *fn, int expected, int got,
+                                int level = 0, TypedValue *rv = nullptr)
+  __attribute__((__cold__));
 void throw_wrong_arguments_nr(const char *fn, int count, int cmin, int cmax,
                               int level = 0, TypedValue *rv = nullptr)
-  __attribute__((cold));
+  __attribute__((__cold__));
 
 /**
  * Handler for exceptions thrown from user functions that we don't
@@ -218,34 +165,21 @@ void throw_wrong_arguments_nr(const char *fn, int count, int cmin, int cmax,
  */
 void handle_destructor_exception(const char* situation = "Destructor");
 
-/**
- * If RuntimeOption::ThrowBadTypeExceptions is on, we are running in
- * a restrictive mode that's not compatible with PHP, and this will throw.
- * If RuntimeOption::ThrowBadTypeExceptions is off, we will log a
- * warning and swallow the error.
+/*
+ * Deprecated wrappers for raising certain types of warnings.
+ *
+ * Don't use in new code.
  */
 void throw_bad_type_exception(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2);
 void throw_expected_array_exception();
 void throw_expected_array_or_collection_exception();
-
-/**
- * If RuntimeOption::ThrowInvalidArguments is on, we are running in
- * a restrictive mode that's not compatible with PHP, and this will throw.
- * If RuntimeOption::ThrowInvalidArguments is off, we will log a
- * warning and swallow the error.
- */
-void throw_invalid_argument(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2);
+void throw_invalid_argument(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2)
+   __attribute__((__cold__));
 
 /**
  * Unsetting ClassName::StaticProperty.
  */
 Variant throw_fatal_unset_static_property(const char *s, const char *prop);
-
-/**
- * Exceptions injected code throws
- */
-Exception* generate_request_timeout_exception();
-Exception* generate_memory_exceeded_exception();
 
 // unserializable default value arguments such as TimeStamp::Current()
 // are serialized as "\x01"
@@ -279,97 +213,14 @@ inline Variant unserialize_from_string(const String& str,
 String resolve_include(const String& file, const char* currentDir,
                        bool (*tryFile)(const String& file, void* ctx),
                        void* ctx);
-Variant include(const String& file, bool once = false,
-                const char *currentDir = "",
-                bool raiseNotice = true);
-Variant require(const String& file, bool once = false,
-                const char *currentDir = "",
-                bool raiseNotice = true);
 Variant include_impl_invoke(const String& file, bool once = false,
                             const char *currentDir = "");
-Variant invoke_file(const String& file, bool once = false,
-                    const char *currentDir = nullptr);
-bool invoke_file_impl(Variant &res, const String& path, bool once,
-                      const char *currentDir);
+Variant require(const String& file, bool once, const char* currentDir,
+                bool raiseNotice);
 
 bool function_exists(const String& function_name);
-
-/**
- * For autoload support
- */
-
-class AutoloadHandler final : public RequestEventHandler {
-  enum Result {
-    Failure,
-    Success,
-    StopAutoloading,
-    ContinueAutoloading
-  };
-
-  struct HandlerBundle {
-    HandlerBundle() = delete;
-    HandlerBundle(const Variant& handler,
-                  smart::unique_ptr<CufIter>& cufIter) :
-      m_handler(handler) {
-      m_cufIter = std::move(cufIter);
-    }
-
-    Variant m_handler; // used to respond to f_spl_autoload_functions
-    smart::unique_ptr<CufIter> m_cufIter; // used to invoke handlers
-  };
-
-  class CompareBundles {
-public:
-    explicit CompareBundles(CufIter* cufIter) : m_cufIter(cufIter) { }
-    bool operator()(const HandlerBundle& hb);
-private:
-    CufIter* m_cufIter;
-  };
-
-public:
-  AutoloadHandler() { }
-
-  ~AutoloadHandler() {
-    m_map.detach();
-    m_map_root.detach();
-    // m_handlers won't run a destructor so nothing to do here
-    m_loading.detach();
-  }
-
-  virtual void requestInit();
-  virtual void requestShutdown();
-
-  Array getHandlers();
-  bool addHandler(const Variant& handler, bool prepend);
-  void removeHandler(const Variant& handler);
-  void removeAllHandlers();
-  bool isRunning();
-
-  bool invokeHandler(const String& className, bool forceSplStack = false);
-  bool autoloadFunc(StringData* name);
-  bool autoloadConstant(StringData* name);
-  bool autoloadType(const String& name);
-  bool setMap(const Array& map, const String& root);
-  DECLARE_STATIC_REQUEST_LOCAL(AutoloadHandler, s_instance);
-
-private:
-  template <class T>
-  Result loadFromMap(const String& name, const String& kind, bool toLower,
-                     const T &checkExists);
-  static String getSignature(const Variant& handler);
-
-  Array m_map;
-  String m_map_root;
-  bool m_spl_stack_inited;
-  union {
-    smart::deque<HandlerBundle> m_handlers;
-  };
-  Array m_loading;
-};
-
-#define CALL_USER_FUNC_FEW_ARGS_COUNT 6
 
 ///////////////////////////////////////////////////////////////////////////////
 }
 
-#endif // incl_HPHP_BUILTIN_FUNCTIONS_H_
+#endif

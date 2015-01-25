@@ -23,11 +23,14 @@
 #include <map>
 
 #include <boost/variant.hpp>
+#include <tbb/concurrent_hash_map.h>
 
-#include "folly/Optional.h"
+#include <folly/Optional.h>
+#include <folly/Hash.h>
 
 #include "hphp/util/either.h"
 #include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/repo-auth-type-array.h"
 #include "hphp/runtime/vm/type-constraint.h"
 
 #include "hphp/hhbbc/hhbbc.h"
@@ -39,6 +42,7 @@ namespace HPHP { namespace HHBBC {
 
 struct Type;
 struct Index;
+struct PublicSPropIndexer;
 
 namespace php {
 struct Class;
@@ -81,6 +85,23 @@ inline bool operator<(Context a, Context b) {
 }
 
 std::string show(Context);
+
+/*
+ * Context for a call to a function.  This means the types and number
+ * of arguments, and where it is being called from.
+ *
+ * TODO(#3788877): add type of $this if it is going to be an object
+ * method, and the LSB class type if static.
+ */
+struct CallContext {
+  Context caller;
+  std::vector<Type> args;
+};
+
+inline bool operator==(const CallContext& a, const CallContext& b) {
+  return a.caller == b.caller &&
+         a.args == b.args;
+}
 
 /*
  * State of properties on a class.  Map from property name to its
@@ -149,10 +170,17 @@ struct Class {
    * Returns whether this type has the no override attribute, that is, if it
    * is a final class (explicitly marked by the user or known by the static
    * analysis).
-   * When returning false the class is guaranteed to be final. When returning
+   *
+   * When returning false the class is guaranteed to be final.  When returning
    * true the system cannot tell though the class may still be final.
    */
   bool couldBeOverriden() const;
+
+  /*
+   * Whether this class (or its subtypes) could possibly have have
+   * certain magic methods.
+   */
+  bool couldHaveMagicGet() const;
 
   /*
    * Returns the Class that is the first common ancestor between 'this' and 'o'.
@@ -166,6 +194,7 @@ private:
 private:
   friend std::string show(const Class&);
   friend struct ::HPHP::HHBBC::Index;
+  friend struct ::HPHP::HHBBC::PublicSPropIndexer;
   borrowed_ptr<const Index> index;
   Either<SString,borrowed_ptr<ClassInfo>> val;
 };
@@ -174,11 +203,10 @@ private:
  * This is an abstraction layer to represent possible runtime function
  * resolutions.
  *
- * Internally, this may only know the name of the function, or we may
- * know exactly which source-code-level function it refers to, or we
- * may only have ruled it down to one of a few functions in a class
- * hierarchy.  The interpreter can treat all these cases the same way
- * using this.
+ * Internally, this may only know the name of the function (or method), or we
+ * may know exactly which source-code-level function it refers to, or we may
+ * only have ruled it down to one of a few functions in a class hierarchy.  The
+ * interpreter can treat all these cases the same way using this.
  */
 struct Func {
   /*
@@ -195,9 +223,29 @@ struct Func {
    */
   SString name() const;
 
+  /*
+   * Returns whether this resolved function could possibly be going through a
+   * magic call, in the magic way.
+   *
+   * That is, if was resolved as part of a direct call to an __call method,
+   * this will say true.  If it was resolved as part as some normal method
+   * call, and we haven't proven that there's no way an __call dispatch could
+   * be involved, this will say false.
+   */
+  bool cantBeMagicCall() const;
+
 private:
   friend struct ::HPHP::HHBBC::Index;
-  using Rep = boost::variant< SString
+  struct FuncName {
+    bool operator==(FuncName o) const { return name == o.name; }
+    SString name;
+  };
+  struct MethodName {
+    bool operator==(MethodName o) const { return name == o.name; }
+    SString name;
+  };
+  using Rep = boost::variant< FuncName
+                            , MethodName
                             , borrowed_ptr<FuncInfo>
                             , borrowed_ptr<FuncFamily>
                             >;
@@ -222,11 +270,8 @@ std::string show(const Class&);
 //////////////////////////////////////////////////////////////////////
 
 /*
- * This class encapsulates the known facts about the program, possibly
- * with a whole-program view.  If the Index is created from a
- * php::Program instead of a php::Unit, it is considered a
- * "comprehensive" Index, which means it will assume it can see the
- * whole program, and may return more aggressive answers.
+ * This class encapsulates the known facts about the program, with a
+ * whole-program view.
  *
  * This structure contains unowned pointers into the php::Program it
  * was created for.  It should not out-live the Program.
@@ -238,20 +283,52 @@ std::string show(const Class&);
  */
 struct Index {
   /*
-   * Create a comprehensive, whole-program-aware index.
+   * Create an Index for a php::Program.  Performs some initial
+   * analysis of the program.
    */
   explicit Index(borrowed_ptr<php::Program>);
-
-  /*
-   * Create a non-comprehensive index for a single php::Unit.
-   */
-  explicit Index(borrowed_ptr<php::Unit>);
 
   /*
    * This class must not be destructed after its associated
    * php::Program.
    */
   ~Index();
+
+  /*
+   * The index operates in two modes: frozen, and unfrozen.
+   *
+   * Conceptually, the index is mutable and may acquire new
+   * information until it has been frozen, and once frozen, it retains
+   * the information it had at the point it was frozen.
+   *
+   * The reason this exists is because certain functions on the index
+   * may cause it to need to consult information in the bodies of
+   * functions other than the Context passed in.  Specifically, if the
+   * interpreter tries to look up the return type for a callee in a
+   * given CallContext, the index may choose to recursively invoke
+   * type inference on that callee's function body to see if more
+   * precise information can be determined, unless it is frozen.
+   *
+   * This is fine until the final pass, because all bytecode is
+   * read-only at that stage.  However, in the final pass, other
+   * threads might be optimizing a callee's bytecode and changing it,
+   * so we should not be reading from it to perform type inference
+   * concurrently.  Freezing the index tells it it can't do that
+   * anymore.
+   *
+   * These are the functions to query and transition to frozen state.
+   */
+  bool frozen() const;
+  void freeze();
+
+  /*
+   * The Index contains a Builder for an ArrayTypeTable.
+   *
+   * If we're creating assert types with options.InsertAssertions, we
+   * need to keep track of which array types exist in the whole
+   * program in order to include it in the repo.
+   */
+  std::unique_ptr<ArrayTypeTable::Builder>& array_table_builder() const;
 
   /*
    * Find all the closures created inside the context of a given
@@ -274,6 +351,17 @@ struct Index {
   folly::Optional<res::Class> resolve_class(Context, SString name) const;
 
   /*
+   * Resolve a closure class.
+   *
+   * Returns both a resolved Class, and the actual php::Class for the
+   * closure.  This function should only be used with class names are
+   * guaranteed to be closures (for example, the name supplied to a
+   * CreateCl opcode).
+   */
+  std::pair<res::Class,borrowed_ptr<php::Class>>
+    resolve_closure_class(Context ctx, SString name) const;
+
+  /*
    * Return a resolved class for a builtin class.
    *
    * Pre: `name' must be the name of a class defined in a systemlib.
@@ -290,17 +378,28 @@ struct Index {
   res::Func resolve_func(Context, SString name) const;
 
   /*
+   * Try to resolve a function using namespace-style fallback lookup.
+   *
+   * The name `name' is tried first, and `fallback' is used if this
+   * isn't found.  Both names must already be namespace-normalized.
+   * Resolution can fail because there are possible situations where
+   * we don't know which will be called at runtime.
+   *
+   * Note: the returned function may or may not be defined at the
+   * program point (it could require a function autoload that might
+   * fail).
+   */
+  folly::Optional<res::Func> resolve_func_fallback(Context,
+                                                   SString name,
+                                                   SString fallback) const;
+
+  /*
    * Try to resolve a class method named `name' with a given Context
    * and class type.
    *
-   * Returns: folly::none if we can't figure out which function this
-   * would call.
-   *
    * Pre: clsType.subtypeOf(TCls)
    */
-  folly::Optional<res::Func> resolve_method(Context,
-                                            Type clsType,
-                                            SString name) const;
+  res::Func resolve_method(Context, Type clsType, SString name) const;
 
   /*
    * Try to resolve a class constructor for the supplied class.
@@ -317,8 +416,20 @@ struct Index {
    * This function returns a subtype of Cell, although TypeConstraints
    * at runtime can match reference parameters.  The caller should
    * make sure to handle that case.
+   *
+   * For soft constraints (@), this function returns Cell.
+   *
+   * For some non-soft constraints (such as "Stringish"), this
+   * function may return a Type that is a strict supertype of the
+   * constraint's type.
    */
   Type lookup_constraint(Context, const TypeConstraint&) const;
+
+  /*
+   * If this function returns true, it is safe to assume that Type t
+   * will always satisfy TypeConstraint tc at run time.
+   */
+  bool satisfies_constraint(Context, Type t, const TypeConstraint& tc) const;
 
   /*
    * Lookup what the best known Type for a class constant would be,
@@ -328,10 +439,19 @@ struct Index {
   Type lookup_class_constant(Context, res::Class, SString cns) const;
 
   /*
-   * Return the best known return type for a resolved function.
-   * Returns TInitGen at worst.
+   * Return the best known return type for a resolved function, in a
+   * context insensitive way.  Returns TInitGen at worst.
    */
   Type lookup_return_type(Context, res::Func) const;
+
+  /*
+   * Return the best known return type for a resolved function, given
+   * the supplied calling context.  Returns TInitGen at worst.
+   *
+   * During analyze phases, this function may re-enter analyze in
+   * order to interpret the callee with these argument types.
+   */
+  Type lookup_return_type(CallContext, res::Func) const;
 
   /*
    * Look up the return type for an unresolved function.  The
@@ -344,8 +464,16 @@ struct Index {
   Type lookup_return_type_raw(borrowed_ptr<const php::Func>) const;
 
   /*
+   * Return the best known types of a closure's used variables (on
+   * entry to the closure).  The function is the closure body.
+   */
+  std::vector<Type>
+    lookup_closure_use_vars(borrowed_ptr<const php::Func>) const;
+
+  /*
    * Return the availability of $this on entry to the provided method.
-   * If the Func provided is not a method of a class false is returned.
+   * If the Func provided is not a method of a class false is
+   * returned.
    */
   bool lookup_this_available(borrowed_ptr<const php::Func>) const;
 
@@ -377,6 +505,23 @@ struct Index {
   PropState lookup_private_statics(borrowed_ptr<const php::Class>) const;
 
   /*
+   * Lookup the best known type for a public static property, with a given
+   * class type and name type.
+   *
+   * This function will always return TInitGen before refine_public_statics has
+   * been called, or if the AnalyzePublicStatics option is off.
+   */
+  Type lookup_public_static(Type cls, Type name) const;
+
+  /*
+   * Returns whether a public static property is known to be immutable.  This
+   * is used to add AttrPersistent flags to static properties, and relies on
+   * AnalyzePublicStatics (without this flag it will always return false).
+   */
+  bool lookup_public_static_immutable(borrowed_ptr<const php::Class>,
+                                      SString name) const;
+
+  /*
    * Refine the return type for a function, based on a round of
    * analysis.
    *
@@ -387,6 +532,18 @@ struct Index {
    * this php::Func.
    */
   std::vector<Context> refine_return_type(borrowed_ptr<const php::Func>, Type);
+
+  /*
+   * Refine the used var types for a closure, based on a round of
+   * analysis.
+   *
+   * No other threads should be calling functions on this Index when
+   * this function is called.
+   *
+   * Returns: true if the types have changed.
+   */
+  bool refine_closure_use_vars(borrowed_ptr<const php::Class>,
+                               const std::vector<Type>&);
 
   /*
    * Refine the private property types for a class, based on a round
@@ -408,19 +565,83 @@ struct Index {
   void refine_private_statics(borrowed_ptr<const php::Class> cls,
                               const PropState&);
 
+  /*
+   * After a whole program pass using PublicSPropIndexer, the types can be
+   * reflected into the index for use during another type inference pass.
+   *
+   * No other threads should be calling functions on this Index or on the
+   * provided PublicSPropIndexer when this function is called.
+   */
+  void refine_public_statics(const PublicSPropIndexer&);
+
 private:
   Index(const Index&) = delete;
   Index& operator=(Index&&) = delete;
 
 private:
+  template<class FuncRange>
+  res::Func resolve_func_helper(const FuncRange&, SString) const;
   res::Func do_resolve(borrowed_ptr<const php::Func>) const;
   bool must_be_derived_from(borrowed_ptr<const php::Class>,
                             borrowed_ptr<const php::Class>) const;
   bool could_be_related(borrowed_ptr<const php::Class>,
                         borrowed_ptr<const php::Class>) const;
+  Type satisfies_constraint_helper(Context, const TypeConstraint&) const;
 
 private:
   std::unique_ptr<IndexData> const m_data;
+};
+
+//////////////////////////////////////////////////////////////////////
+
+/*
+ * Indexer object used for collecting information about public static property
+ * types.  See analyze_public_statics in whole-program.cpp for details about
+ * how it is used.
+ */
+struct PublicSPropIndexer {
+  explicit PublicSPropIndexer(borrowed_ptr<const Index> index)
+    : m_index(index)
+  {}
+
+  /*
+   * Called by the interpreter during analyze_func_collect when a
+   * PublicSPropIndexer is active.  This function must be called anywhere the
+   * interpreter does something that could change the type of public static
+   * properties named `name' on classes of type `cls' to `val'.
+   *
+   * Note that if cls and name are both too generic this object will have to
+   * give up all information it knows about any public static properties.
+   *
+   * This routine may be safely called concurrently by multiple analysis
+   * threads.
+   */
+  void merge(Context ctx, Type cls, Type name, Type val);
+
+private:
+  friend struct Index;
+
+  struct KnownKey {
+    bool operator==(KnownKey o) const {
+      return cinfo == o.cinfo && prop == o.prop;
+    }
+
+    friend size_t tbb_hasher(KnownKey k) {
+      return folly::hash::hash_combine(k.cinfo, k.prop);
+    }
+
+    borrowed_ptr<ClassInfo> cinfo;
+    SString prop;
+  };
+
+  using UnknownMap = tbb::concurrent_hash_map<SString,Type>;
+  using KnownMap = tbb::concurrent_hash_map<KnownKey,Type>;
+
+private:
+  borrowed_ptr<const Index> m_index;
+  std::atomic<bool> m_everything_bad{false};
+  UnknownMap m_unknown;
+  KnownMap m_known;
 };
 
 //////////////////////////////////////////////////////////////////////

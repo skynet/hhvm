@@ -17,6 +17,7 @@
 #ifndef VARIANTCONTROLLER_H
 #define VARIANTCONTROLLER_H
 
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/base-includes.h"
 #include <algorithm>
 
@@ -43,10 +44,14 @@ struct VariantController {
       case KindOfStaticString:
       case KindOfString:     return HPHP::serialize::Type::STRING;
       case KindOfObject:     return HPHP::serialize::Type::OBJECT;
-      default:
+      case KindOfResource:
+      case KindOfRef:
         throw HPHP::serialize::SerializeError(
           "don't know how to serialize HPHP Variant");
+      case KindOfClass:
+        break;
     }
+    not_reached();
   }
   static int64_t asInt64(const VariantType& obj) { return obj.toInt64(); }
   static bool asBool(const VariantType& obj) { return obj.toInt64() != 0; }
@@ -58,7 +63,7 @@ struct VariantController {
   static const Array& asVector(const VariantType& obj) { return obj.toCArrRef(); }
 
   // variant creators
-  static VariantType createNull() { return null_variant; }
+  static VariantType createNull() { return init_null(); }
   static VariantType fromInt64(int64_t val) { return val; }
   static VariantType fromBool(bool val) { return val; }
   static VariantType fromDouble(double val) { return val; }
@@ -67,12 +72,12 @@ struct VariantController {
   static VariantType fromVector(const VectorType& vec) { return vec; }
 
   // map methods
-  static MapType createMap() { return Array::Create(); }
+  static MapType createMap() { return empty_array(); }
   static MapType createMap(ArrayInit&& map) {
     return map.toArray();
   }
   static ArrayInit reserveMap(size_t n) {
-    ArrayInit res(n, ArrayInit::Map{});
+    ArrayInit res(n, ArrayInit::Map{}, CheckAllocation{});
     return res;
   }
   static MapType getStaticEmptyMap() {
@@ -82,8 +87,8 @@ struct VariantController {
     return type(k);
   }
   static int64_t mapKeyAsInt64(const Variant& k) { return k.toInt64(); }
-  static const String& mapKeyAsString(const Variant& k) {
-    return k.toCStrRef();
+  static String mapKeyAsString(const Variant& k) {
+    return k.toString();
   }
   template <typename Key>
   static void mapSet(MapType& map, Key&& k, VariantType&& v) {
@@ -91,7 +96,7 @@ struct VariantController {
   }
   template <typename Key>
   static void mapSet(ArrayInit& map, Key&& k, VariantType&& v) {
-    map.set(std::move(k), std::move(v), /* key converted */ true);
+    map.set(std::move(k), std::move(v));
   }
   static int64_t mapSize(const MapType& map) { return map.size(); }
   static ArrayIter mapIterator(const MapType& map) {
@@ -105,7 +110,7 @@ struct VariantController {
   static const VariantType& mapValue(ArrayIter& it) { return it.secondRef(); }
 
   // vector methods
-  static VectorType createVector() { return Array::Create(); }
+  static VectorType createVector() { return empty_array(); }
   static void vectorAppend(VectorType& vec, const VariantType& v) {
     vec.append(v);
   }
@@ -131,7 +136,7 @@ struct VariantController {
     return ret;
   }
   static StringType getStaticEmptyString() {
-    return empty_string;
+    return empty_string();
   }
   static char* getMutablePtr(StringType& s) {
     return s.bufferSlice().ptr;

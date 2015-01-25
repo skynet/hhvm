@@ -24,17 +24,17 @@
 #include "hphp/runtime/vm/jit/print.h"
 #include "hphp/runtime/vm/jit/timer.h"
 
-namespace HPHP {
-namespace JIT {
+namespace HPHP { namespace jit {
 
-// insert inst after the point dst is defined
-static void insertAfter(IRInstruction* definer, IRInstruction* inst) {
+//////////////////////////////////////////////////////////////////////
+
+namespace {
+
+// insert inst after definer
+void insertAfter(IRInstruction* definer, IRInstruction* inst) {
   assert(!definer->isBlockEnd());
   Block* block = definer->block();
   auto pos = block->iteratorTo(definer);
-  if (pos->op() == DefLabel) {
-    ++pos;
-  }
   block->insert(++pos, inst);
 }
 
@@ -43,81 +43,87 @@ static void insertAfter(IRInstruction* definer, IRInstruction* inst) {
  * a refcounted value.  The value must be something we can safely dereference
  * to check the _count field.
  */
-static void insertRefCountAsserts(IRInstruction& inst, IRUnit& unit) {
+void insertRefCountAsserts(IRInstruction& inst, IRUnit& unit) {
   for (SSATmp& dst : inst.dsts()) {
-    Type t = dst.type();
+    auto const t = dst.type();
     if (t <= (Type::Counted | Type::StaticStr | Type::StaticArr)) {
       insertAfter(&inst, unit.gen(DbgAssertRefCount, inst.marker(), &dst));
     }
   }
 }
 
-/*
- * Insert a DbgAssertTv instruction for each stack location stored to by
- * a SpillStack instruction.
- */
-static void insertSpillStackAsserts(IRInstruction& inst, IRUnit& unit) {
-  SSATmp* sp = inst.dst();
-  auto const vals = inst.srcs().subpiece(2);
-  auto* block = inst.block();
-  auto pos = block->iteratorTo(&inst); ++pos;
-  for (unsigned i = 0, n = vals.size(); i < n; ++i) {
-    Type t = vals[i]->type();
-    if (t <= Type::Gen) {
-      IRInstruction* addr = unit.gen(LdStackAddr,
-                                     inst.marker(),
-                                     Type::PtrToGen,
-                                     StackOffset(i),
-                                     sp);
-      block->insert(pos, addr);
-      IRInstruction* check = unit.gen(DbgAssertPtr, inst.marker(), addr->dst());
-      block->insert(pos, check);
-    }
-  }
+void insertStStkAssert(IRInstruction& inst, IRUnit& unit) {
+  if (!(inst.src(1)->type() <= Type::Gen)) return;
+  auto const addr = unit.gen(
+    LdStkAddr,
+    inst.marker(),
+    Type::PtrToStkGen,
+    StackOffset { inst.extra<StStk>()->offset },
+    inst.src(0)
+  );
+  auto const block = inst.block();
+  auto pos = block->iteratorTo(&inst);
+  ++pos;
+  block->insert(pos, addr);
+  auto const check = unit.gen(DbgAssertPtr, inst.marker(), addr->dst());
+  block->insert(pos, check);
 }
 
-/*
- * Insert asserts at various points in the IR.
- * TODO: t2137231 Insert DbgAssertPtr at points that use or produces a GenPtr
- */
-static void insertAsserts(IRUnit& unit) {
-  postorderWalk(unit, [&](Block* block) {
-      for (auto it = block->begin(), end = block->end(); it != end; ) {
-        IRInstruction& inst = *it;
-        ++it;
-        if (inst.op() == SpillStack) {
-          insertSpillStackAsserts(inst, unit);
-          continue;
-        }
-        if (inst.op() == Call) {
-          SSATmp* sp = inst.dst();
-          IRInstruction* addr = unit.gen(LdStackAddr,
-                                         inst.marker(),
-                                         Type::PtrToGen,
-                                         StackOffset(0),
-                                         sp);
-          insertAfter(&inst, addr);
-          insertAfter(addr, unit.gen(DbgAssertPtr, inst.marker(), addr->dst()));
-          continue;
-        }
-        if (!inst.isBlockEnd()) insertRefCountAsserts(inst, unit);
-      }
-    });
+void insertCallAssert(IRInstruction& inst, IRUnit& unit) {
+  auto const sp = inst.dst();
+  auto const addr = unit.gen(
+    LdStkAddr,
+    inst.marker(),
+    Type::PtrToStkGen,
+    StackOffset { 0 },
+    sp
+  );
+  insertAfter(&inst, addr);
+  auto const check = unit.gen(DbgAssertPtr, inst.marker(), addr->dst());
+  insertAfter(addr, check);
 }
+
+void insertAsserts(IRUnit& unit) {
+  postorderWalk(unit, [&](Block* block) {
+    for (auto it = block->begin(); it != block->end();) {
+      auto& inst = *it;
+      ++it;
+      if (inst.op() == StStk) {
+        insertStStkAssert(inst, unit);
+        continue;
+      }
+      if (inst.op() == Call) {
+        insertCallAssert(inst, unit);
+        continue;
+      }
+      if (!inst.isBlockEnd()) {
+        insertRefCountAsserts(inst, unit);
+      }
+    }
+  });
+}
+
+}
+
+//////////////////////////////////////////////////////////////////////
 
 void optimize(IRUnit& unit, IRBuilder& irBuilder, TransKind kind) {
   Timer _t(Timer::optimize);
 
   auto finishPass = [&](const char* msg) {
-    dumpTrace(6, unit, folly::format("after {}", msg).str().c_str());
+    if (msg) {
+      printUnit(6, unit, folly::format("after {}", msg).str().c_str());
+    }
     assert(checkCfg(unit));
     assert(checkTmpsSpanningCalls(unit));
     if (debug) {
-      forEachInst(rpoSortCfg(unit), assertOperandTypes);
+      forEachInst(rpoSortCfg(unit), [&](IRInstruction* inst) {
+        assert(checkOperandTypes(inst, &unit));
+      });
     }
   };
 
-  auto doPass = [&](void (*fn)(IRUnit&), const char* msg) {
+  auto doPass = [&](void (*fn)(IRUnit&), const char* msg = nullptr) {
     fn(unit);
     finishPass(msg);
   };
@@ -128,31 +134,30 @@ void optimize(IRUnit& unit, IRBuilder& irBuilder, TransKind kind) {
     finishPass(folly::format("{} DCE", which).str().c_str());
   };
 
-  if (RuntimeOption::EvalHHIRRelaxGuards) {
-    /*
-     * In TransProfile mode, we can only relax the guards in tracelet
-     * region mode.  If the region came from analyze() and we relax the
-     * guards here, then the RegionDesc's TypePreds in ProfData won't
-     * accurately reflect the generated guards.  This can result in a
-     * TransOptimze region to be formed with types that are incompatible,
-     * e.g.:
-     *    B1: TypePred: Loc0: Bool      // but this gets relaxed to Uncounted
-     *        PostCond: Loc0: Uncounted // post-conds are accurate
-     *    B2: TypePred: Loc0: Int       // this will always fail
-     */
-    const bool relax = kind != TransProfile ||
-                       RuntimeOption::EvalJitRegionSelector == "tracelet";
-    if (relax) {
-      Timer _t(Timer::optimize_relaxGuards);
-      const bool simple = kind == TransProfile &&
-                          RuntimeOption::EvalJitRegionSelector == "tracelet";
-      auto changed = relaxGuards(unit, *irBuilder.guards(), simple);
-      if (changed) finishPass("guard relaxation");
+  auto const doReoptimize = RuntimeOption::EvalHHIRExtraOptPass &&
+    (RuntimeOption::EvalHHIRCse || RuntimeOption::EvalHHIRSimplification);
+
+  auto const hasLoop = RuntimeOption::EvalJitLoops && cfgHasLoop(unit);
+
+  // TODO(#5792564): Guard relaxation doesn't work with loops.
+  if (shouldHHIRRelaxGuards() && !hasLoop) {
+    Timer _t(Timer::optimize_relaxGuards);
+    const bool simple = kind == TransKind::Profile &&
+                        (RuntimeOption::EvalJitRegionSelector == "tracelet" ||
+                         RuntimeOption::EvalJitRegionSelector == "method");
+    RelaxGuardsFlags flags = (RelaxGuardsFlags)
+      (RelaxReflow | (simple ? RelaxSimple : RelaxNormal));
+    auto changed = relaxGuards(unit, *irBuilder.guards(), flags);
+    if (changed) finishPass("guard relaxation");
+
+    if (doReoptimize) {
+      irBuilder.reoptimize();
+      finishPass("guard relaxation reoptimize");
     }
   }
 
   if (RuntimeOption::EvalHHIRRefcountOpts) {
-    optimizeRefcounts(unit, FrameState{unit, unit.entry()->front().marker()});
+    optimizeRefcounts(unit, FrameStateMgr{unit.entry()->front().marker()});
     finishPass("refcount opts");
   }
 
@@ -162,20 +167,34 @@ void optimize(IRUnit& unit, IRBuilder& irBuilder, TransKind kind) {
     doPass(optimizePredictions, "prediction opts");
   }
 
-  if (RuntimeOption::EvalHHIRExtraOptPass
-      && (RuntimeOption::EvalHHIRCse
-          || RuntimeOption::EvalHHIRSimplification)) {
+  if (doReoptimize) {
     irBuilder.reoptimize();
     finishPass("reoptimize");
-    // Cleanup any dead code left around by CSE/Simplification
-    // Ideally, this would be controlled by a flag returned
-    // by optimzeTrace indicating whether DCE is necessary
     dce("reoptimize");
   }
 
-  if (RuntimeOption::EvalHHIRJumpOpts) {
-    doPass(optimizeJumps, "jumpopts");
-    dce("jump opts");
+  if (RuntimeOption::EvalHHIRGlobalValueNumbering) {
+    doPass(gvn);
+    dce("gvn");
+  }
+
+  if (kind != TransKind::Profile && RuntimeOption::EvalHHIRMemoryOpts) {
+    doPass(optimizeLoads);
+    dce("loadelim");
+  }
+
+  /*
+   * Note: doing this pass this late might not be ideal, in particular because
+   * we've already turned some StLoc instructions into StLocNT.
+   *
+   * But right now there are assumptions preventing us from doing it before
+   * refcount opts.  (Refcount opts needs to see all the StLocs explicitly
+   * because it makes assumptions about whether references are consumed based
+   * on that.)
+   */
+  if (kind != TransKind::Profile && RuntimeOption::EvalHHIRMemoryOpts) {
+    doPass(optimizeStores);
+    dce("storeelim");
   }
 
   if (RuntimeOption::EvalHHIRGenerateAsserts) {

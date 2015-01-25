@@ -16,7 +16,7 @@
 */
 #include "hphp/runtime/ext/icu/ext_icu_locale.h"
 #include "hphp/runtime/ext/icu/icu.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 
 #include <unicode/ures.h>
 #include <unicode/uloc.h>
@@ -76,7 +76,7 @@ static int getGrandfatheredOffset(const String& locale) {
 
 static String getGrandfatheredPreferred(int ofs) {
   if ((ofs < 0) || (ofs >= g_grandfathered.size())) {
-    return null_string;
+    return String();
   }
   if (ofs < g_grandfathered_preferred.size()) {
     return g_grandfathered_preferred[ofs];
@@ -158,9 +158,9 @@ static Variant get_icu_value(const String &locale, LocaleTag tag,
       }
       int pos = singleton_pos(locale);
       if (pos == 0) {
-        return null_string;
+        return init_null();
       } else if (pos > 0) {
-        locale_name = f_substr(locale, 0, pos - 1);
+        locale_name = HHVM_FN(substr)(locale, 0, pos - 1);
       }
     }
   }
@@ -181,7 +181,7 @@ static Variant get_icu_value(const String &locale, LocaleTag tag,
   do {
     UErrorCode error = U_ZERO_ERROR;
     int32_t len = ulocfunc(locale_name.c_str(),
-                           buf.get()->mutableData(), buf.get()->capacity(),
+                           buf.get()->mutableData(), buf.capacity() + 1,
                            &error);
     if (error != U_BUFFER_OVERFLOW_ERROR &&
         error != U_STRING_NOT_TERMINATED_WARNING) {
@@ -192,7 +192,7 @@ static Variant get_icu_value(const String &locale, LocaleTag tag,
       buf.setSize(len);
       return buf;
     }
-    if (len <= buf.get()->capacity()) {
+    if (len <= buf.capacity() + 1) {
       // Avoid infinite loop
       s_intl_error->setError(U_INTERNAL_PROGRAM_ERROR,
                              "Got invalid response from ICU");
@@ -205,8 +205,8 @@ static Variant get_icu_value(const String &locale, LocaleTag tag,
   return false;
 }
 
-static Variant get_icu_display_value(const String &locale,
-                                     const String &disp_locale,
+static Variant get_icu_display_value(const String& locale,
+                                     const String& disp_locale,
                                      LocaleTag tag) {
   String locname(locale);
   if (tag != LOC_DISPLAY) {
@@ -219,6 +219,10 @@ static Variant get_icu_display_value(const String &locale,
       }
     }
   }
+
+  // Hack around buffer overflow in libicu. ures_getByKeyWithFallback is a
+  // silly function.
+  if (locname.size() >= 255 || disp_locale.size() >= 255) return false;
 
   int32_t (*ulocfunc)(const char *loc, const char *dloc,
                       UChar *dest, int32_t destcap, UErrorCode *err);
@@ -413,7 +417,7 @@ static Array HHVM_STATIC_METHOD(Locale, getAllVariants, const String& locale) {
   Variant val = get_icu_value(localeOrDefault(locale), LOC_VARIANT);
   String strval = val.toString();
   if (strval.empty()) {
-    return null_array;
+    return Array();
   }
   Array ret = Array::Create();
   const char *s = strval.c_str(), *e = s + strval.size(), *p;
@@ -474,7 +478,7 @@ static Array HHVM_STATIC_METHOD(Locale, getKeywords, const String& locale) {
   UErrorCode error = U_ZERO_ERROR;
   String locname = localeOrDefault(locale);
   UEnumeration *e = uloc_openKeywords(locname.c_str(), &error);
-  if (!e) return null_array;
+  if (!e) return Array();
 
   Array ret = Array::Create();
   const char *key;
@@ -486,7 +490,7 @@ static Array HHVM_STATIC_METHOD(Locale, getKeywords, const String& locale) {
 tryagain:
     error = U_ZERO_ERROR;
     int val_len = uloc_getKeywordValue(locname.c_str(), key,
-                                       ptr, val.get()->capacity(), &error);
+                                       ptr, val.capacity() + 1, &error);
     if (error == U_BUFFER_OVERFLOW_ERROR) {
       val = String(val_len + 128, ReserveString);
       ptr = val.get()->mutableData();
@@ -496,7 +500,7 @@ tryagain:
       s_intl_error->setError(error, "locale_get_keywords: Error encountered "
                                     "while getting the keyword  value for the "
                                     " keyword");
-      return null_array;
+      return Array();
     }
     ret.set(String(key, key_len, CopyString), String(ptr, val_len, CopyString));
   }
@@ -520,13 +524,13 @@ static String locale_suffix_strip(const String& locale) {
   for (int i = locale.size(); i >= 0; --i) {
     if (isIDSeparator(locale[i])) {
       if ((i>=2) && isIDSeparator(locale[i-2])) {
-        return f_substr(locale, 0, i - 2);
+        return HHVM_FN(substr)(locale, 0, i - 2);
       } else {
-        return f_substr(locale, 0, i);
+        return HHVM_FN(substr)(locale, 0, i);
       }
     }
   }
-  return null_string;
+  return String();
 }
 
 inline void normalize_for_match(String& v) {
@@ -589,23 +593,23 @@ static String HHVM_STATIC_METHOD(Locale, lookup, const Array& langtag,
 }
 
 static Variant get_private_subtags(const String& locname) {
-  if (locname.empty()) return uninit_null();
+  if (locname.empty()) return init_null();
   String locale(locname);
   int pos;
   while ((pos = singleton_pos(locale)) >= 0) {
     if ((locale[pos] == 'x') || (locale[pos] == 'X')) {
       if ((pos + 2) == locale.size()) {
         /* loc_name ends with '-x-' */
-        return uninit_null();
+        return init_null();
       }
-      return f_substr(locale, pos);
+      return HHVM_FN(substr)(locale, pos);
     }
     if ((pos + 1) >= locale.size()) {
-      return uninit_null();
+      return init_null();
     }
-    locale = f_substr(locale, pos + 1);
+    locale = HHVM_FN(substr)(locale, pos + 1);
   }
-  return uninit_null();
+  return init_null();
 }
 
 static void add_array_entry(Array& ret,

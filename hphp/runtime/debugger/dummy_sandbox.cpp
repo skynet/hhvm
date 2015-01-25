@@ -19,12 +19,12 @@
 #include <boost/noncopyable.hpp>
 
 #include "hphp/runtime/debugger/debugger.h"
+#include "hphp/runtime/debugger/debugger_hook_handler.h"
 #include "hphp/runtime/debugger/cmd/cmd_signal.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/server/source-root-info.h"
 #include "hphp/runtime/base/externals.h"
-#include "hphp/runtime/base/hphp-system.h"
 #include "hphp/runtime/base/php-globals.h"
 
 #include "hphp/util/logger.h"
@@ -66,8 +66,7 @@ struct CLISession : private boost::noncopyable {
   ~CLISession() {
     TRACE(2, "CLISession::~CLISession\n");
     Debugger::UnregisterSandbox(g_context->getSandboxId());
-    ThreadInfo::s_threadInfo.getNoCheck()->
-      m_reqInjectionData.setDebugger(false);
+    DebugHookHandler::detach();
     execute_command_line_end(0, false, nullptr);
   }
 };
@@ -94,10 +93,10 @@ void DummySandbox::run() {
           msg = "Invalid sandbox was specified. "
             "PHP files may not be loaded properly.\n";
         } else {
-          auto server = php_global_exchange(s__SERVER, Variant());
+          auto server = php_global_exchange(s__SERVER, init_null());
           forceToArray(server);
           Array arr = server.toArrRef();
-          server = Variant();
+          server.unset();
           php_global_set(s__SERVER, sri.setServerVariables(std::move(arr)));
         }
         Debugger::RegisterSandbox(sandbox);
@@ -125,7 +124,7 @@ void DummySandbox::run() {
         g_context->setSandboxId(m_proxy->getDummyInfo().id());
       }
 
-      ti->m_reqInjectionData.setDebugger(true);
+      DebugHookHandler::attach<DebuggerHookHandler>(ti);
       {
         DebuggerDummyEnv dde;
         // This is really the entire point of having the dummy sandbox. This

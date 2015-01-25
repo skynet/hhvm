@@ -17,7 +17,7 @@
 #include "hphp/runtime/vm/jit/timer.h"
 #include <map>
 
-#include "folly/Format.h"
+#include <folly/Format.h>
 
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/util/timer.h"
@@ -26,7 +26,7 @@
 
 TRACE_SET_MOD(jittime);
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 static __thread Timer::Counter s_counters[Timer::kNumTimers];
 
@@ -37,6 +37,8 @@ static const struct { const char* str; Timer::Name name; } s_names[] = {
 };
 
 static int64_t getCPUTimeNanos() {
+  if (!RuntimeOption::EvalJitTimer) return -1;
+
 #ifdef CLOCK_THREAD_CPUTIME_ID
   auto const ns = Vdso::ClockGetTimeNS(CLOCK_THREAD_CPUTIME_ID);
   if (ns != -1) return ns;
@@ -58,11 +60,13 @@ Timer::Timer(Name name)
 }
 
 Timer::~Timer() {
-  if (m_finished) return;
+  if (!RuntimeOption::EvalJitTimer || m_finished) return;
   end();
 }
 
 void Timer::end() {
+  if (!RuntimeOption::EvalJitTimer) return;
+
   assert(!m_finished);
   auto const finish = getCPUTimeNanos();
   auto const elapsed = finish - m_start;
@@ -79,6 +83,10 @@ Timer::CounterVec Timer::Counters() {
     ret.emplace_back(pair.str, s_counters[pair.name]);
   }
   return ret;
+}
+
+Timer::Counter Timer::CounterValue(Timer::Name name) {
+  return s_counters[name];
 }
 
 void Timer::RequestInit() {

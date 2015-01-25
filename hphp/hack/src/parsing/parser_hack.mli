@@ -8,21 +8,20 @@
  *
  *)
 
-type comments = (Pos.t * string) list
+type parser_return = {
+    file_mode  : Ast.mode option; (* None if PHP *)
+    comments   : (Pos.t * string) list;
+    ast        : Ast.program;
+  }
 
-(*
- * Main parser entry point: parse a program out of a string.
- *
- * 'fail' indicates whether we should raise an exception if there were
- * parse errors.
- *)
-val program : ?fail:bool -> string -> Ast.program
-
-(* True if the last file parsed was in <?hh *)
-val is_hh_file : bool ref
+val program : ?elaborate_namespaces:bool -> Relative_path.t ->
+  string -> parser_return
 
 (* Parses a file *)
-val from_file : string -> Ast.program
+val from_file : Relative_path.t -> parser_return
 
-(* Same as from_file, but returns the list of comments as well as the tree *)
-val from_file_with_comments : string -> comments * Ast.program
+type saved_lb
+type assoc
+val save_lexbuf_state: Lexing.lexbuf -> saved_lb
+val restore_lexbuf_state: Lexing.lexbuf -> saved_lb -> unit
+val get_priority: Lexer_hack.token -> assoc * int

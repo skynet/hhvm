@@ -18,52 +18,14 @@
 #define incl_HPHP_VM_CODEGENHELPERS_H_
 
 #include "hphp/runtime/vm/jit/type.h"
-#include "hphp/runtime/vm/jit/phys-reg.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
-namespace HPHP { namespace JIT {
+#include "hphp/util/abi-cxx.h"
 
-struct CppCall {
-  template<class Ret, class... Args>
-  explicit CppCall(Ret (*pfun)(Args...))
-    : m_kind(Direct)
-    , m_fptr(reinterpret_cast<void*>(pfun))
-  {}
-
-  explicit CppCall(void* p)
-    : m_kind(Direct)
-    , m_fptr(p)
-  {}
-
-  explicit CppCall(int off) : m_kind(Virtual), m_offset(off) {}
-
-  explicit CppCall(PhysReg reg)
-    : m_kind(Indirect)
-    , m_reg(reg)
-  {}
-
-  CppCall(CppCall const&) = default;
-
-  bool isDirect()   const { return m_kind == Direct;  }
-  bool isVirtual()  const { return m_kind == Virtual; }
-  bool isIndirect() const { return m_kind == Indirect; }
-
-  const void*       getAddress() const { return m_fptr; }
-  int               getOffset()  const { return m_offset; }
-  PhysReg           getReg()     const { return m_reg; }
-
-  void updateCallIndirect(PhysReg reg) {
-    assert(isIndirect());
-    m_reg = reg;
-  }
-
- private:
-  enum { Direct, Virtual, Indirect } m_kind;
-  union {
-    void* m_fptr;
-    int   m_offset;
-    PhysReg m_reg;
-  };
-};
+namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
 
 /*
  * SaveFP uses rVmFp, as usual. SavePC requires the caller to have
@@ -85,6 +47,24 @@ inline RegSaveFlags operator~(const RegSaveFlags& f) {
   return RegSaveFlags(~int(f));
 }
 
+template <class T, class F>
+Vreg cond(Vout& v, ConditionCode cc, Vreg sf, Vreg dst, T t, F f) {
+  auto fblock = v.makeBlock();
+  auto tblock = v.makeBlock();
+  auto done = v.makeBlock();
+  v << jcc{cc, sf, {fblock, tblock}};
+  v = tblock;
+  auto treg = t(v);
+  v << phijmp{done, v.makeTuple(VregList{treg})};
+  v = fblock;
+  auto freg = f(v);
+  v << phijmp{done, v.makeTuple(VregList{freg})};
+  v = done;
+  v << phidef{v.makeTuple(VregList{dst})};
+  return dst;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 }}
 
 #endif

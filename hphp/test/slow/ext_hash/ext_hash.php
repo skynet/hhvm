@@ -50,7 +50,7 @@ function brown_fox() {
       hash("tiger128,3-fb", $data) == '9370512795923aaeeb76fe3d8ea7433e' &&
       hash("adler32-fb", $data) == '5e10f17b'
     );
-    var_dump(hash("adler32", $data) == '5e10f17b');
+    var_dump(hash("adler32", $data) == '7bf1105e');
     var_dump(hash("crc32b", $data) == '4246a382');
   } else {
     var_dump(true);
@@ -71,6 +71,12 @@ function test_hash_file() {
   var_dump(hash_hmac_file("md5", __DIR__.'/test_file.txt', "secret"));
 }
 
+function test_hash_hmac() {
+  $data = "the quick brown fox jumped over the lazy dog.";
+  var_dump(hash_hmac("md5", $data, "secret"));
+  var_dump(hash_hmac("md5", $data, ""));
+}
+
 function test_furchash() {
   if (is_facebook()) {
     var_dump(furchash_hphp_ext("15minutesoffame", 15, 86) == '25');
@@ -83,3 +89,4 @@ brown_fox();
 test_hash_init();
 test_hash_file();
 test_furchash();
+test_hash_hmac();

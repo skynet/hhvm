@@ -134,10 +134,17 @@ typedef struct _zend_fcall_info_cache {
 #define ZEND_MODULE_GLOBALS_CTOR_D(module)  void ZEND_MODULE_GLOBALS_CTOR_N(module)(zend_##module##_globals *module##_globals TSRMLS_DC)
 #define ZEND_MODULE_GLOBALS_DTOR_D(module)  void ZEND_MODULE_GLOBALS_DTOR_N(module)(zend_##module##_globals *module##_globals TSRMLS_DC)
 
+#ifdef HHVM
+#define ZEND_GET_MODULE(module_name) \
+  extern "C" HPHP::Extension * getModule() { \
+    return &module_name##_module_entry.name; \
+  }
+#else
 #define ZEND_GET_MODULE(name) \
     BEGIN_EXTERN_C()\
   ZEND_DLEXPORT zend_module_entry *get_module(void) { return &name##_module_entry; }\
     END_EXTERN_C()
+#endif
 
 #define ZEND_BEGIN_MODULE_GLOBALS(module_name)    \
   typedef struct _zend_##module_name##_globals {
@@ -473,7 +480,7 @@ ZEND_API int add_property_zval_ex(zval *arg, const char *key, uint key_len, zval
 #define add_property_double(__arg, __key, __d) add_property_double_ex(__arg, __key, strlen(__key)+1, __d TSRMLS_CC)
 #define add_property_string(__arg, __key, __str, __duplicate) add_property_string_ex(__arg, __key, strlen(__key)+1, __str, __duplicate TSRMLS_CC)
 #define add_property_stringl(__arg, __key, __str, __length, __duplicate) add_property_stringl_ex(__arg, __key, strlen(__key)+1, __str, __length, __duplicate TSRMLS_CC)
-#define add_property_zval(__arg, __key, __value) add_property_zval_ex(__arg, __key, strlen(__key)+1, __value TSRMLS_CC)       
+#define add_property_zval(__arg, __key, __value) add_property_zval_ex(__arg, __key, strlen(__key)+1, __value TSRMLS_CC)
 
 
 ZEND_API int call_user_function(HashTable *function_table, zval **object_pp, zval *function_name, zval *retval_ptr, zend_uint param_count, zval *params[] TSRMLS_DC);
@@ -484,7 +491,7 @@ ZEND_API extern const zend_fcall_info_cache empty_fcall_info_cache;
 
 /** Build zend_call_info/cache from a zval*
  *
- * Caller is responsible to provide a return value, otherwise the we will crash. 
+ * Caller is responsible to provide a return value, otherwise the we will crash.
  * fci->retval_ptr_ptr = NULL;
  * In order to pass parameters the following members need to be set:
  * fci->param_count = 0;
@@ -779,7 +786,7 @@ END_EXTERN_C()
 }
 
 #ifdef HHVM
-#define HASH_OF(p) (Z_TYPE_P(p)==IS_ARRAY ? Z_ARRVAL_P(p) : ((Z_TYPE_P(p)==IS_OBJECT ? Z_OBJPROP_P(p) : NULL)))
+#define HASH_OF(p) (Z_TYPE_P(p)==IS_ARRAY ? Z_ARRVAL_P(p) : ((Z_TYPE_P(p)==IS_OBJECT ? Z_OBJPROP_P(p) : nullptr)))
 #else
 #define HASH_OF(p) (Z_TYPE_P(p)==IS_ARRAY ? Z_ARRVAL_P(p) : ((Z_TYPE_P(p)==IS_OBJECT ? Z_OBJ_HT_P(p)->get_properties((p) TSRMLS_CC) : NULL)))
 #endif

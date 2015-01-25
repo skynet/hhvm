@@ -20,9 +20,10 @@
 #include <atomic>
 #include <tbb/concurrent_hash_map.h>
 
-#include "folly/ScopeGuard.h"
-#include "folly/MapUtil.h"
+#include <folly/ScopeGuard.h>
+#include <folly/MapUtil.h>
 
+#include "hphp/util/lock.h"
 #include "hphp/util/trace.h"
 #include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/vm/class.h"
@@ -36,9 +37,9 @@ namespace HPHP { namespace InstanceBits {
 namespace {
 
 typedef tbb::concurrent_hash_map<
-  const StringData*, uint64_t, pointer_hash<StringData>> InstanceCounts;
+  const StringData*, uint64_t, StringDataHashICompare> InstanceCounts;
 typedef hphp_hash_map<const StringData*, unsigned,
-                      pointer_hash<StringData>> InstanceBitsMap;
+                      string_data_hash, string_data_isame> InstanceBitsMap;
 
 InstanceCounts s_instanceCounts;
 ReadWriteMutex s_instanceCountsLock(RankInstanceCounts);
@@ -77,7 +78,7 @@ void profile(const StringData* name) {
 }
 
 void init() {
-  assert(JIT::Translator::WriteLease().amOwner());
+  assert(jit::Translator::WriteLease().amOwner());
   if (initFlag.load(std::memory_order_acquire)) return;
 
   s_currentlyInitializing = true;
@@ -111,14 +112,13 @@ void init() {
   uint64_t accum = 0;
   for (auto& item : counts) {
     if (i >= kNumInstanceBits) break;
-    if (Class* cls = Unit::lookupUniqueClass(item.first)) {
-      if (!(cls->attrs() & AttrUnique)) {
-        continue;
+    if (Class* cls = Unit::lookupClassOrUniqueClass(item.first)) {
+      if (cls->attrs() & AttrUnique) {
+        s_instanceBitsMap[item.first] = i;
+        accum += item.second;
+        ++i;
       }
     }
-    s_instanceBitsMap[item.first] = i;
-    accum += item.second;
-    ++i;
   }
 
   // Print out stats about what we ended up using

@@ -16,6 +16,7 @@
 */
 
 #include "hphp/runtime/ext/imagick/ext_imagick.h"
+#include "hphp/runtime/base/array-init.h"
 
 #include <utility>
 
@@ -28,13 +29,13 @@ using PixelSetFunction = void (*)(PixelWand*, const double);
 
 Object createImagickPixel(PixelWand* wand, bool owner) {
   Object ret = ImagickPixel::allocObject();
-  setWandResource(s_ImagickPixel, ret, wand, owner);
+  setWandResource(s_ImagickPixel, ret.get(), wand, owner);
   return ret;
 }
 
 Array createImagickPixelArray(size_t num, PixelWand* wands[], bool owner) {
   if (wands == nullptr) {
-    return null_array;
+    return Array();
   } else {
     PackedArrayInit ret(num);
     for (int i = 0; i < num; ++i) {
@@ -45,44 +46,44 @@ Array createImagickPixelArray(size_t num, PixelWand* wands[], bool owner) {
 }
 
 ALWAYS_INLINE
-WandResource<PixelWand> getPixelWand(const Variant& obj) {
+SmartPtr<WandResource<PixelWand>> getPixelWand(const Variant& obj) {
   if (!obj.isObject()) {
     IMAGICKPIXEL_THROW("Invalid color parameter provided");
-  } else if (!obj.getObjectData()->o_instanceof(s_ImagickPixel)) {
+  } else if (!obj.getObjectData()->instanceof(s_ImagickPixel)) {
     IMAGICKPIXEL_THROW(
       "The parameter must be an instance of ImagickPixel or a string");
   } else {
-    auto wand = getPixelWandResource(obj.toCObjRef());
-    return WandResource<PixelWand>(wand->getWand(), false);
+    auto wand = getPixelWandResource(obj.toCObjRef().get());
+    return makeSmartPtr<WandResource<PixelWand>>(wand->getWand(), false);
   }
 }
 
-WandResource<PixelWand> newPixelWand() {
-  WandResource<PixelWand> ret(NewPixelWand(), true);
-  if (ret.getWand() == nullptr) {
+SmartPtr<WandResource<PixelWand>> newPixelWand() {
+  auto ret = makeSmartPtr<WandResource<PixelWand>>(NewPixelWand());
+  if (ret->getWand() == nullptr) {
     IMAGICKPIXEL_THROW("Failed to allocate PixelWand structure");
   }
   return ret;
 }
 
-WandResource<PixelWand> buildColorWand(const Variant& color) {
+SmartPtr<WandResource<PixelWand>> buildColorWand(const Variant& color) {
   if (!color.isString()) {
     return getPixelWand(color);
   }
   auto ret = newPixelWand();
-  auto status = PixelSetColor(ret.getWand(), color.toCStrRef().c_str());
+  auto status = PixelSetColor(ret->getWand(), color.toCStrRef().c_str());
   if (status == MagickFalse) {
     IMAGICKPIXEL_THROW("Unrecognized color string");
   }
   return ret;
 }
 
-WandResource<PixelWand> buildOpacityWand(const Variant& opacity) {
+SmartPtr<WandResource<PixelWand>> buildOpacityWand(const Variant& opacity) {
   if (!opacity.isInteger() && !opacity.isDouble()) {
     return getPixelWand(opacity);
   }
   auto ret = newPixelWand();
-  PixelSetOpacity(ret.getWand(), opacity.toDouble());
+  PixelSetOpacity(ret->getWand(), opacity.toDouble());
   return ret;
 }
 
@@ -176,14 +177,14 @@ static Array HHVM_METHOD(ImagickPixel, getHSL) {
     s_luminosity, luminosity);
 }
 
-static bool isSimilar(const Object& this_, const Variant& color,
+static bool isSimilar(ObjectData* this_, const Variant& color,
                       double fuzz, bool useQuantum) {
   auto wand = getPixelWandResource(this_);
-  WandResource<PixelWand> pixel(buildColorWand(color));
+  auto pixel = buildColorWand(color);
   if (useQuantum) {
     fuzz *= QuantumRange;
   }
-  return IsPixelWandSimilar(wand->getWand(), pixel.getWand(), fuzz)
+  return IsPixelWandSimilar(wand->getWand(), pixel->getWand(), fuzz)
     != MagickFalse;
 }
 

@@ -16,7 +16,7 @@
 
 #include "hphp/runtime/vm/verifier/check.h"
 
-#include "hphp/runtime/base/mixed-array.h"
+#include "hphp/runtime/base/struct-array.h"
 
 #include "hphp/runtime/vm/verifier/cfg.h"
 #include "hphp/runtime/vm/verifier/util.h"
@@ -200,7 +200,7 @@ bool FuncChecker::checkOffsets() {
   for (Range<FixedVector<Func::ParamInfo> > p(m_func->params()); !p.empty(); ) {
     const Func::ParamInfo& param = p.popFront();
     if (param.hasDefaultValue()) {
-      ok &= checkOffset("dv-entry", param.funcletOff(), "func body", base,
+      ok &= checkOffset("dv-entry", param.funcletOff, "func body", base,
                         funclets);
     }
   }
@@ -383,7 +383,7 @@ bool FuncChecker::checkLocal(PC pc, int k) {
 }
 
 bool FuncChecker::checkString(PC pc, Id id) {
-  return unit()->checkStringId(id);
+  return unit()->isLitstrId(id);
 }
 
 /**
@@ -452,18 +452,22 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
       PC iva_pc = pc;
       int32_t k = decodeVariableSizeImm(&iva_pc);
       switch (*instr) {
-      case OpStaticLoc:
-      case OpStaticLocInit:
-        ok &= checkLocal(pc, k);
-        break;
-      case OpVerifyParamType:
-        if (k >= numParams()) {
-          error("invalid parameter id %d at %d\n",
-                 k, offset((PC)instr));
-          ok = false;
-        }
-      default:
-        break;
+        case Op::ConcatN:
+          ok &= (k >= 2 && k <= kMaxConcatN);
+          break;
+        case Op::StaticLoc:
+        case Op::StaticLocInit:
+          ok &= checkLocal(pc, k);
+          break;
+        case Op::VerifyParamType:
+          if (k >= numParams()) {
+            error("invalid parameter id %d at %d\n",
+                   k, offset((PC)instr));
+            ok = false;
+          }
+          break;
+        default:
+          break;
       }
       break;
     }
@@ -490,7 +494,7 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
     }
     case VSA: { // vector of litstr ids
       auto len = *(uint32_t*)pc;
-      if (len < 1 || len > MixedArray::MaxMakeSize) {
+      if (len < 1 || len > StructArray::MaxMakeSize) {
         error("invalid length of immedate VSA vector %d at offset %d\n",
               len, offset(pc));
         return false;
@@ -521,21 +525,6 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
       int op = int(*pc);
       switch (*instr) {
       default: assert(false && "Unexpected opcode with immType OA");
-      case Op::AssertTL: case Op::AssertTStk:
-      case Op::PredictTL: case Op::PredictTStk:
-#define ASSERTT_OP(x)  if (op == static_cast<uint8_t>(AssertTOp::x)) break;
-        ASSERTT_OPS
-#undef ASSERTT_OP
-        error("invalid operation for AssertT*: %d\n", op);
-        ok = false;
-        break;
-      case Op::AssertObjL: case Op::AssertObjStk:
-#define ASSERTOBJ_OP(x) if (op == static_cast<uint8_t>(AssertObjOp::x)) break;
-        ASSERTOBJ_OPS
-#undef ASSERTOBJ_OP
-        error("invalid operator for AssertObj*: %d\n", op);
-        ok = false;
-        break;
       case Op::IsTypeC: case Op::IsTypeL:
 #define ISTYPE_OP(x)  if (op == static_cast<uint8_t>(IsTypeOp::x)) break;
         ISTYPE_OPS
@@ -580,9 +569,34 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
         error("invalid error kind for Fatal: %d\n", op);
         ok = false;
         break;
+      case OpSilence:
+#define SILENCE_OP(x) if (op == static_cast<uint8_t>(SilenceOp::x)) break;
+        SILENCE_OPS
+#undef SILENCE_OP
+        error("invalid operation for Silence: %d\n", op);
+        ok = false;
+        break;
+      case OpOODeclExists:
+#define OO_DECL_EXISTS_OP(x) if (op == static_cast<uint8_t>(OODeclExistsOp::x)) break;
+        OO_DECL_EXISTS_OPS
+#undef OO_DECL_EXISTS_OP
+          error("invalid operation for OODeclExists: %d\n", op);
+        ok = false;
+        break;
+      case OpFPushObjMethodD:
+      case OpFPushObjMethod:
+#define OBJMETHOD_OP(x) if (op == static_cast<uint8_t>(ObjMethodOp::x)) break;
+        OBJMETHOD_OPS
+#undef OBJMETHOD_OP
+          error("invalid operation for FPushObjMethod*: %d\n", op);
+        ok = false;
+        break;
       }
+    }
+    case RATA:
+      // Nothing to check at the moment.
       break;
-    }}
+    }
   }
   return ok;
 }
@@ -694,9 +708,10 @@ const FlavorDesc* FuncChecker::sig(PC pc) {
     return vectorSig(pc, NOV);
   case Op::SetWithRefRM://ONE(MA),   R_MMANY, NOV
     return vectorSig(pc, RV);
-  case Op::FCall:     // ONE(IVA),     FMANY,   ONE(RV)
-  case Op::FCallD:    // THREE(IVA,SA,SA), FMANY,   ONE(RV)
-  case Op::FCallArray:// NA,           ONE(FV), ONE(RV)
+  case Op::FCall:       // ONE(IVA),     FMANY,   ONE(RV)
+  case Op::FCallD:      // THREE(IVA,SA,SA), FMANY,   ONE(RV)
+  case Op::FCallUnpack: // ONE(IVA), FMANY, ONE(RV)
+  case Op::FCallArray:  // NA,           ONE(FV), ONE(RV)
     for (int i = 0, n = instrNumPops((Op*)pc); i < n; ++i) {
       m_tmp_sig[i] = FV;
     }
@@ -713,6 +728,7 @@ const FlavorDesc* FuncChecker::sig(PC pc) {
     return m_tmp_sig;
   case Op::NewPackedArray:  // ONE(IVA),     CMANY,   ONE(CV)
   case Op::NewStructArray:  // ONE(VSA),     SMANY,   ONE(CV)
+  case Op::ConcatN:         // ONE(IVA),     CMANY,   ONE(CV)
     for (int i = 0, n = instrNumPops((Op*)pc); i < n; ++i) {
       m_tmp_sig[i] = CV;
     }
@@ -755,8 +771,7 @@ bool FuncChecker::checkFpi(State* cur, PC pc, Block* b) {
   if (isFCallStar(*reinterpret_cast<const Op*>(pc))) {
     --cur->fpilen;
     auto const op = static_cast<Op>(*pc);
-    int call_params = op == Op::FCall || op == Op::FCallD
-      ? getImmIva(pc) : 1;
+    int call_params = op == Op::FCallArray ? 1 : getImmIva(pc);
     int push_params = getImmIva(at(fpi.fpush));
     if (call_params != push_params) {
       error("FCall* param_count (%d) doesn't match FPush* (%d)\n",

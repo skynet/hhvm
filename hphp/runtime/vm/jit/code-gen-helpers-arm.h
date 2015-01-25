@@ -19,14 +19,20 @@
 #include "hphp/vixl/a64/macro-assembler-a64.h"
 
 #include "hphp/runtime/base/types.h"
+#include "hphp/runtime/vm/jit/types.h"
 #include "hphp/runtime/vm/jit/abi-arm.h"
 #include "hphp/runtime/vm/jit/code-gen-helpers.h"
+#include "hphp/runtime/vm/jit/cpp-call.h"
 #include "hphp/runtime/vm/jit/fixup.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/vm/jit/translator-runtime.h"
-#include "hphp/runtime/vm/jit/types.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
-namespace HPHP { namespace JIT { namespace ARM {
+namespace HPHP { namespace jit { namespace arm {
+///////////////////////////////////////////////////////////////////////////////
 
 /*
  * Intelligently chooses between Add, Mov, and no-op.
@@ -49,7 +55,8 @@ void emitStoreRetIntoActRec(vixl::MacroAssembler& a);
  * differently depending on whether we're simulating ARM or running native.
  * Returns the address at which to record a fixup, if you need to.
  */
-JIT::TCA emitCall(vixl::MacroAssembler& a, CppCall call);
+jit::TCA emitCall(vixl::MacroAssembler& a, CppCall call);
+Vpoint emitCall(Vout&, CppCall call, RegSet args);
 
 /*
  * Swaps two registers. Uses XOR swap, so will not touch memory, flags, or any
@@ -68,9 +75,10 @@ void emitRegRegMove(vixl::MacroAssembler& a,
 /*
  * Check the surprise flags. If surprised, call functionEnterHelper.
  */
-void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& stubsCode,
-                                 bool inTracelet, JIT::FixupMap& fixupMap,
-                                 JIT::Fixup fixup);
+void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
+                                 PhysReg rds, jit::Fixup fixup);
+void emitCheckSurpriseFlagsEnter(Vout& v, Vout& vcold, Vreg rds,
+                                 jit::Fixup fixup);
 
 /*
  * Increments the current (at translation time) translation counter.
@@ -81,7 +89,8 @@ void emitTransCounterInc(vixl::MacroAssembler& a);
  * Immediately saves the VM sp, fp and pc (the latter two contingent on the
  * flags argument) to the ExecutionContext.
  */
-void emitEagerVMRegSave(vixl::MacroAssembler& a, RegSaveFlags flags);
+void emitEagerVMRegSave(vixl::MacroAssembler& a, vixl::Register rds,
+                        RegSaveFlags flags);
 
 /*
  * Emits an incref after checking only the static bit, not the type.
@@ -101,30 +110,22 @@ void emitIncRefGeneric(vixl::MacroAssembler& a,
 /**
  * Emit a load of a low pointer.
  */
-template<class Mem>
-void emitLdLowPtr(vixl::MacroAssembler& a,
-                  const vixl::Register& dest,
-                  Mem mem, size_t size) {
+inline void emitLdLowPtr(Vout& v, Vreg dest, Vptr mem, size_t size) {
   if (size == 8) {
-    a.   Ldr   (dest, mem);
+    v << load{mem, dest};
   } else if (size == 4) {
-    a.   Ldr   (dest.W(), mem); // XXX will this zero-extend?
+    v << loadl{mem, dest};
   } else {
     not_implemented();
   }
 }
 
-inline
-void emitCmpClass(vixl::MacroAssembler& a,
-                  const vixl::Register& reg,
-                  const Class* c) {
+inline void emitCmpClass(Vout& v, Vreg sf, Vreg reg, const Class* c) {
   auto size = sizeof(LowClassPtr);
-  auto imm = reinterpret_cast<int64_t>(c);
-
   if (size == 8) {
-    a.   Cmp   (reg, imm);
+    v << cmpq{v.cns(c), reg, sf};
   } else if (size == 4) {
-    a.   Cmp   (reg.W(), uint32_t(imm));
+    v << cmpl{v.cns(c), reg, sf};
   } else {
     not_implemented();
   }
@@ -141,7 +142,7 @@ inline void emitTLSLoad(vixl::MacroAssembler& a,
                         const ThreadLocalNoCheck<T>& datum,
                         const vixl::Register& destReg) {
   using namespace vixl;
-  a.   Mov  (rHostCallReg, JIT::tlsBaseNoInline);
+  a.   Mov  (rHostCallReg, jit::tlsBaseNoInline);
   a.   Push (x30, x29);
   a.   HostCall(0);
   // tlsBaseNoInline doesn't need a sync point
@@ -164,6 +165,7 @@ inline void emitTLSLoad(vixl::MacroAssembler& a,
 }
 #endif // USE_GCC_FAST_TLS
 
+///////////////////////////////////////////////////////////////////////////////
 }}}
 
 #endif

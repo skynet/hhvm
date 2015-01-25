@@ -13,6 +13,7 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #ifndef incl_HPHP_TYPE_CONSTRAINT_H_
 #define incl_HPHP_TYPE_CONSTRAINT_H_
 
@@ -38,7 +39,7 @@ namespace HPHP {
  * function or method parameter typehint at runtime.
  */
 struct TypeConstraint {
-  enum Flags {
+  enum Flags : uint8_t {
     NoFlags = 0x0,
 
     /*
@@ -81,7 +82,8 @@ struct TypeConstraint {
    *
    * See underlyingDataType().
    */
-  enum class MetaType { Precise, Self, Parent, Callable, Number };
+  enum class MetaType : uint8_t { Precise, Self, Parent, Callable, Number,
+                                  ArrayKey };
 
   static const int32_t ReturnId = -1;
 
@@ -141,7 +143,13 @@ struct TypeConstraint {
    * KindOfObject: it may either be a type alias or a class, depending
    * on what typeName() means in a given request.
    */
-  DataType underlyingDataType() const { return m_type.dt; }
+  MaybeDataType underlyingDataType() const { return m_type.dt; }
+
+  /*
+   * Returns the underlying DataType for this TypeConstraint,
+   * chasing down type aliases.
+   */
+  MaybeDataType underlyingDataTypeResolved() const;
 
   /*
    * Predicates for various properties of the type constraint.
@@ -156,11 +164,13 @@ struct TypeConstraint {
   bool isCallable() const { return metaType() == MetaType::Callable; }
   bool isNumber()   const { return metaType() == MetaType::Number; }
   bool isPrecise()  const { return metaType() == MetaType::Precise; }
+  bool isArrayKey() const { return metaType() == MetaType::ArrayKey; }
 
   bool isArray()    const { return m_type.dt == KindOfArray; }
 
   bool isObjectOrTypeAlias() const {
     assert(IMPLIES(isNumber(), m_type.dt != KindOfObject));
+    assert(IMPLIES(isArrayKey(), m_type.dt != KindOfObject));
     assert(IMPLIES(isParent(), m_type.dt == KindOfObject));
     assert(IMPLIES(isSelf(), m_type.dt == KindOfObject));
     assert(IMPLIES(isCallable(), m_type.dt == KindOfObject));
@@ -192,20 +202,7 @@ struct TypeConstraint {
    * required for PHP inheritance where a method with parameter
    * typehints is overridden.
    */
-  bool compat(const TypeConstraint& other) const {
-    if (other.isExtended() || isExtended()) {
-      /*
-       * Rely on the ahead of time typechecker---checking here can
-       * make it harder to convert a base class or interface to <?hh,
-       * because derived classes that are still <?php would all need
-       * to be modified.
-       */
-      return true;
-    }
-    return (m_typeName == other.m_typeName
-            || (m_typeName != nullptr && other.m_typeName != nullptr
-                && m_typeName->isame(other.m_typeName)));
-  }
+  bool compat(const TypeConstraint& other) const;
 
   // General check for any constraint.
   bool check(TypedValue* tv, const Func* func) const;
@@ -242,9 +239,11 @@ struct TypeConstraint {
     verifyFail(func, tv, ReturnId);
   }
 
+  static MaybeDataType typeNameToMaybeDataType(const StringData* typeName);
+
 private:
   struct Type {
-    DataType dt;
+    MaybeDataType dt;
     MetaType metatype;
   };
   typedef hphp_hash_map<const StringData*, Type,
@@ -257,6 +256,7 @@ private:
   void init();
   void selfToTypeName(const Func* func, const StringData **typeName) const;
   void parentToTypeName(const Func* func, const StringData **typeName) const;
+  static const Type* typeNameToType(const StringData* typeName);
 
 private:
   // m_type represents the DataType to check on.  We don't know

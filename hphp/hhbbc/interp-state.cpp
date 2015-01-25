@@ -17,8 +17,8 @@
 
 #include <string>
 
-#include "folly/Format.h"
-#include "folly/Conv.h"
+#include <folly/Format.h>
+#include <folly/Conv.h>
 
 #include "hphp/util/match.h"
 #include "hphp/hhbbc/analyze.h"
@@ -133,6 +133,21 @@ const PropState& PropertiesInfo::privateStatics() const {
 
 //////////////////////////////////////////////////////////////////////
 
+void merge_closure_use_vars_into(ClosureUseVarMap& dst,
+                                 borrowed_ptr<php::Class> clo,
+                                 std::vector<Type> types) {
+  auto& current = dst[clo];
+  if (current.empty()) {
+    current = std::move(types);
+    return;
+  }
+
+  assert(types.size() == current.size());
+  for (auto i = uint32_t{0}; i < current.size(); ++i) {
+    current[i] = union_of(std::move(current[i]), std::move(types[i]));
+  }
+}
+
 bool widen_into(PropState& dst, const PropState& src) {
   assert(dst.size() == src.size());
 
@@ -177,6 +192,19 @@ bool merge_impl(State& dst, const State& src, JoinOp join) {
   assert(dst.iters.size() == src.iters.size());
   assert(dst.stack.size() == src.stack.size());
   assert(dst.fpiStack.size() == src.fpiStack.size());
+
+  if (src.unreachable) {
+    // If we're coming from unreachable code and the dst is already
+    // initialized, it doesn't change the dst (whether it is reachable or not).
+    return false;
+  }
+  if (dst.unreachable) {
+    // If we're going to code currently believed to be unreachable, take the
+    // src state, and consider the dest state changed only if the source state
+    // was reachable.
+    dst = src;
+    return !src.unreachable;
+  }
 
   auto changed = false;
 
@@ -260,16 +288,14 @@ std::string state_string(const php::Func& f, const State& st) {
     return ret;
   }
 
-  ret = "state:\n";
+  folly::format(&ret, "state{}:\n", st.unreachable ? " (unreachable)" : "");
   if (f.cls) {
     folly::format(&ret, "thisAvailable({})\n", st.thisAvailable);
   }
 
   for (auto i = size_t{0}; i < st.locals.size(); ++i) {
-    folly::format(&ret, "${: <8} :: {}\n",
-      f.locals[i]->name
-        ? std::string(f.locals[i]->name->data())
-        : folly::format("<unnamed{}>", i).str(),
+    folly::format(&ret, "{: <8} :: {}\n",
+      local_string(borrow(f.locals[i])),
       show(st.locals[i])
     );
   }

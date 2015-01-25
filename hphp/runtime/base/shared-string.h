@@ -18,10 +18,12 @@
 #define incl_HPHP_CPP_BASE_SHARED_SHARED_STRING_H_
 
 #include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/types.h"
 #include <tbb/concurrent_hash_map.h>
 #include <tbb/atomic.h>
 #include "hphp/util/atomic.h"
 #include "hphp/util/hash.h"
+#include "hphp/util/hash-map-typedefs.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////

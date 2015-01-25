@@ -31,11 +31,11 @@
 FILE_RCSID("@(#)$File: magic.c,v 1.78 2013/01/07 18:20:19 christos Exp $")
 #endif  /* lint */
 
-#include "magic.h"
+#include "magic.h" // @nolint
 
 #include <stdlib.h>
 #ifdef PHP_WIN32
-#include "win32/unistd.h"
+#include "win32/unistd.h" // @nolint
 #else
 #include <unistd.h>
 #endif
@@ -347,7 +347,7 @@ file_or_stream(struct magic_set *ms, const char *inname, php_stream *stream)
   unsigned char *buf;
   struct stat  sb;
   ssize_t nbytes = 0;  /* number of bytes read from a datafile */
-  int no_in_stream = 0;
+  HPHP::SmartPtr<HPHP::File> file;
 
   if (!inname && !stream) {
     return NULL;
@@ -376,9 +376,9 @@ file_or_stream(struct magic_set *ms, const char *inname, php_stream *stream)
   errno = 0;
 
   if (!stream && inname) {
-    no_in_stream = 1;
     auto wrapper = HPHP::Stream::getWrapperFromURI(inname);
-    stream = wrapper->open(inname, "rb", 0, HPHP::Variant());
+    if (wrapper) file = wrapper->open(inname, "rb", 0, HPHP::Variant());
+    stream = file.get();
   }
 
   if (!stream) {
@@ -406,10 +406,6 @@ file_or_stream(struct magic_set *ms, const char *inname, php_stream *stream)
   rv = 0;
 done:
   efree(buf);
-
-  if (no_in_stream && stream) {
-    stream->close();
-  }
 
   close_and_restore(ms, inname, 0, &sb);
   return rv == 0 ? file_getbuffer(ms) : NULL;

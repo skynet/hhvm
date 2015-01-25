@@ -23,20 +23,11 @@
 #include <functional>
 #include <string>
 
+#include <folly/Format.h>
+
 //////////////////////////////////////////////////////////////////////
 
 #define IMPLIES(a, b) (!(a) || (b))
-
-#ifndef __GXX_EXPERIMENTAL_CXX0X__
-# define static_assert(what, why) CT_ASSERT((what))
-#endif
-
-// Usage example: const_assert(hhvm);
-#define const_assert(c) do {                                                  \
-  if (!(c)) {                                                                 \
-    always_assert(false);                                                     \
-  }                                                                           \
-} while (0)
 
 #ifdef __INTEL_COMPILER
 #define not_reached()                                                \
@@ -56,13 +47,11 @@ T bad_value() {
   not_reached();
 }
 
-#define NOT_REACHED not_reached
-
 #define not_implemented() do {                   \
   fprintf(stderr, "not implemented: %s:%d %s\n", \
           __FILE__, __LINE__, __FUNCTION__);     \
-  not_reached();                                 \
-} while(0)
+  always_assert(0);                              \
+} while (0)
 
 #define assert_not_implemented(pred) do {        \
   if (! (pred) ) {                               \
@@ -78,7 +67,7 @@ namespace HPHP {
 void assert_fail(const char* exp,
                  const char* file,
                  unsigned int line,
-                 const char* func) __attribute__((noreturn));
+                 const char* func) __attribute__((__noreturn__));
 
 void assert_fail_log(const char* title, const std::string& msg);
 typedef std::function<void(const char*, const std::string&)> AssertFailLogger;

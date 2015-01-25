@@ -19,6 +19,7 @@
 #define incl_HPHP_THRIFT_TRANSPORT_H_
 
 #include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/util/logger.h"
 
 #include <sys/types.h>
@@ -93,6 +94,7 @@ class PHPTransport {
 public:
   static StaticString s_getTransport;
   static StaticString s_flush;
+  static StaticString s_onewayFlush;
   static StaticString s_write;
   static StaticString s_putBack;
   static StaticString s_read;
@@ -212,9 +214,17 @@ public:
     directFlush();
   }
 
+  void onewayFlush() {
+    writeBufferToTransport();
+    directOnewayFlush();
+  }
+
 protected:
   void directFlush() {
     t->o_invoke_few_args(s_flush, 0);
+  }
+  void directOnewayFlush() {
+    t->o_invoke_few_args(s_onewayFlush, 0);
   }
   void directWrite(const char* data, size_t len) {
     t->o_invoke_few_args(s_write, 1, String(data, len, CopyString));

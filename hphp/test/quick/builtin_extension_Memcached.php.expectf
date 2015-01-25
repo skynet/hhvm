@@ -5,7 +5,7 @@ object(Memcached)#1 (0) {
 Warning: Attempted to serialize unserializable builtin class Memcached in %s/builtin_extensions.inc on line 8
 string(2) "N;"
 NULL
-array(39) {
+array(44) {
   [0]=>
   string(11) "__construct"
   [1]=>
@@ -27,63 +27,73 @@ array(39) {
   [9]=>
   string(9) "decrement"
   [10]=>
-  string(6) "delete"
+  string(14) "decrementByKey"
   [11]=>
-  string(11) "deleteByKey"
+  string(6) "delete"
   [12]=>
-  string(5) "fetch"
+  string(11) "deleteByKey"
   [13]=>
-  string(8) "fetchAll"
+  string(5) "fetch"
   [14]=>
-  string(5) "flush"
+  string(8) "fetchAll"
   [15]=>
-  string(3) "get"
+  string(5) "flush"
   [16]=>
-  string(10) "getAllKeys"
+  string(3) "get"
   [17]=>
-  string(8) "getByKey"
+  string(10) "getAllKeys"
   [18]=>
-  string(10) "getDelayed"
+  string(8) "getByKey"
   [19]=>
-  string(15) "getDelayedByKey"
+  string(10) "getDelayed"
   [20]=>
-  string(8) "getMulti"
+  string(15) "getDelayedByKey"
   [21]=>
-  string(13) "getMultiByKey"
+  string(8) "getMulti"
   [22]=>
-  string(9) "getOption"
+  string(13) "getMultiByKey"
   [23]=>
-  string(13) "getResultCode"
+  string(9) "getOption"
   [24]=>
-  string(16) "getResultMessage"
+  string(13) "getResultCode"
   [25]=>
-  string(14) "getServerByKey"
+  string(16) "getResultMessage"
   [26]=>
-  string(13) "getServerList"
+  string(14) "getServerByKey"
   [27]=>
-  string(8) "getStats"
+  string(13) "getServerList"
   [28]=>
-  string(10) "getVersion"
+  string(15) "resetServerList"
   [29]=>
-  string(9) "increment"
+  string(8) "getStats"
   [30]=>
-  string(7) "prepend"
+  string(10) "getVersion"
   [31]=>
-  string(12) "prependByKey"
+  string(9) "increment"
   [32]=>
-  string(7) "replace"
+  string(14) "incrementByKey"
   [33]=>
-  string(12) "replaceByKey"
+  string(7) "prepend"
   [34]=>
-  string(3) "set"
+  string(12) "prependByKey"
   [35]=>
-  string(8) "setByKey"
+  string(4) "quit"
   [36]=>
-  string(8) "setMulti"
+  string(7) "replace"
   [37]=>
-  string(13) "setMultiByKey"
+  string(12) "replaceByKey"
   [38]=>
+  string(3) "set"
+  [39]=>
+  string(8) "setByKey"
+  [40]=>
+  string(8) "setMulti"
+  [41]=>
+  string(13) "setMultiByKey"
+  [42]=>
   string(9) "setOption"
+  [43]=>
+  string(10) "setOptions"
 }
 ================
 A_Memcached
@@ -95,7 +105,7 @@ object(A_Memcached)#2 (1) {
 Warning: Attempted to serialize unserializable builtin class A_Memcached in %s/builtin_extensions.inc on line 26
 string(2) "N;"
 NULL
-array(39) {
+array(44) {
   [0]=>
   string(11) "__construct"
   [1]=>
@@ -117,61 +127,71 @@ array(39) {
   [9]=>
   string(9) "decrement"
   [10]=>
-  string(6) "delete"
+  string(14) "decrementByKey"
   [11]=>
-  string(11) "deleteByKey"
+  string(6) "delete"
   [12]=>
-  string(5) "fetch"
+  string(11) "deleteByKey"
   [13]=>
-  string(8) "fetchAll"
+  string(5) "fetch"
   [14]=>
-  string(5) "flush"
+  string(8) "fetchAll"
   [15]=>
-  string(3) "get"
+  string(5) "flush"
   [16]=>
-  string(10) "getAllKeys"
+  string(3) "get"
   [17]=>
-  string(8) "getByKey"
+  string(10) "getAllKeys"
   [18]=>
-  string(10) "getDelayed"
+  string(8) "getByKey"
   [19]=>
-  string(15) "getDelayedByKey"
+  string(10) "getDelayed"
   [20]=>
-  string(8) "getMulti"
+  string(15) "getDelayedByKey"
   [21]=>
-  string(13) "getMultiByKey"
+  string(8) "getMulti"
   [22]=>
-  string(9) "getOption"
+  string(13) "getMultiByKey"
   [23]=>
-  string(13) "getResultCode"
+  string(9) "getOption"
   [24]=>
-  string(16) "getResultMessage"
+  string(13) "getResultCode"
   [25]=>
-  string(14) "getServerByKey"
+  string(16) "getResultMessage"
   [26]=>
-  string(13) "getServerList"
+  string(14) "getServerByKey"
   [27]=>
-  string(8) "getStats"
+  string(13) "getServerList"
   [28]=>
-  string(10) "getVersion"
+  string(15) "resetServerList"
   [29]=>
-  string(9) "increment"
+  string(8) "getStats"
   [30]=>
-  string(7) "prepend"
+  string(10) "getVersion"
   [31]=>
-  string(12) "prependByKey"
+  string(9) "increment"
   [32]=>
-  string(7) "replace"
+  string(14) "incrementByKey"
   [33]=>
-  string(12) "replaceByKey"
+  string(7) "prepend"
   [34]=>
-  string(3) "set"
+  string(12) "prependByKey"
   [35]=>
-  string(8) "setByKey"
+  string(4) "quit"
   [36]=>
-  string(8) "setMulti"
+  string(7) "replace"
   [37]=>
-  string(13) "setMultiByKey"
+  string(12) "replaceByKey"
   [38]=>
+  string(3) "set"
+  [39]=>
+  string(8) "setByKey"
+  [40]=>
+  string(8) "setMulti"
+  [41]=>
+  string(13) "setMultiByKey"
+  [42]=>
   string(9) "setOption"
+  [43]=>
+  string(10) "setOptions"
 }

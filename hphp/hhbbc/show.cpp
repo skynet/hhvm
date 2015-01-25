@@ -20,16 +20,17 @@
 #include <memory>
 #include <vector>
 
-#include "folly/Conv.h"
-#include "folly/Format.h"
-#include "folly/String.h"
-#include "folly/Range.h"
-#include "folly/gen/Base.h"
-#include "folly/gen/String.h"
+#include <folly/Conv.h>
+#include <folly/Format.h>
+#include <folly/String.h>
+#include <folly/Range.h>
+#include <folly/gen/Base.h>
+#include <folly/gen/String.h>
 
 #include "hphp/hhbbc/cfg.h"
 #include "hphp/hhbbc/type-system.h"
 #include "hphp/hhbbc/index.h"
+#include "hphp/hhbbc/func-util.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -80,17 +81,17 @@ std::string array_string(SArray arr) {
   return str.str();
 }
 
-std::string local_string(borrowed_ptr<const php::Local> loc) {
-  return loc->name
-    ? folly::to<std::string>("$", loc->name->data())
-    : folly::to<std::string>("$<unnamed:", loc->id, ">");
-};
-
 }
 
 //////////////////////////////////////////////////////////////////////
 
 namespace php {
+
+std::string local_string(borrowed_ptr<const php::Local> loc) {
+  return loc->name
+    ? folly::to<std::string>("$", loc->name->data())
+    : folly::to<std::string>("$<unnamed:", loc->id, ">");
+};
 
 std::string show(const Block& block) {
   std::string ret;
@@ -299,7 +300,7 @@ std::string show(const Bytecode& bc) {
         folly::toAppend(":", m.immInt, &ret);
         break;
       case MCodeImm::Local:
-        folly::toAppend(":$", m.immLoc->name->data(), &ret);
+        folly::toAppend(":$", local_string(m.immLoc), &ret);
         break;
       }
     }
@@ -350,6 +351,7 @@ std::string show(const Bytecode& bc) {
 #define IMM_IA(n)      folly::toAppend(" iter:", data.iter##n->id, &ret);
 #define IMM_DA(n)      folly::toAppend(" ", data.dbl##n, &ret);
 #define IMM_SA(n)      folly::toAppend(" ", escaped_string(data.str##n), &ret);
+#define IMM_RATA(n)    folly::toAppend(" ", show(data.rat), &ret);
 #define IMM_AA(n)      ret += " " + array_string(data.arr##n);
 #define IMM_BA(n)      folly::toAppend(" <blk:", data.target->id, ">", &ret);
 #define IMM_OA_IMPL(n) /* empty */
@@ -387,6 +389,7 @@ std::string show(const Bytecode& bc) {
 #undef IMM_IA
 #undef IMM_DA
 #undef IMM_SA
+#undef IMM_RATA
 #undef IMM_AA
 #undef IMM_BA
 #undef IMM_OA_IMPL
@@ -483,6 +486,7 @@ std::string show(Type t) {
     return ret;
   case DataTag::Obj:
   case DataTag::Cls:
+  case DataTag::RefInner:
   case DataTag::ArrPacked:
   case DataTag::ArrPackedN:
   case DataTag::ArrStruct:
@@ -524,6 +528,9 @@ std::string show(Type t) {
       folly::toAppend("<=", show(t.m_data.dcls.cls), &ret);
       break;
     }
+    break;
+  case DataTag::RefInner:
+    folly::toAppend("(", show(*t.m_data.inner), ")", &ret);
     break;
   case DataTag::None:
     break;
@@ -571,6 +578,11 @@ std::string show(Type t) {
 
 std::string show(Context ctx) {
   auto ret = std::string{};
+  if (is_pseudomain(ctx.func)) {
+    ret = ctx.func->unit->filename->data();
+    ret += ";pseudomain";
+    return ret;
+  }
   if (ctx.cls) {
     ret = ctx.cls->name->data();
     ret += "::";

@@ -23,6 +23,8 @@
 #include "hphp/compiler/analysis/class_scope.h"
 #include "hphp/compiler/analysis/analysis_result.h"
 #include "hphp/compiler/analysis/ast_walker.h"
+#include "hphp/compiler/analysis/exceptions.h"
+#include "hphp/parser/parse-time-fatal-exception.h"
 
 #include "hphp/compiler/statement/function_statement.h"
 

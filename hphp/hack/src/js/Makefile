@@ -5,25 +5,22 @@ TOP=..
 #############################################################################
 
 SRC = \
-  deriving_Json_Str.ml\
   hh_json.ml\
   ide.ml\
-  str.ml\
   pos.ml\
   ident.ml\
+  errors.ml\
   utils.ml\
   prefix.ml\
   value.ml\
   sharedMem.ml\
   autocomplete.ml\
   find_refs.ml\
-  silent.ml\
   typing_deps.ml\
   namespace_env.ml\
   ast.ml\
   namespaces.ml\
   parser_heap.ml\
-  preprocessor.ml\
   lexing_modes.ml\
   lexer_hack.ml\
   parser_hack.ml\
@@ -32,7 +29,6 @@ SRC = \
   nast.ml\
   typing_defs.ml\
   typing_env.ml\
-  naming_error.ml\
   naming_heap.ml\
   naming_ast_helpers.ml\
   naming.ml\
@@ -50,6 +46,7 @@ SRC = \
   typing_generic.ml\
   typing_ops.ml\
   typing_dynamic_yield.ml\
+  typing_enum.ml\
   typing_hint.ml\
   typing_suggest.ml\
   typing_async.ml\
@@ -60,11 +57,17 @@ SRC = \
   typing_lenv.ml\
   typing.ml\
   typing_inherit.ml\
+  typing_variance.ml\
   typing_decl.ml\
   pp.ml\
   colorFile.ml\
   fileOutline.ml\
-  hh_ide.ml
+  format_hack.ml\
+  hh_ide.ml\
+  typeVisitor.ml\
+  coverage_level.ml\
+  typingEqualityCheck.ml\
+  typing_taccess.ml\
 
 INCLUDEDIRS=$(shell ocamlfind -query js_of_ocaml)
 
@@ -92,6 +95,9 @@ deploy: hh_ide.js
 #TODO: a bid sad to do that, can probably just reuse the lib.cma
 lexer_hack.ml: $(TOP)/parsing/lexer_hack.ml
 	cp $(TOP)/parsing/lexer_hack.ml .
+
+format_hack.ml: $(TOP)/parsing/format_hack.ml
+	cp $(TOP)/parsing/format_hack.ml .
 
 parser_hack.ml: $(TOP)/parsing/parser_hack.ml
 	cp $(TOP)/parsing/parser_hack.ml .
@@ -123,9 +129,6 @@ namespaces.ml: $(TOP)/parsing/namespaces.ml
 parser_heap.ml: $(TOP)/parsing/parser_heap.ml
 	cp $(TOP)/parsing/parser_heap.ml .
 
-preprocessor.ml: $(TOP)/parsing/preprocessor.ml
-	cp $(TOP)/parsing/preprocessor.ml .
-
 parser.ml: $(TOP)/parsing/parser.ml
 	cp $(TOP)/parsing/parser.ml .
 
@@ -150,8 +153,17 @@ typing_suggest.ml: $(TOP)/typing/typing_suggest.ml
 typing_utils.ml: $(TOP)/typing/typing_utils.ml
 	cp $(TOP)/typing/typing_utils.ml .
 
+typeVisitor.ml: $(TOP)/typing/typeVisitor.ml
+	cp $(TOP)/typing/typeVisitor.ml .
+
+coverage_level.ml: $(TOP)/typing/coverage_level.ml
+	cp $(TOP)/typing/coverage_level.ml .
+
 typing_dynamic_yield.ml: $(TOP)/typing/typing_dynamic_yield.ml
 	cp $(TOP)/typing/typing_dynamic_yield.ml .
+
+typing_enum.ml: $(TOP)/typing/typing_enum.ml
+	cp $(TOP)/typing/typing_enum.ml .
 
 typing_print.ml: $(TOP)/typing/typing_print.ml
 	cp $(TOP)/typing/typing_print.ml .
@@ -173,6 +185,9 @@ typing_extends.ml: $(TOP)/typing/typing_extends.ml
 
 typing.ml: $(TOP)/typing/typing.ml
 	cp $(TOP)/typing/typing.ml .
+
+typing_variance.ml: $(TOP)/typing/typing_variance.ml
+	cp $(TOP)/typing/typing_variance.ml .
 
 typing_decl.ml: $(TOP)/typing/typing_decl.ml
 	cp $(TOP)/typing/typing_decl.ml .
@@ -200,12 +215,6 @@ autocomplete.ml: $(TOP)/globals/autocomplete.ml
 
 find_refs.ml: $(TOP)/globals/find_refs.ml
 	cp $(TOP)/globals/find_refs.ml .
-
-silent.ml: $(TOP)/globals/silent.ml
-	cp $(TOP)/globals/silent.ml .
-
-naming_error.ml: $(TOP)/naming/naming_error.ml
-	cp $(TOP)/naming/naming_error.ml .
 
 naming_ast_helpers.ml: $(TOP)/naming/naming_ast_helpers.ml
 	cp $^ .
@@ -285,7 +294,6 @@ clean::
 	rm -f nastVisitor.ml
 	rm -f nastCheck.ml
 	rm -f nastInitCheck.ml
-	rm -f naming_error.ml
 	rm -f naming_heap.ml
 	rm -f naming_ast_helpers.ml
 	rm -f naming.ml
@@ -296,7 +304,6 @@ clean::
 	rm -f typing_env.ml
 	rm -f typing_ops.ml
 	rm -f fix_file.ml
-	rm -f preprocessor.ml
 	rm -f typing_async.ml
 	rm -f typing_expand.ml
 	rm -f typing_alias.ml
@@ -308,8 +315,8 @@ clean::
 	rm -f typing_hint.ml
 	rm -f typing_print.ml
 	rm -f typing_dynamic_yield.ml
+	rm -f typing_enum.ml
 	rm -f find_refs.ml
-	rm -f silent.ml
 	rm -f autocomplete.ml
 	rm -f nast_terminality.ml
 	rm -f colorFile.ml
@@ -318,7 +325,10 @@ clean::
 	rm -f parser_hack.ml
 	rm -f typing_unify.ml
 	rm -f fileOutline.ml
+	rm -f format_hack.ml
 
 # legacy
 clean::
 	rm -f nast_helpers.ml
+
+.depend:: $(SRC)

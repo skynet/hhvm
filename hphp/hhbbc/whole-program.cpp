@@ -21,8 +21,10 @@
 #include <memory>
 #include <set>
 
-#include "folly/Memory.h"
-#include "folly/ScopeGuard.h"
+#include <folly/Memory.h>
+#include <folly/ScopeGuard.h>
+
+#include "hphp/runtime/vm/unit-emitter.h"
 
 #include "hphp/hhbbc/representation.h"
 #include "hphp/hhbbc/index.h"
@@ -34,7 +36,7 @@
 #include "hphp/hhbbc/optimize.h"
 #include "hphp/hhbbc/type-system.h"
 #include "hphp/hhbbc/stats.h"
-#include "hphp/runtime/vm/unit.h"
+#include "hphp/hhbbc/class-util.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -43,6 +45,10 @@ TRACE_SET_MOD(hhbbc);
 //////////////////////////////////////////////////////////////////////
 
 namespace {
+
+//////////////////////////////////////////////////////////////////////
+
+const StaticString s_invoke("__invoke");
 
 //////////////////////////////////////////////////////////////////////
 
@@ -130,6 +136,9 @@ std::vector<Context> all_function_contexts(const php::Program& program) {
     for (auto& f : u->funcs) {
       ret.push_back(Context { borrow(u), borrow(f) });
     }
+    if (options.AnalyzePseudomains) {
+      ret.push_back(Context { borrow(u), borrow(u->pseudomain) });
+    }
   }
   return ret;
 }
@@ -164,6 +173,12 @@ std::vector<WorkItem> initial_work(const php::Program& program) {
     for (auto& f : u->funcs) {
       ret.emplace_back(WorkType::Func, Context { borrow(u), borrow(f) });
     }
+    if (options.AnalyzePseudomains) {
+      ret.emplace_back(
+        WorkType::Func,
+        Context { borrow(u), borrow(u->pseudomain) }
+      );
+    }
   }
   return ret;
 }
@@ -173,43 +188,47 @@ WorkItem work_item_for(Context ctx) {
     return WorkItem { WorkType::Func, ctx };
   }
 
-  return ctx.cls == nullptr
-    ? WorkItem { WorkType::Func, ctx }
-    : WorkItem { WorkType::Class, Context { ctx.unit, nullptr, ctx.cls } };
+  return
+    ctx.cls == nullptr ? WorkItem { WorkType::Func, ctx } :
+    ctx.cls->closureContextCls ?
+      WorkItem {
+        WorkType::Class,
+        Context { ctx.unit, nullptr, ctx.cls->closureContextCls }
+      } :
+    WorkItem { WorkType::Class, Context { ctx.unit, nullptr, ctx.cls } };
 }
 
-void optimize(Index& index, php::Program& program) {
-  assert(check(program));
-  trace_time tracer("optimize");
-  SCOPE_EXIT { state_after("optimize", program); };
+
+/*
+ * Algorithm:
+ *
+ * Start by running an analyze pass on every class or free function.
+ * During analysis, information about functions or classes will be
+ * requested from the Index, which initially won't really know much,
+ * but will record a dependency.  This part is done in parallel: no
+ * passes are mutating anything, just reading from the Index.
+ *
+ * After a pass, we do a single-threaded "update" step to prepare
+ * for the next pass: for each function or class that was analyzed,
+ * note the facts we learned that may aid analyzing other functions
+ * in the program, and register them in the index.
+ *
+ * If any of these facts are more useful than they used to be, add
+ * all the Contexts that had a dependency on the new information to
+ * the work list again, in case they can do better based on the new
+ * fact.  (This only applies to function analysis information right
+ * now.)
+ *
+ * Repeat until the work list is empty.
+ */
+void analyze_iteratively(Index& index, php::Program& program) {
+  trace_time tracer("analyze iteratively");
 
   // Counters, just for debug printing.
   std::atomic<uint32_t> total_funcs{0};
   std::atomic<uint32_t> total_classes{0};
   auto round = uint32_t{0};
 
-  /*
-   * Algorithm:
-   *
-   * Start by running an analyze pass on every class or free function.
-   * During analysis, information about functions or classes will be
-   * requested from the Index, which initially won't really know much,
-   * but will record a dependency.  This part is done in parallel: no
-   * passes are mutating anything, just reading from the Index.
-   *
-   * After a pass, we do a single-threaded "update" step to prepare
-   * for the next pass: for each function or class that was analyzed,
-   * note the facts we learned that may aid analyzing other functions
-   * in the program, and register them in the index.
-   *
-   * If any of these facts are more useful than they used to be, add
-   * all the Contexts that had a dependency on the new information to
-   * the work list again, in case they can do better based on the new
-   * fact.  (This only applies to function analysis information right
-   * now.)
-   *
-   * Repeat until the work list is empty.
-   */
   auto work = initial_work(program);
   while (!work.empty()) {
     auto const results = [&] {
@@ -243,6 +262,20 @@ void optimize(Index& index, php::Program& program) {
     auto update_func = [&] (const FuncAnalysis& fa) {
       auto deps = index.refine_return_type(fa.ctx.func, fa.inferredReturn);
       for (auto& d : deps) revisit.insert(work_item_for(d));
+
+      for (auto& kv : fa.closureUseTypes) {
+        assert(is_closure(*kv.first));
+        if (index.refine_closure_use_vars(kv.first, kv.second)) {
+          auto const func = find_method(kv.first, s_invoke.get());
+          always_assert_flog(
+            func != nullptr,
+            "Failed to find __invoke on {} during index update\n",
+            kv.first->name->data()
+          );
+          auto const ctx = Context { func->unit, func, kv.first };
+          revisit.insert(work_item_for(ctx));
+        }
+      }
     };
 
     for (auto& result : results) {
@@ -268,22 +301,57 @@ void optimize(Index& index, php::Program& program) {
     Trace::traceRelease("total class visits %u\n", total_classes.load());
     Trace::traceRelease("total function visits %u\n", total_funcs.load());
   }
+}
 
-  /*
-   * Finally, use the results of all these iterations to perform
-   * optimization.  This reanalyzes every function using our
-   * now-very-updated Index, and then runs optimize_func with the
-   * results.
-   *
-   * We do this in parallel: all the shared information is queried out
-   * of the index, and each thread is allowed to modify the bytecode
-   * for the function it is looking at.
-   *
-   * NOTE: currently they can't modify anything other than the
-   * bytecode/Blocks, because other threads may be doing unlocked
-   * queries to php::Func and php::Class structures.
-   */
+void analyze_public_statics(Index& index, php::Program& program) {
+  PublicSPropIndexer publicStatics{&index};
+
+  {
+    trace_time timer("analyze public statics");
+    parallel::for_each(
+      all_function_contexts(program),
+      [&] (Context ctx) {
+        auto info = CollectedInfo { index, ctx, nullptr, &publicStatics };
+        analyze_func_collect(index, ctx, info);
+      }
+    );
+  }
+
+  trace_time update("update public statics");
+  index.refine_public_statics(publicStatics);
+}
+
+void mark_persistent_static_properties(const Index& index,
+                                       php::Program& program) {
+  trace_time update("mark persistent static properties");
+  for (auto& unit : program.units) {
+    for (auto& cls : unit->classes) {
+      for (auto& prop : cls->properties) {
+        if (index.lookup_public_static_immutable(borrow(cls), prop.name)) {
+          prop.attrs |= AttrPersistent;
+        }
+      }
+    }
+  }
+}
+
+/*
+ * Finally, use the results of all these iterations to perform
+ * optimization.  This reanalyzes every function using our
+ * now-very-updated Index, and then runs optimize_func with the
+ * results.
+ *
+ * We do this in parallel: all the shared information is queried out
+ * of the index, and each thread is allowed to modify the bytecode
+ * for the function it is looking at.
+ *
+ * NOTE: currently they can't modify anything other than the
+ * bytecode/Blocks, because other threads may be doing unlocked
+ * queries to php::Func and php::Class structures.
+ */
+void final_pass(Index& index, php::Program& program) {
   trace_time final_pass("final pass");
+  index.freeze();
   parallel::for_each(
     all_function_contexts(program),
     [&] (Context ctx) { optimize_func(index, analyze_func(index, ctx)); }
@@ -322,7 +390,10 @@ make_unit_emitters(const Index& index, const php::Program& program) {
 
 //////////////////////////////////////////////////////////////////////
 
-std::vector<std::unique_ptr<UnitEmitter>>
+std::pair<
+  std::vector<std::unique_ptr<UnitEmitter>>,
+  std::unique_ptr<ArrayTypeTable::Builder>
+>
 whole_program(std::vector<std::unique_ptr<UnitEmitter>> ues) {
   trace_time tracer("whole program");
 
@@ -334,7 +405,20 @@ whole_program(std::vector<std::unique_ptr<UnitEmitter>> ues) {
   state_after("parse", *program);
 
   Index index{borrow(program)};
-  if (!options.NoOptimizations) optimize(index, *program);
+  if (!options.NoOptimizations) {
+    assert(check(*program));
+    analyze_iteratively(index, *program);
+    if (options.AnalyzePublicStatics) {
+      analyze_public_statics(index, *program);
+      analyze_iteratively(index, *program);
+    }
+    final_pass(index, *program);
+    state_after("optimize", *program);
+  }
+
+  if (options.AnalyzePublicStatics) {
+    mark_persistent_static_properties(index, *program);
+  }
 
   debug_dump_program(index, *program);
   print_stats(index, *program);
@@ -342,7 +426,7 @@ whole_program(std::vector<std::unique_ptr<UnitEmitter>> ues) {
   LitstrTable::get().setWriting();
   ues = make_unit_emitters(index, *program);
 
-  return ues;
+  return { std::move(ues), std::move(index.array_table_builder()) };
 }
 
 //////////////////////////////////////////////////////////////////////

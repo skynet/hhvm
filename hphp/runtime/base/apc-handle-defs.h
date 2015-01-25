@@ -24,11 +24,11 @@
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-inline void APCHandle::unreferenceRoot() {
-  if (!getUncounted()) {
+inline void APCHandle::unreferenceRoot(size_t size) {
+  if (!isUncounted()) {
     realDecRef();
   } else {
-    g_context->enqueueAPCHandle(this);
+    g_context->enqueueAPCHandle(this, size);
   }
 }
 

@@ -17,13 +17,13 @@
 
 #include "hphp/vixl/a64/simulator-a64.h"
 
+#include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/runtime/vm/jit/abi-arm.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/util/data-block.h"
 
-namespace HPHP {
-namespace JIT {
+namespace HPHP { namespace jit {
 
 bool
 FixupMap::getFrameRegs(const ActRec* ar, const ActRec* prevAr,
@@ -50,23 +50,20 @@ FixupMap::getFrameRegs(const ActRec* ar, const ActRec* prevAr,
 }
 
 void
-FixupMap::recordSyncPoint(CodeAddress frontier, Offset pcOff, Offset spOff) {
-  m_pendingFixups.push_back(PendingFixup(frontier, Fixup(pcOff, spOff)));
-}
-
-void
 FixupMap::recordIndirectFixup(CodeAddress frontier, int dwordsPushed) {
   recordIndirectFixup(frontier, IndirectFixup((2 + dwordsPushed) * 8));
 }
 
 namespace {
+
+// If this function asserts or crashes, it is usually because VMRegAnchor was
+// not used to force a sync prior to calling a runtime function.
 bool isVMFrame(const ExecutionContext* ec, const ActRec* ar) {
-  // If this assert is failing, you may have forgotten a sync point somewhere
   assert(ar);
+  // Determine whether the frame pointer is outside the native stack, cleverly
+  // using a single unsigned comparison to do both halves of the bounds check.
   bool ret = uintptr_t(ar) - s_stackLimit >= s_stackSize;
-  assert(!ret ||
-         (ar >= ec->m_stack.getStackLowAddress() &&
-          ar < ec->m_stack.getStackHighAddress()) ||
+  assert(!ret || isValidVMStackAddress(ar) ||
          (ar->m_func->validate(), ar->resumed()));
   return ret;
 }
@@ -93,11 +90,12 @@ FixupMap::fixupWork(ExecutionContext* ec, ActRec* rbp) const {
       VMRegs regs;
       if (getFrameRegs(rbp, prevRbp, &regs)) {
         TRACE(2, "fixup(end): func %s fp %p sp %p pc %p\n",
-              regs.m_fp->m_func->name()->data(),
-              regs.m_fp, regs.m_sp, regs.m_pc);
-        ec->m_fp = const_cast<ActRec*>(regs.m_fp);
-        ec->m_pc = reinterpret_cast<PC>(regs.m_pc);
-        vmsp() = regs.m_sp;
+              regs.fp->m_func->name()->data(),
+              regs.fp, regs.sp, regs.pc);
+        auto& vmRegs = vmRegsUnsafe();
+        vmRegs.fp = const_cast<ActRec*>(regs.fp);
+        vmRegs.pc = reinterpret_cast<PC>(regs.pc);
+        vmRegs.stack.top() = regs.sp;
         return;
       }
     }
@@ -119,10 +117,7 @@ FixupMap::fixupWorkSimulated(ExecutionContext* ec) const {
     bool ret =
       uintptr_t(ar) - s_stackLimit >= s_stackSize &&
       !sim->is_on_stack(ar);
-    assert(!ret ||
-           (ar >= g_context->m_stack.getStackLowAddress() &&
-            ar < g_context->m_stack.getStackHighAddress()) ||
-           ar->resumed());
+    assert(!ret || isValidVMStackAddress(ar) || ar->resumed());
     return ret;
   };
 
@@ -133,7 +128,7 @@ FixupMap::fixupWorkSimulated(ExecutionContext* ec) const {
   // uniqueStub.
   for (int i = ec->m_activeSims.size() - 1; i >= 0; --i) {
     auto const* sim = ec->m_activeSims[i];
-    auto* rbp = reinterpret_cast<ActRec*>(sim->xreg(JIT::ARM::rVmFp.code()));
+    auto* rbp = reinterpret_cast<ActRec*>(sim->xreg(jit::arm::rVmFp.code()));
     auto tca = reinterpret_cast<TCA>(sim->pc());
     TRACE(2, "considering frame %p, %p\n", rbp, tca);
 
@@ -156,11 +151,12 @@ FixupMap::fixupWorkSimulated(ExecutionContext* ec) const {
     VMRegs regs;
     regsFromActRec(tca, rbp, ent->fixup, &regs);
     TRACE(2, "fixup(end): func %s fp %p sp %p pc %p\b",
-          regs.m_fp->m_func->name()->data(),
-          regs.m_fp, regs.m_sp, regs.m_pc);
-    ec->m_fp = const_cast<ActRec*>(regs.m_fp);
-    ec->m_pc = reinterpret_cast<PC>(regs.m_pc);
-    vmsp() = regs.m_sp;
+          regs.fp->m_func->name()->data(),
+          regs.fp, regs.sp, regs.pc);
+    auto& vmRegs = vmRegsUnsafe();
+    vmRegs.fp = const_cast<ActRec*>(regs.fp);
+    vmRegs.pc = reinterpret_cast<PC>(regs.pc);
+    vmRegs.stack.top() = regs.sp;
     return;
   }
 
@@ -182,16 +178,6 @@ FixupMap::fixup(ExecutionContext* ec) const {
   }
 }
 
-void
-FixupMap::processPendingFixups() {
-  for (uint i = 0; i < m_pendingFixups.size(); i++) {
-    TCA tca = m_pendingFixups[i].m_tca;
-    assert(mcg->isValidCodeAddress(tca));
-    recordFixup(tca, m_pendingFixups[i].m_fixup);
-  }
-  m_pendingFixups.clear();
-}
-
 /* This is somewhat hacky. It decides which helpers/builtins should
  * use eager vmreganchor based on profile information. Using eager
  * vmreganchor for all helper calls is a perf regression. */
@@ -199,25 +185,22 @@ bool
 FixupMap::eagerRecord(const Func* func) {
   const char* list[] = {
     "func_get_args",
+    "__SystemLib\\func_get_args_sl",
     "get_called_class",
     "func_num_args",
+    "__SystemLib\\func_num_arg_",
     "array_filter",
     "array_map",
     "__SystemLib\\func_slice_args",
   };
 
-  for (int i = 0; i < sizeof(list)/sizeof(list[0]); i++) {
-    if (!strcmp(func->name()->data(), list[i])) {
-      return true;
-    }
+  for (auto str : list) {
+    if (!strcmp(func->name()->data(), str)) return true;
   }
-  if (func->cls() && !strcmp(func->cls()->name()->data(), "WaitHandle")
-      && !strcmp(func->name()->data(), "join")) {
-    return true;
-  }
-  return false;
+
+  return func->cls() &&
+    !strcmp(func->cls()->name()->data(), "HH\\WaitHandle") &&
+    !strcmp(func->name()->data(), "join");
 }
 
-} // HPHP::JIT
-
-} // HPHP
+}}

@@ -26,10 +26,16 @@
  */
 
 #include "hphp/runtime/base/types.h"
-#include "hphp/runtime/vm/name-value-table-wrapper.h"
+#include "hphp/runtime/vm/globals-array.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
+/*
+ * This file is included from inside an extern "C" block in some places, but
+ * these functions have return types that are incompatible with C linkage.
+ */
+extern "C++" {
 
 /**
  * Invoking an arbitrary user-defined function.
@@ -47,6 +53,8 @@ extern Variant get_static_property(const String& s, const char *prop);
  */
 extern Variant get_class_var_init(const String& s, const char *var);
 
+} // extern C++
+
 /**
  * Class/function meta info entirely encoded here as a const char * array.
  */
@@ -55,7 +63,7 @@ extern const char *g_class_map[];
 /**
  * Returns a thread local global variable class pointer.
  */
-typedef GlobalNameValueTableWrapper GlobalVariables;
+typedef GlobalsArray GlobalVariables;
 extern GlobalVariables *get_global_variables();
 extern void free_global_variables();
 extern void free_global_variables_after_sweep();
@@ -73,7 +81,6 @@ struct EnvConstants {
   static void requestExit();
   Variant lvalProxy;
   Variant stgv_Variant[1];
-#define k_SID stgv_Variant[0]
 };
 extern EnvConstants* get_env_constants();
 extern String k_PHP_BINARY;

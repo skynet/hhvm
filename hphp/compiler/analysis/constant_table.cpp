@@ -147,7 +147,7 @@ const {
 void ConstantTable::cleanupForError(AnalysisResultConstPtr ar) {
   AnalysisResult::Locker lock(ar);
 
-  BOOST_FOREACH(Symbol *sym, m_symbolVec) {
+  for (Symbol *sym: m_symbolVec) {
     if (!sym->isDynamic()) {
       sym->setDynamic();
       sym->setDeclaration(ConstructPtr());
@@ -181,7 +181,9 @@ TypePtr ConstantTable::check(BlockScopeRawPtr context,
           }
         }
         if (!isClassScope || !((ClassScope*)&m_blockScope)->isTrait()) {
-          Compiler::Error(Compiler::UseUndeclaredConstant, construct);
+          if (strcasecmp("class", name.c_str())) {
+            Compiler::Error(Compiler::UseUndeclaredConstant, construct);
+          }
         }
         actualType = isClassScope || !Option::WholeProgram ?
           Type::Variant : Type::String;
@@ -240,14 +242,4 @@ ClassScopeRawPtr ConstantTable::findBase(
 ///////////////////////////////////////////////////////////////////////////////
 
 void ConstantTable::outputPHP(CodeGenerator &cg, AnalysisResultPtr ar) {
-  if (Option::GenerateInferredTypes) {
-    for (unsigned int i = 0; i < m_symbolVec.size(); i++) {
-      Symbol *sym = m_symbolVec[i];
-      if (sym->isSystem()) continue;
-
-      cg_printf("// @const  %s\t$%s\n",
-                sym->getFinalType()->toString().c_str(),
-                sym->getName().c_str());
-    }
-  }
 }

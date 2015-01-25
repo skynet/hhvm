@@ -27,33 +27,58 @@ module SSet = Utils.SSet
 let autoimport_classes = [
   "Traversable";
   "KeyedTraversable";
+  "Container";
+  "KeyedContainer";
   "Iterator";
   "KeyedIterator";
   "Iterable";
   "KeyedIterable";
   "Collection";
   "Vector";
-  "Set";
   "ImmVector";
+  "Map";
+  "ImmMap";
+  "StableMap";
+  "Set";
   "ImmSet";
   "Pair";
-  "Map";
-  "StableMap";
-  "ImmMap"
+  "Awaitable";
+  "AsyncIterator";
+  "IMemoizeParam";
+  "AsyncKeyedIterator";
+  "InvariantException";
+  "AsyncGenerator";
+  "WaitHandle";
+  "StaticWaitHandle";
+  "WaitableWaitHandle";
+  "BlockableWaitHandle";
+  "ResumableWaitHandle";
+  "AsyncFunctionWaitHandle";
+  "AsyncGeneratorWaitHandle";
+  "AwaitAllWaitHandle";
+  "GenArrayWaitHandle";
+  "GenMapWaitHandle";
+  "GenVectorWaitHandle";
+  "ConditionWaitHandle";
+  "RescheduleWaitHandle";
+  "SleepWaitHandle";
+  "ExternalThreadEventWaitHandle"
 ]
 let autoimport_set =
   List.fold_left (fun s e -> SSet.add e s) SSet.empty autoimport_classes
 let is_autoimport_class id = SSet.mem id autoimport_set
 
+let elaborate_into_current_ns nsenv id =
+  match nsenv.ns_name with
+    | None -> "\\" ^ id
+    | Some ns -> "\\" ^ ns ^ "\\" ^ id
+
 (* Resolves an identifier in a given namespace environment. For example, if we
  * are in the namespace "N\O", the identifier "P\Q" is resolved to "\N\O\P\Q".
  *
- * If we are inside a namespace, identifiers are resolved to fully-qualified
- * names. Outside of a namespace, qualified identifiers are similarly resolved
- * to fully-qualified identifiers. However, unqualified identifiers outside of
- * a namespace are *not* fully-qualified -- we omit the leading slash so that
- * code that doesn't make use of namespaces doesn't have spurious leading
- * slashes appended to every name in error messages.
+ * All identifiers are fully-qualified by this function; the internal
+ * representation of identifiers inside the typechecker after naming is a fully
+ * qualified identifier.
  *
  * It's extremely important that this function is idempotent. We actually
  * normalize identifiers in two phases. Right after parsing, we need to have
@@ -61,7 +86,8 @@ let is_autoimport_class id = SSet.mem id autoimport_set
  * incremental mode properly. Other identifiers are normalized during naming.
  * However, we don't do any bookkeeping to determin which we've normalized or
  * not, just relying on the idempotence of this function to make sure everything
- * works out.
+ * works out. (Fully qualifying identifiers is of course idempotent, but there
+ * used to be other schemes here.)
  *)
 let elaborate_id nsenv (p, id) =
   (* Go ahead and fully-qualify the name first. *)
@@ -73,12 +99,17 @@ let elaborate_id nsenv (p, id) =
       let bslash_loc =
         try String.index id '\\' with Not_found -> String.length id in
       let prefix = String.sub id 0 bslash_loc in
-      match SMap.get prefix nsenv.ns_uses with
-        | None -> begin match nsenv.ns_name with
-          | None -> "\\" ^ id
-          | Some ns -> "\\" ^ ns ^ "\\" ^ id
-        end
+      if prefix = "namespace" then begin
+        (* Strip off the 'namespace\' (including the slash) from id, then
+        elaborate back into the current namespace. *)
+        let len = (String.length id) - bslash_loc  - 1 in
+        elaborate_into_current_ns nsenv (String.sub id (bslash_loc + 1) len)
+      end else match SMap.get prefix nsenv.ns_uses with
+        | None -> elaborate_into_current_ns nsenv id
         | Some use -> begin
+          (* Strip off the "use" from id, but *not* the backslash after that
+           * (so "use\foo" will become "\foo") and then prepend the new
+           * namespace. *)
           let len = (String.length id) - bslash_loc in
           use ^ (String.sub id bslash_loc len)
         end
@@ -99,18 +130,27 @@ let elaborate_id nsenv (p, id) =
  * allow us to fix those up during a second pass during naming.
  *)
 module ElaborateDefs = struct
-  let rec hint nsenv = function
+  let hint nsenv = function
     | p, Happly (id, args) ->
         p, Happly (elaborate_id nsenv id, args)
     | other -> other
 
   let class_def nsenv = function
     | ClassUse h -> ClassUse (hint nsenv h)
+    | XhpAttrUse h -> XhpAttrUse (hint nsenv h)
     | other -> other
 
   let rec def nsenv = function
+    (*
+      The default namespace in php is the global namespace specified by
+      the empty string. In the case of an empty string, we model it as
+      the global namespace.
+    *)
     | Namespace ((_, nsname), prog) -> begin
-        let new_nsenv = {nsenv with ns_name = Some nsname} in
+        let nsname = match nsname with
+          | "" -> None
+          | _ -> Some nsname in
+        let new_nsenv = {nsenv with ns_name = nsname} in
         nsenv, program new_nsenv prog
       end
     | NamespaceUse l -> begin

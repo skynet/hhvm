@@ -4,6 +4,9 @@
 	/*** test mysqli_connect 127.0.0.1 ***/
 	$mysql = new my_mysqli($host, $user, $passwd, $db, $port, $socket);
 
+	if (!mysqli_query($mysql, "SET sql_mode=''"))
+		printf("[002] Cannot set SQL-Mode, [%d] %s\n", mysqli_errno($mysql), mysqli_error($mysql));
+
 	$mysql->query("DROP TABLE IF EXISTS test_066_table_1");
 
 	$mysql->query("CREATE TABLE test_066_table_1 (a int not null) ENGINE=myisam");
@@ -19,6 +22,7 @@
 	$mysql->close();
 	print "done!";
 ?>
+<?php error_reporting(0); ?>
 <?php
 require_once("connect.inc");
 if (!$link = my_mysqli_connect($host, $user, $passwd, $db, $port, $socket))

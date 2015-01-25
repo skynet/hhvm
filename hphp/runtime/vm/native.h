@@ -40,7 +40,7 @@ class Object;
  *   }
  *
  * Then register it from your Extension's moduleLoad() hook:
- *   virtual moduleLoad(Hdf config) {
+ *   void moduleLoad(const IniSetting::Map& ini, Hdf config) override {
  *     HHVM_FE(sum);
  *   }
  *
@@ -72,20 +72,28 @@ class Object;
  *   }
  *
  * In which case you will need to use a different macro in moduleLoad()
- *   virtual moduleLoad(Hdf config) {
+ *   virtual moduleLoad(const IniSetting::Map& ini, Hdf config) {
  *     HHVM_NAME_FE(sum, my_sum_function)
  *   }
  * Or an explicit call to registerBuildinFunction()
  *   static const StaticString s_sum("sum");
- *   virtual moduleLoad(Hdf config) {
- *     Native::registerBuiltinFunction(s_sum.get(), (void*)my_sum_function);
+ *   virtual moduleLoad(const IniSetting::Map& ini, Hdf config) {
+ *     Native::registerBuiltinFunction(s_sum, (void*)my_sum_function);
  *   }
+ *
+ ****************************************************************************
+ *
+ * The macros HHVM_FALIAS, HHVM_MALIAS, and HHVM_STATIC_MALIAS allow
+ * giving different names to the C++ implementation and the exported
+ * C++ function. This ca be useful for creating multiple names for one
+ * function or for registering functions that live in a namespace.
+ *
  */
 #define HHVM_FN(fn) f_ ## fn
 #define HHVM_FUNCTION(fn, ...) \
         HHVM_FN(fn)(__VA_ARGS__)
-#define HHVM_NAMED_FE(fn, fimpl) Native::registerBuiltinFunction(\
-                          makeStaticString(#fn), fimpl)
+#define HHVM_NAMED_FE(fn, fimpl) \
+        Native::registerBuiltinFunction(#fn, fimpl)
 #define HHVM_FE(fn) HHVM_NAMED_FE(fn, HHVM_FN(fn))
 #define HHVM_FALIAS(fn, falias) HHVM_NAMED_FE(fn, HHVM_FN(falias))
 
@@ -96,15 +104,16 @@ class Object;
  * These macros only differ in the following ways:
  * - They accept a classname in addition to the function name
  * - The registered name of the function is "ClassName->FunctionName"
- * - Prototypes include a prepended const Object& parameter (named this_)
+ * - Prototypes include a prepended ObjectData* const parameter (named this_)
  */
 #define HHVM_MN(cn,fn) c_ ## cn ## _ni_ ## fn
 #define HHVM_METHOD(cn, fn, ...) \
-        HHVM_MN(cn,fn)(const Object& this_, ##__VA_ARGS__)
-#define HHVM_NAMED_ME(cn,fn,mimpl) Native::registerBuiltinFunction(\
-                          makeStaticString(#cn "->" #fn), \
-                          mimpl)
+        HHVM_MN(cn,fn)(ObjectData* const this_, ##__VA_ARGS__)
+#define HHVM_NAMED_ME(cn,fn,mimpl) \
+        Native::registerBuiltinFunction(#cn "->" #fn, mimpl)
 #define HHVM_ME(cn,fn) HHVM_NAMED_ME(cn,fn, HHVM_MN(cn,fn))
+#define HHVM_MALIAS(cn,fn,calias,falias) \
+  HHVM_NAMED_ME(cn,fn,HHVM_MN(calias,falias))
 
 /* Macros related to declaring/registering internal implementations
  * of <<__Native>> class static methods.
@@ -118,10 +127,11 @@ class Object;
 #define HHVM_STATIC_MN(cn,fn) c_ ## cn ## _ns_ ## fn
 #define HHVM_STATIC_METHOD(cn, fn, ...) \
         HHVM_STATIC_MN(cn,fn)(const Class *self_, ##__VA_ARGS__)
-#define HHVM_NAMED_STATIC_ME(cn,fn,mimpl) Native::registerBuiltinFunction(\
-                          makeStaticString(#cn "::" #fn), \
-                          mimpl)
+#define HHVM_NAMED_STATIC_ME(cn,fn,mimpl) \
+        Native::registerBuiltinFunction(#cn "::" #fn, mimpl)
 #define HHVM_STATIC_ME(cn,fn) HHVM_NAMED_STATIC_ME(cn,fn,HHVM_STATIC_MN(cn,fn))
+#define HHVM_STATIC_MALIAS(cn,fn,calias,falias) \
+  HHVM_NAMED_STATIC_ME(cn,fn,HHVM_STATIC_MN(calias,falias))
 
 namespace HPHP { namespace Native {
 //////////////////////////////////////////////////////////////////////////////
@@ -186,32 +196,35 @@ bool coerceFCallArgs(TypedValue* args,
  * If <ctx> is not nullptr, it is prepended to <args> when
  * calling.
  */
-void callFunc(const Func* func, TypedValue *ctx,
-              TypedValue* args, int32_t numArgs,
-              TypedValue &ret);
-/**
- * ActRec to native function call wrapper
- *
- * Unpacks args and coerces types according to Func typehints
- * Calls C++ function in the form ret f_foo(type arg1, type arg2, ...)
- * Marshalls return into TypedValue
- */
-TypedValue* functionWrapper(ActRec* ar);
+template<bool usesDoubles, bool variadic>
+void callFunc(const Func* func, void* ctx,
+              TypedValue* args, TypedValue& ret);
 
 /**
- * Method version of nativeFunctionWrapper() above.
- *
- * Also prepends a calling context:
- *   const Object& for instance methods
- *   Class* for static methods
+ * Extract the name used to invoke the function from the ActRec where name
+ * maybe be stored in invName, or may include the classname (e.g. Class::func)
  */
-TypedValue* methodWrapper(ActRec* ar);
+const StringData* getInvokeName(ActRec* ar);
+
+/**
+ * Returns a specialization of either functionWrapper or methodWrapper
+ *
+ * functionWrapper() Unpacks args and coerces types according
+ * to Func typehints. Calls C++ function in the form:
+ * ret f_foo(type arg1, type arg2, ...)
+ * Marshalls return into TypedValue.
+ *
+ * methodWrapper() behaves the same as functionWrapper(),
+ * but also prepends either an ObjectData* (instance) or Class* (static)
+ * argument to the signature. i.e.:
+ * ret c_class_ni_method(ObjectData* this_, type arg1, type arg2, ...)
+ * ret c_class_ns_method(Class* self_, type arg1, type arg2, ...)
+ */
+BuiltinFunction getWrapper(bool method, bool usesDoubles, bool variadic);
 
 /**
  * Fallback method bound to declared methods with no matching
  * internal implementation.
- *
- * Throws a NotImplementedException
  */
 TypedValue* unimplementedWrapper(ActRec* ar);
 
@@ -219,7 +232,9 @@ TypedValue* unimplementedWrapper(ActRec* ar);
  * Case insensitive map of "name" to function pointer
  *
  * Extensions should generally add items to this map using
- * the HHVM_FE/ME macros above
+ * the HHVM_FE/ME macros above. The function name (key) must
+ * be a static string because this table is shared and outlives
+ * individual requests.
  */
 typedef hphp_hash_map<const StringData*, BuiltinFunction,
                       string_data_hash, string_data_isame> BuiltinFunctionMap;
@@ -227,12 +242,21 @@ typedef hphp_hash_map<const StringData*, BuiltinFunction,
 extern BuiltinFunctionMap s_builtinFunctions;
 
 template <class Fun>
-inline void registerBuiltinFunction(const StringData* fname, Fun func) {
+inline void registerBuiltinFunction(const char* name, Fun func) {
   static_assert(
     std::is_pointer<Fun>::value &&
     std::is_function<typename std::remove_pointer<Fun>::type>::value,
     "You can only register pointers to function.");
-  s_builtinFunctions[fname] = (BuiltinFunction)func;
+  s_builtinFunctions[makeStaticString(name)] = (BuiltinFunction)func;
+}
+
+template <class Fun>
+inline void registerBuiltinFunction(const String& name, Fun func) {
+  static_assert(
+    std::is_pointer<Fun>::value &&
+    std::is_function<typename std::remove_pointer<Fun>::type>::value,
+    "You can only register pointers to function.");
+  s_builtinFunctions[makeStaticString(name)] = (BuiltinFunction)func;
 }
 
 inline BuiltinFunction GetBuiltinFunction(const StringData* fname,

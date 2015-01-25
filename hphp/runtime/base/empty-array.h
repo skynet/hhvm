@@ -22,6 +22,7 @@
 #include <sys/types.h>
 
 #include "hphp/runtime/base/array-common.h"
+#include "hphp/runtime/base/typed-value.h"
 
 namespace HPHP {
 
@@ -31,9 +32,7 @@ struct Variant;
 struct ArrayData;
 struct RefData;
 struct StringData;
-struct TypedValue;
 struct MArrayIter;
-struct APCHandle;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -45,41 +44,32 @@ struct APCHandle;
  */
 struct EmptyArray {
   static void Release(ArrayData*);
-  static constexpr auto NvGetInt =
-    reinterpret_cast<const TypedValue* (*)(const ArrayData*, int64_t)>(
-      ArrayCommon::ReturnNull
-    );
-  static constexpr auto NvGetStr =
-    reinterpret_cast<const TypedValue* (*)(const ArrayData*,
-                                           const StringData*)>(
-      ArrayCommon::ReturnNull
-    );
+  static const TypedValue* NvGetInt(const ArrayData*, int64_t) {
+    return nullptr;
+  }
+  static const TypedValue* NvGetStr(const ArrayData*, const StringData*) {
+    return nullptr;
+  }
   static void NvGetKey(const ArrayData*, TypedValue* out, ssize_t pos);
-  static ArrayData* SetInt(ArrayData*, int64_t k, const Variant& v, bool copy);
-  static ArrayData* SetStr(ArrayData*, StringData* k, const Variant& v,
-    bool copy);
-  static constexpr auto RemoveInt =
-    reinterpret_cast<ArrayData* (*)(ArrayData*, int64_t, bool)>(
-      ArrayCommon::ReturnFirstArg
-    );
-  static constexpr auto RemoveStr =
-    reinterpret_cast<ArrayData* (*)(ArrayData*, const StringData*, bool)>(
-      ArrayCommon::ReturnFirstArg
-    );
+  static ArrayData* SetInt(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* SetStr(ArrayData*, StringData* k, Cell v, bool copy);
+  static ArrayData* RemoveInt(ArrayData* ad, int64_t, bool) {
+    return ad;
+  }
+  static ArrayData* RemoveStr(ArrayData* ad, const StringData*, bool) {
+    return ad;
+  }
   static size_t Vsize(const ArrayData*);
   static const Variant& GetValueRef(const ArrayData* ad, ssize_t pos);
-  static constexpr auto IsVectorData =
-    reinterpret_cast<bool (*)(const ArrayData*)>(
-      ArrayCommon::ReturnTrue
-    );
-  static constexpr auto ExistsInt =
-    reinterpret_cast<bool (*)(const ArrayData*, int64_t)>(
-      ArrayCommon::ReturnFalse
-    );
-  static constexpr auto ExistsStr =
-    reinterpret_cast<bool (*)(const ArrayData*, const StringData*)>(
-      ArrayCommon::ReturnFalse
-    );
+  static bool IsVectorData(const ArrayData*) {
+    return true;
+  }
+  static bool ExistsInt(const ArrayData*, int64_t) {
+    return false;
+  }
+  static bool ExistsStr(const ArrayData*, const StringData*) {
+    return false;
+  }
   static ArrayData* LvalInt(ArrayData*, int64_t k, Variant*& ret, bool copy);
   static ArrayData* LvalStr(ArrayData*, StringData* k, Variant*& ret,
                             bool copy);
@@ -90,42 +80,32 @@ struct EmptyArray {
   static constexpr auto AddInt = &SetInt;
   static constexpr auto AddStr = &SetStr;
   static constexpr auto IterBegin = &ArrayCommon::ReturnInvalidIndex;
+  static constexpr auto IterLast = &ArrayCommon::ReturnInvalidIndex;
   static constexpr auto IterEnd = &ArrayCommon::ReturnInvalidIndex;
   static ssize_t IterAdvance(const ArrayData*, ssize_t prev);
   static ssize_t IterRewind(const ArrayData*, ssize_t prev);
-  static constexpr auto ValidMArrayIter =
-    reinterpret_cast<bool (*)(const ArrayData*, const MArrayIter&)>(
-      ArrayCommon::ReturnFalse
-    );
+
+  // ValidMArrayIter may be called on this array kind, because Escalate is a
+  // no-op.
+  static bool ValidMArrayIter(const ArrayData*, const MArrayIter&) {
+    return false;
+  }
   static bool AdvanceMArrayIter(ArrayData*, MArrayIter& fp);
-  static constexpr auto EscalateForSort =
-    reinterpret_cast<ArrayData* (*)(ArrayData*)>(
-      ArrayCommon::ReturnFirstArg
-    );
-  static constexpr auto Ksort =
-    reinterpret_cast<void (*)(ArrayData*, int, bool)>(
-      ArrayCommon::NoOp
-    );
-  static constexpr auto Sort =
-    reinterpret_cast<void (*)(ArrayData*, int, bool)>(
-      ArrayCommon::NoOp
-    );
-  static constexpr auto Asort =
-    reinterpret_cast<void (*)(ArrayData*, int, bool)>(
-      ArrayCommon::NoOp
-    );
-  static constexpr auto Uksort =
-    reinterpret_cast<bool (*)(ArrayData*, const Variant&)>(
-      ArrayCommon::ReturnTrue
-    );
-  static constexpr auto Usort =
-    reinterpret_cast<bool (*)(ArrayData*, const Variant&)>(
-      ArrayCommon::ReturnTrue
-    );
-  static constexpr auto Uasort =
-    reinterpret_cast<bool (*)(ArrayData*, const Variant&)>(
-      ArrayCommon::ReturnTrue
-    );
+  static ArrayData* EscalateForSort(ArrayData* ad) {
+    return ad;
+  }
+  static void Ksort(ArrayData*, int, bool) {}
+  static void Sort(ArrayData*, int, bool) {}
+  static void Asort(ArrayData*, int, bool) {}
+  static bool Uksort(ArrayData*, const Variant&) {
+    return true;
+  }
+  static bool Usort(ArrayData*, const Variant&) {
+    return true;
+  }
+  static bool Uasort(ArrayData*, const Variant&) {
+    return true;
+  }
   static ArrayData* PopOrDequeue(ArrayData*, Variant&);
   static constexpr auto Pop = &PopOrDequeue;
   static constexpr auto Dequeue = &PopOrDequeue;
@@ -134,26 +114,18 @@ struct EmptyArray {
   static ArrayData* NonSmartCopy(const ArrayData*);
   static ArrayData* ZSetInt(ArrayData* ad, int64_t k, RefData* v);
   static ArrayData* ZSetStr(ArrayData* ad, StringData* k, RefData* v);
-  static ArrayData* ZAppend(ArrayData* ad, RefData* v);
+  static ArrayData* ZAppend(ArrayData* ad, RefData* v, int64_t* key_ptr);
   static ArrayData* Append(ArrayData*, const Variant& v, bool copy);
   static ArrayData* AppendRef(ArrayData*, Variant& v, bool copy);
   static ArrayData* AppendWithRef(ArrayData*, const Variant& v, bool copy);
   static ArrayData* PlusEq(ArrayData*, const ArrayData* elems);
   static ArrayData* Merge(ArrayData*, const ArrayData* elems);
   static ArrayData* Prepend(ArrayData*, const Variant& v, bool copy);
-  static constexpr auto Renumber =
-    reinterpret_cast<void (*)(ArrayData*)>(
-      ArrayCommon::NoOp
-    );
+  static void Renumber(ArrayData*) {}
   static void OnSetEvalScalar(ArrayData*);
-  static constexpr auto Escalate =
-    reinterpret_cast<ArrayData* (*)(const ArrayData*)>(
-      ArrayCommon::ReturnFirstArg
-    );
-  static constexpr auto GetAPCHandle =
-    reinterpret_cast<APCHandle* (*)(const ArrayData*)>(
-      ArrayCommon::ReturnNull
-    );
+  static ArrayData* Escalate(const ArrayData* ad) {
+    return const_cast<ArrayData*>(ad);
+  }
 
 private:
   static std::pair<ArrayData*,TypedValue*> MakePacked(TypedValue);

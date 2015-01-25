@@ -16,20 +16,15 @@
 
 #include "hphp/runtime/vm/jit/extra-data.h"
 
-#include "hphp/runtime/ext/ext_continuation.h"
-#include "hphp/runtime/ext/asio/async_function_wait_handle.h"
 #include "hphp/runtime/vm/jit/ssa-tmp.h"
+#include "hphp/runtime/vm/jit/abi-x64.h"
 #include "hphp/util/text-util.h"
 
-namespace HPHP { namespace JIT {
-
-std::string LocalData::show() const {
-  return folly::to<std::string>(LocalId::show(), ',',
-                                typeSrc ? typeSrc->toString() : "null");
-}
+namespace HPHP { namespace jit {
 
 std::string NewStructData::show() const {
   std::ostringstream os;
+  os << offset << ',';
   auto delim = "";
   for (uint32_t i = 0; i < numKeys; i++) {
     os << delim << "\"" <<
@@ -38,36 +33,6 @@ std::string NewStructData::show() const {
     delim = ",";
   }
   return os.str();
-}
-
-const RawMemData::Info& RawMemData::info() const {
-  static const Info infos[] = {
-    {c_AsyncFunctionWaitHandle::stateOff(),
-                                  sz::byte,  JIT::Type::Int},
-    {c_AsyncFunctionWaitHandle::childOff(),
-                                  sz::qword, JIT::Type::Obj},
-    {c_AsyncFunctionWaitHandle::offsetOff(),
-                                  sz::dword, JIT::Type::Int},
-    {c_Continuation::offsetOff(), sz::dword, JIT::Type::Int},
-    {CONTOFF(m_index),            sz::qword, JIT::Type::Int},
-    {c_Continuation::stateOff(),  sz::byte,  JIT::Type::Int},
-    {StringData::sizeOff(),       sz::dword, JIT::Type::Int},
-    {Func::numParamsOff(),        sz::dword, JIT::Type::Int},
-  };
-  static_assert(sizeof infos / sizeof infos[0] == kNumTypes,
-                "Incorrect size of infos array");
-
-  always_assert(type < kNumTypes);
-  return infos[type];
-}
-
-std::string RawMemData::show() const {
-  switch (type) {
-#   define RAW_TYPE(name) case name: return #name;
-    RAW_MEM_DATA_TYPES
-#   undef RAW_TYPE
-  }
-  not_reached();
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -186,14 +151,22 @@ MAKE_DISPATCHER(EqualsDispatcher, bool, cseEqualsExtraImpl);
 MAKE_DISPATCHER(CloneDispatcher, IRExtraData*, cloneExtraImpl);
 MAKE_DISPATCHER(ShowDispatcher, std::string, showExtraImpl);
 
-} // namespace
-
-size_t cseHashExtra(Opcode opc, IRExtraData* data) {
-  return dispatchExtra<size_t,HashDispatcher>(opc, data);
 }
 
-bool cseEqualsExtra(Opcode opc, IRExtraData* data, IRExtraData* other) {
-  return dispatchExtra<bool,EqualsDispatcher>(opc, data, other);
+//////////////////////////////////////////////////////////////////////
+
+size_t cseHashExtra(Opcode opc, const IRExtraData* data) {
+  return dispatchExtra<size_t,HashDispatcher>(
+    opc, const_cast<IRExtraData*>(data));
+}
+
+bool cseEqualsExtra(
+  Opcode opc,
+  const IRExtraData* data,
+  const IRExtraData* other
+) {
+  return dispatchExtra<bool,EqualsDispatcher>(
+    opc, const_cast<IRExtraData*>(data), const_cast<IRExtraData*>(other));
 }
 
 IRExtraData* cloneExtra(Opcode opc, IRExtraData* data, Arena& a) {
@@ -205,4 +178,6 @@ std::string showExtra(Opcode opc, const IRExtraData* data) {
       const_cast<IRExtraData*>(data));
 }
 
-} }
+//////////////////////////////////////////////////////////////////////
+
+}}

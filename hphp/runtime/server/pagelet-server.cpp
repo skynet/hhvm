@@ -19,10 +19,11 @@
 #include "hphp/runtime/server/http-request-handler.h"
 #include "hphp/runtime/server/upload.h"
 #include "hphp/runtime/server/job-queue-vm-stack.h"
+#include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/ext/ext_server.h"
+#include "hphp/runtime/ext/server/ext_server.h"
 #include "hphp/util/job-queue.h"
 #include "hphp/util/lock.h"
 #include "hphp/util/logger.h"
@@ -209,7 +210,7 @@ String PageletTransport::getResults(
         long long nanosecs = (timeout_ms % 1000) * 1000000;
         if (!wait(seconds, nanosecs)) {
           code = -1;
-          return "";
+          return empty_string();
         }
       } else {
         wait();
@@ -291,7 +292,7 @@ struct PageletWorker
       } else {
         timeout = 0;
       }
-      HttpRequestHandler(timeout).handleRequest(job);
+      HttpRequestHandler(timeout).run(job);
       job->decRefCount();
     } catch (...) {
       Logger::Error("HttpRequestHandler leaked exceptions");
@@ -327,7 +328,7 @@ public:
 private:
   PageletTransport *m_job;
 };
-IMPLEMENT_OBJECT_ALLOCATION(PageletTask)
+IMPLEMENT_RESOURCE_ALLOCATION(PageletTask)
 
 ///////////////////////////////////////////////////////////////////////////////
 // implementing PageletServer
@@ -379,16 +380,16 @@ Resource PageletServer::TaskStart(
   {
     Lock l(s_dispatchMutex);
     if (!s_dispatcher) {
-      return null_resource;
+      return Resource();
     }
     if (RuntimeOption::PageletServerQueueLimit > 0 &&
         s_dispatcher->getQueuedJobs() >
         RuntimeOption::PageletServerQueueLimit) {
       pageletOverflowCounter->addValue(1);
-      return null_resource;
+      return Resource();
     }
   }
-  PageletTask *task = NEWOBJ(PageletTask)(url, headers, remote_host, post_data,
+  PageletTask *task = newres<PageletTask>(url, headers, remote_host, post_data,
                                           get_uploaded_files(), files,
                                           timeoutSeconds);
   Resource ret(task);
@@ -403,9 +404,10 @@ Resource PageletServer::TaskStart(
     }
 
     s_dispatcher->enqueue(job);
+    g_context->incrPageletTasksStarted();
     return ret;
   }
-  return null_resource;
+  return Resource();
 }
 
 int64_t PageletServer::TaskStatus(const Resource& task) {

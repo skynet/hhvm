@@ -34,8 +34,7 @@ extern const int64_t q_RescheduleWaitHandle$$QUEUE_NO_PENDING_IO;
  *
  * RescheduleWaitHandle is guaranteed to never finish immediately.
  */
-FORWARD_DECLARE_CLASS(RescheduleWaitHandle);
-class c_RescheduleWaitHandle : public c_WaitableWaitHandle {
+class c_RescheduleWaitHandle final : public c_WaitableWaitHandle {
  public:
   DECLARE_CLASS_NO_SWEEP(RescheduleWaitHandle)
 
@@ -45,25 +44,28 @@ class c_RescheduleWaitHandle : public c_WaitableWaitHandle {
   {}
   ~c_RescheduleWaitHandle() {}
 
-  void t___construct();
   static Object ti_create(int64_t queue, int priority);
 
  public:
   void run();
   String getName();
+  void enterContextImpl(context_idx_t ctx_idx);
   void exitContext(context_idx_t ctx_idx);
 
- protected:
-  void enterContextImpl(context_idx_t ctx_idx);
-
  private:
+  void setState(uint8_t state) { setKindState(Kind::Reschedule, state); }
   void initialize(uint32_t queue, uint32_t priority);
 
   uint32_t m_queue;
   uint32_t m_priority;
 
-  static const int8_t STATE_SCHEDULED = 3;
+  static const int8_t STATE_SCHEDULED = 2;
 };
+
+inline c_RescheduleWaitHandle* c_WaitHandle::asReschedule() {
+  assert(getKind() == Kind::Reschedule);
+  return static_cast<c_RescheduleWaitHandle*>(this);
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 }

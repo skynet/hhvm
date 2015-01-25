@@ -16,15 +16,16 @@
 
 #include "hphp/runtime/base/ini-setting.h"
 
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/hphp-system.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/zend-strtod.h"
 
 #include "hphp/runtime/base/ini-parser/zend-ini.h"
 
-#include "hphp/runtime/ext/ext_misc.h"
+#include "hphp/runtime/ext/std/ext_std_misc.h"
 #include "hphp/runtime/ext/extension.h"
 
 #include "hphp/util/lock.h"
@@ -40,6 +41,9 @@ namespace HPHP {
 const Extension* IniSetting::CORE = (Extension*)(-1);
 
 bool IniSetting::s_pretendExtensionsHaveNotBeenLoaded = false;
+
+bool IniSetting::s_config_is_a_constant = false;
+std::set<std::string> IniSetting::config_names_that_use_constants;
 
 const StaticString
   s_global_value("global_value"),
@@ -72,7 +76,7 @@ static std::string dynamic_to_std_string(const folly::dynamic& v) {
     case folly::dynamic::Type::BOOL:
       return std::to_string(v.asBool());
     case folly::dynamic::Type::DOUBLE:
-      return std::to_string(v.asDouble());
+      return convDblToStrWithPhpFormat(v.asDouble());
     case folly::dynamic::Type::INT64:
       return std::to_string(v.asInt());
     case folly::dynamic::Type::STRING:
@@ -84,7 +88,7 @@ static std::string dynamic_to_std_string(const folly::dynamic& v) {
 static Variant dynamic_to_variant(const folly::dynamic& v) {
   switch (v.type()) {
     case folly::dynamic::Type::NULLT:
-      return init_null_variant;
+      return init_null();
     case folly::dynamic::Type::BOOL:
       return v.asBool();
     case folly::dynamic::Type::DOUBLE:
@@ -109,7 +113,6 @@ static folly::dynamic variant_to_dynamic(const Variant& v) {
   switch (v.getType()) {
     case KindOfUninit:
     case KindOfNull:
-    default:
       return nullptr;
     case KindOfBoolean:
       return v.toBoolean();
@@ -122,13 +125,17 @@ static folly::dynamic variant_to_dynamic(const Variant& v) {
       return v.toString().data();
     case KindOfArray:
     case KindOfObject:
-    case KindOfResource:
+    case KindOfResource: {
       folly::dynamic ret = folly::dynamic::object;
       for (ArrayIter iter(v.toArray()); iter; ++iter) {
         ret.insert(variant_to_dynamic(iter.first()),
                    variant_to_dynamic(iter.second()));
       }
       return ret;
+    }
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
   not_reached();
 }
@@ -164,6 +171,17 @@ bool ini_on_update(const folly::dynamic& value, double& p) {
   return true;
 }
 
+bool ini_on_update(const folly::dynamic& value, char& p) {
+  INI_ASSERT_STR(value);
+  auto n = convert_bytes_to_long(str);
+  auto maxValue = 0x7FL;
+  if (n > maxValue || n < (- maxValue - 1)) {
+    return false;
+  }
+  p = n;
+  return true;
+}
+
 bool ini_on_update(const folly::dynamic& value, int16_t& p) {
   INI_ASSERT_STR(value);
   auto n = convert_bytes_to_long(str);
@@ -189,6 +207,17 @@ bool ini_on_update(const folly::dynamic& value, int32_t& p) {
 bool ini_on_update(const folly::dynamic& value, int64_t& p) {
   INI_ASSERT_STR(value);
   p = convert_bytes_to_long(str);
+  return true;
+}
+
+bool ini_on_update(const folly::dynamic& value, unsigned char& p) {
+  INI_ASSERT_STR(value);
+  auto n = convert_bytes_to_long(str);
+  auto mask = ~0xFFUL;
+  if (((uint64_t)n & mask)) {
+    return false;
+  }
+  p = n;
   return true;
 }
 
@@ -246,11 +275,33 @@ bool ini_on_update(const folly::dynamic& value, std::set<std::string>& p) {
   return true;
 }
 
+
+bool ini_on_update(const folly::dynamic& value, std::vector<std::string>& p) {
+  INI_ASSERT_ARR(value);
+  for (auto& v : value.values()) {
+    p.push_back(v.data());
+  }
+  return true;
+}
+
+bool ini_on_update(const folly::dynamic& value,
+                   std::map<std::string, std::string>& p) {
+  INI_ASSERT_ARR(value);
+  for (auto& pair : value.items()) {
+    p[pair.first.data()] = pair.second.data();
+  }
+  return true;
+}
+
 folly::dynamic ini_get(bool& p) {
   return p ? "1" : "";
 }
 
 folly::dynamic ini_get(double& p) {
+  return p;
+}
+
+folly::dynamic ini_get(char& p) {
   return p;
 }
 
@@ -263,6 +314,10 @@ folly::dynamic ini_get(int32_t& p) {
 }
 
 folly::dynamic ini_get(int64_t& p) {
+  return p;
+}
+
+folly::dynamic ini_get(unsigned char& p) {
   return p;
 }
 
@@ -286,6 +341,14 @@ folly::dynamic ini_get(String& p) {
   return p.data();
 }
 
+folly::dynamic ini_get(std::map<std::string, std::string>& p) {
+  folly::dynamic ret = folly::dynamic::object;
+  for (auto& pair : p) {
+    ret.insert(pair.first, pair.second);
+  }
+  return ret;
+}
+
 folly::dynamic ini_get(Array& p) {
   folly::dynamic ret = folly::dynamic::object;
   for (ArrayIter iter(p); iter; ++iter) {
@@ -299,6 +362,15 @@ folly::dynamic ini_get(std::set<std::string>& p) {
   folly::dynamic ret = folly::dynamic::object;
   for (auto& s : p) {
     ret.push_back(s);
+  }
+  return ret;
+}
+
+folly::dynamic ini_get(std::vector<std::string>& p) {
+  folly::dynamic ret = folly::dynamic::object;
+  auto idx = 0;
+  for (auto& s : p) {
+    ret.insert(idx++, s);
   }
   return ret;
 }
@@ -335,11 +407,11 @@ void IniSetting::ParserCallback::onPopEntry(
   }
 }
 
-void IniSetting::ParserCallback::makeArray(Variant &hash,
-                                           const std::string &offset,
-                                           const std::string &value) {
+void IniSetting::ParserCallback::makeArray(Variant& hash,
+                                           const std::string& offset,
+                                           const std::string& value) {
   assert(!offset.empty());
-  Variant val = strongBind(hash);
+  Variant val(Variant::StrongBind{}, hash);
   auto start = offset.c_str();
   auto p = start;
   bool last = false;
@@ -380,9 +452,9 @@ void IniSetting::ParserCallback::onVar(std::string &result,
     result = curval;
     return;
   }
-  char *value = getenv(name.data());
-  if (value) {
-    result = std::string(value);
+  String value = g_context->getenv(name);
+  if (!value.isNull()) {
+    result = value.toCppString();
     return;
   }
   result.clear();
@@ -449,6 +521,12 @@ void IniSetting::SystemParserCallback::onLabel(const std::string &name,
 void IniSetting::SystemParserCallback::onEntry(
     const std::string &key, const std::string &value, void *arg) {
   assert(!key.empty());
+  // onConstant will always be called before onEntry, so we can check
+  // here
+  if (IniSetting::s_config_is_a_constant) {
+    IniSetting::config_names_that_use_constants.insert(key);
+    IniSetting::s_config_is_a_constant = false;
+  }
   auto& arr = *(IniSetting::Map*)arg;
   arr[key] = value;
 }
@@ -458,6 +536,10 @@ void IniSetting::SystemParserCallback::onPopEntry(const std::string& key,
                                                   const std::string& offset,
                                                   void* arg) {
   assert(!key.empty());
+  if (IniSetting::s_config_is_a_constant) {
+    IniSetting::config_names_that_use_constants.insert(key);
+    IniSetting::s_config_is_a_constant = false;
+  }
   auto& arr = *(IniSetting::Map*)arg;
   auto* ptr = arr.get_ptr(key);
   if (!ptr || !ptr->isObject()) {
@@ -470,9 +552,11 @@ void IniSetting::SystemParserCallback::onPopEntry(const std::string& key,
     // Find the highest index
     auto max = 0;
     for (auto &a : ptr->keys()) {
-      if (a.isInt() && a >= max) {
-        max = a.asInt() + 1;
-      }
+      try {
+        if (a.asInt() >= max) {
+          max = a.asInt() + 1;
+        }
+      } catch (std::range_error const& e) { /* not an int */ }
     }
     (*ptr)[std::to_string(max)] = value;
   }
@@ -501,6 +585,7 @@ void IniSetting::SystemParserCallback::makeArray(Map &hash,
 }
 void IniSetting::SystemParserCallback::onConstant(std::string &result,
                                                   const std::string &name) {
+  IniSetting::s_config_is_a_constant = true;
   if (MemoryManager::TlsWrapper::isNull()) {
     // We can't load constants before the memory manger is up, so lets just
     // pretend they are strings I guess
@@ -521,6 +606,8 @@ static Mutex s_mutex;
 Variant IniSetting::FromString(const String& ini, const String& filename,
                                bool process_sections, int scanner_mode) {
   Lock lock(s_mutex); // ini parser is not thread-safe
+  // We are parsing something new, so reset this flag
+  s_config_is_a_constant = false;
   auto ini_cpp = ini.toCppString();
   auto filename_cpp = filename.toCppString();
   if (process_sections) {
@@ -544,6 +631,8 @@ Variant IniSetting::FromString(const String& ini, const String& filename,
 IniSetting::Map IniSetting::FromStringAsMap(const std::string& ini,
                                             const std::string& filename) {
   Lock lock(s_mutex); // ini parser is not thread-safe
+  // We are parsing something new, so reset this flag
+  s_config_is_a_constant = false;
   SystemParserCallback cb;
   Map ret = IniSetting::Map::object;
   zend_parse_ini_string(ini, filename, NormalScanner, cb, &ret);
@@ -569,11 +658,11 @@ static SettingMap s_system_settings;
 // Changed during the course of the request
 static IMPLEMENT_THREAD_LOCAL(SettingMap, s_saved_defaults);
 
-class IniSettingExtension : public Extension {
+class IniSettingExtension final : public Extension {
 public:
   IniSettingExtension() : Extension("hhvm.ini", NO_EXTENSION_VERSION_YET) {}
 
-  void requestShutdown() {
+  void requestShutdown() override {
     // Put all the defaults back to the way they were before any ini_set()
     for (auto &item : *s_saved_defaults) {
       IniSetting::SetUser(item.first, item.second, IniSetting::FollyDynamic());
@@ -670,9 +759,32 @@ static bool ini_set(const std::string& name, const folly::dynamic& value,
   return cb->updateCallback(value);
 }
 
+bool IniSetting::FillInConstant(const std::string& name,
+                                const folly::dynamic& value,
+                                FollyDynamic) {
+
+  if (config_names_that_use_constants.find(name) ==
+      config_names_that_use_constants.end()) {
+    return false;
+  }
+  return IniSetting::Set(name, value, FollyDynamic());
+}
+
 bool IniSetting::Set(const std::string& name, const folly::dynamic& value,
                      FollyDynamic) {
-  s_system_settings.insert(make_pair(name, value));
+  // Need to make sure to update the value if the pair exists already
+  // A general insert(make_pair) won't actually update new values.
+  bool found = false;
+  for (auto& pair : s_system_settings) {
+    if (pair.first == name) {
+      pair.second = value;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    s_system_settings.insert(make_pair(name, value));
+  }
   return ini_set(name, value, PHP_INI_SET_EVERY);
 }
 
@@ -703,6 +815,15 @@ bool IniSetting::ResetSystemDefault(const std::string& name) {
     return false;
   }
   return ini_set(name, it->second, PHP_INI_SET_EVERY);
+}
+
+bool IniSetting::GetMode(const std::string& name, Mode& mode) {
+  auto cb = get_callback(name);
+  if (!cb) {
+    return false;
+  }
+  mode = cb->mode;
+  return true;
 }
 
 Array IniSetting::GetAll(const String& ext_name, bool details) {

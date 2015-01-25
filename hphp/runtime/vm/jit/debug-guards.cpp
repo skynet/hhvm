@@ -21,7 +21,7 @@
 #include "hphp/runtime/vm/jit/types.h"
 #include "hphp/runtime/vm/jit/back-end-x64.h" // XXX Layering violation.
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 static constexpr size_t dbgOff =
   offsetof(ThreadInfo, m_reqInjectionData) +
@@ -37,12 +37,12 @@ void addDbgGuardImpl(SrcKey sk, SrcRec* srcRec) {
   }
   TCA dbgGuard = mcg->code.main().frontier();
 
-  mcg->backEnd().addDbgGuard(mcg->code.main(), mcg->code.stubs(), sk, dbgOff);
+  mcg->backEnd().addDbgGuard(mcg->code.main(), mcg->code.cold(), sk, dbgOff);
 
   // Emit a jump to the actual code
   //
   // XXX kJmpLen access here is a layering violation.
-  mcg->backEnd().prepareForSmash(mcg->code.main(), X64::kJmpLen);
+  mcg->backEnd().prepareForSmash(mcg->code.main(), x64::kJmpLen);
   TCA dbgBranchGuardSrc = mcg->code.main().frontier();
   mcg->backEnd().emitSmashableJump(mcg->code.main(), realCode, CC_None);
 

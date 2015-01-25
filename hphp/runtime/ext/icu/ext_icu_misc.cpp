@@ -1,5 +1,7 @@
 #include "hphp/runtime/ext/icu/icu.h"
 
+#include "hphp/runtime/base/array-init.h"
+
 #include <unicode/uidna.h>
 #include <unicode/parseerr.h>
 
@@ -98,7 +100,7 @@ static Variant doIdnTranslateUTS46(const String& domain, int64_t options,
   SCOPE_EXIT{ uidna_close(idna); };
   String result(255, ReserveString); // 255 == max length possible
   int32_t len;
-  auto capacity = result.get()->capacity();
+  auto capacity = result.capacity() + 1;
   if (toUtf8) {
     len = uidna_nameToUnicodeUTF8(idna, domain.c_str(), domain.size(),
                                   result.bufferSlice().ptr, capacity,
@@ -125,7 +127,7 @@ static Variant doIdnTranslateUTS46(const String& domain, int64_t options,
   arr.set(s_result, result);
   arr.set(s_isTransitionalDifferent, info.isTransitionalDifferent);
   arr.set(s_errors, (long)info.errors);
-  retInfo = arr.create();
+  retInfo = arr.toVariant();
   return result;
 
 #else

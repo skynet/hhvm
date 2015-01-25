@@ -22,31 +22,35 @@ namespace HPHP {
 //////////////////////////////////////////////////////////////////////
 
 // initialize the cache
-static EnumCache cache;
+static EnumCache s_cache;
 
-const StaticString enumName("Enum");
+const StaticString s_enumName("Enum");
 
-const EnumCache::EnumValues* EnumCache::getValues(
-    const Class* klass,
-    bool recurse) {
-  if (klass->classVecLen() == 1 ||
-      !enumName.get()->same(klass->classVec()[0]->name())) {
+const EnumCache::EnumValues* EnumCache::getValues(const Class* klass,
+                                                  bool recurse) {
+  if (UNLIKELY(klass->classVecLen() == 1 ||
+               !s_enumName.get()->same(klass->classVec()[0]->name()))) {
     std::string msg;
     msg += klass->name()->data();
     msg += " must derive from Enum";
     EnumCache::failLookup(msg);
   }
-  return cache.getEnumValues(klass, recurse);
+  return s_cache.getEnumValues(klass, recurse);
+}
+
+const EnumCache::EnumValues* EnumCache::getValuesBuiltin(const Class* klass) {
+  assert(isEnum(klass));
+  return s_cache.getEnumValues(klass, false);
 }
 
 void EnumCache::deleteValues(const Class* klass) {
   // it's unlikely a class is in the cache so check first
   // without write lock
-  if (cache.getEnumValuesIfDefined(getKey(klass, false)) != nullptr) {
-    cache.deleteEnumValues(getKey(klass, false));
+  if (s_cache.getEnumValuesIfDefined(getKey(klass, false)) != nullptr) {
+    s_cache.deleteEnumValues(getKey(klass, false));
   }
-  if (cache.getEnumValuesIfDefined(getKey(klass, true)) != nullptr) {
-    cache.deleteEnumValues(getKey(klass, true));
+  if (s_cache.getEnumValuesIfDefined(getKey(klass, true)) != nullptr) {
+    s_cache.deleteEnumValues(getKey(klass, true));
   }
 }
 
@@ -59,15 +63,17 @@ EnumCache::~EnumCache() {
   m_enumValuesMap.clear();
 }
 
-const EnumCache::EnumValues* EnumCache::loadEnumValues(
-    const Class* klass,
-    bool recurse) {
+const EnumCache::EnumValues* EnumCache::loadEnumValues(const Class* klass,
+                                                       bool recurse) {
   auto const numConstants = klass->numConstants();
   size_t foundOnClass = 0;
   Array values;
   Array names;
   auto const consts = klass->constants();
   for (size_t i = 0; i < numConstants; i++) {
+    if (consts[i].m_val.isAbstractConst()) {
+      continue;
+    }
     if (consts[i].m_class == klass) foundOnClass++;
     else if (!recurse) continue;
     Cell value = consts[i].m_val;
@@ -85,8 +91,8 @@ const EnumCache::EnumValues* EnumCache::loadEnumValues(
       msg += " enum can only contain static string and int values";
       EnumCache::failLookup(msg);
     }
-    values.set(consts[i].nameStr(), cellAsCVarRef(value));
-    names.set(cellAsCVarRef(value), VarNR(consts[i].name()));
+    values.set(StrNR(consts[i].m_name), cellAsCVarRef(value));
+    names.set(cellAsCVarRef(value), VarNR(consts[i].m_name));
   }
   if (UNLIKELY(foundOnClass == 0)) {
     std::string msg;
@@ -112,7 +118,7 @@ const EnumCache::EnumValues* EnumCache::loadEnumValues(
 }
 
 const EnumCache::EnumValues* EnumCache::getEnumValuesIfDefined(
-    intptr_t key) const {
+  intptr_t key) const {
   EnumValuesMap::const_accessor acc;
   if (m_enumValuesMap.find(acc, key)) {
     return acc->second;
@@ -120,9 +126,8 @@ const EnumCache::EnumValues* EnumCache::getEnumValuesIfDefined(
   return nullptr;
 }
 
-const EnumCache::EnumValues* EnumCache::getEnumValues(
-    const Class* klass,
-    bool recurse) {
+const EnumCache::EnumValues* EnumCache::getEnumValues(const Class* klass,
+                                                      bool recurse) {
   const EnumCache::EnumValues* values =
       getEnumValuesIfDefined(getKey(klass, recurse));
   if (values == nullptr) {

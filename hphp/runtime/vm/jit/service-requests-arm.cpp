@@ -16,7 +16,7 @@
 
 #include "hphp/vixl/a64/macro-assembler-a64.h"
 
-#include "folly/Optional.h"
+#include <folly/Optional.h>
 
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/vm/jit/abi-arm.h"
@@ -24,31 +24,34 @@
 #include "hphp/runtime/vm/jit/back-end.h"
 #include "hphp/runtime/vm/jit/service-requests-inline.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/vasm-print.h"
 
-namespace HPHP { namespace JIT { namespace ARM {
+namespace HPHP { namespace jit { namespace arm {
 
 using namespace vixl;
 
 namespace {
 
-void emitBindJ(CodeBlock& cb, CodeBlock& stubs, SrcKey dest,
-               JIT::ConditionCode cc, ServiceRequest req) {
+void emitBindJ(CodeBlock& cb, CodeBlock& frozen, SrcKey dest,
+               ConditionCode cc, ServiceRequest req, TransFlags trflags) {
 
   TCA toSmash = cb.frontier();
-  if (cb.base() == stubs.base()) {
+  if (cb.base() == frozen.base()) {
     // This is just to reserve space. We'll overwrite with the real dest later.
     mcg->backEnd().emitSmashableJump(cb, toSmash, cc);
   }
 
   mcg->setJmpTransID(toSmash);
 
-  TCA sr = (req == JIT::REQ_BIND_JMP
-            ? emitEphemeralServiceReq(mcg->code.stubs(), mcg->getFreeStub(),
-                                      req, toSmash, dest.offset())
-            : emitServiceReq(mcg->code.stubs(), req, toSmash, dest.offset()));
+  TCA sr = emitEphemeralServiceReq(frozen,
+                                   mcg->getFreeStub(frozen,
+                                                    &mcg->cgFixups()),
+                                   req, toSmash,
+                                   dest.toAtomicInt(),
+                                   trflags.packed);
 
   MacroAssembler a { cb };
-  if (cb.base() == stubs.base()) {
+  if (cb.base() == frozen.base()) {
     UndoMarker um {cb};
     cb.setFrontier(toSmash);
     mcg->backEnd().emitSmashableJump(cb, sr, cc);
@@ -62,20 +65,22 @@ void emitBindJ(CodeBlock& cb, CodeBlock& stubs, SrcKey dest,
 
 //////////////////////////////////////////////////////////////////////
 
-TCA emitServiceReqWork(CodeBlock& cb, TCA start, bool persist, SRFlags flags,
+TCA emitServiceReqWork(CodeBlock& cb, TCA start, SRFlags flags,
                        ServiceRequest req, const ServiceReqArgVec& argv) {
   MacroAssembler a { cb };
+
+  const bool persist = flags & SRFlags::Persist;
 
   folly::Optional<CodeCursor> maybeCc = folly::none;
   if (start != cb.frontier()) {
     maybeCc.emplace(cb, start);
   }
 
-  // There are 6 instructions after the argument-shuffling, and they're all
+  // There are 4 instructions after the argument-shuffling, and they're all
   // single instructions (i.e. not macros). There are up to 4 instructions per
   // argument (it may take up to 4 instructions to move a 64-bit immediate into
   // a register).
-  constexpr auto kMaxStubSpace = 6 * vixl::kInstructionSize +
+  constexpr auto kMaxStubSpace = 4 * vixl::kInstructionSize +
     (4 * maxArgReg()) * vixl::kInstructionSize;
 
   for (auto i = 0; i < argv.size(); ++i) {
@@ -92,11 +97,6 @@ TCA emitServiceReqWork(CodeBlock& cb, TCA start, bool persist, SRFlags flags,
     }
   }
 
-  // Save VM regs
-  a.     Str   (rVmFp, rGContextReg[offsetof(ExecutionContext, m_fp)]);
-  a.     Str   (rVmSp, rGContextReg[offsetof(ExecutionContext, m_stack) +
-                                    Stack::topOfStackOffset()]);
-
   if (persist) {
     a.   Mov   (rAsm, 0);
   } else {
@@ -105,11 +105,7 @@ TCA emitServiceReqWork(CodeBlock& cb, TCA start, bool persist, SRFlags flags,
   a.     Mov   (argReg(0), req);
 
   a.     Ldr   (rLinkReg, MemOperand(sp, 16, PostIndex));
-  if (flags & SRFlags::JmpInsteadOfRet) {
-    a.   Br    (rLinkReg);
-  } else {
-    a.   Ret   ();
-  }
+  a.     Ret   ();
   a.     Brk   (0);
 
   if (!persist) {
@@ -122,98 +118,13 @@ TCA emitServiceReqWork(CodeBlock& cb, TCA start, bool persist, SRFlags flags,
   return start;
 }
 
-void emitBindJmp(CodeBlock& cb, CodeBlock& stubs, SrcKey dest) {
-  emitBindJ(cb, stubs, dest, JIT::CC_None, REQ_BIND_JMP);
+void emitBindJmp(CodeBlock& cb, CodeBlock& frozen, SrcKey dest) {
+  emitBindJ(cb, frozen, dest, jit::CC_None, REQ_BIND_JMP, TransFlags{});
 }
 
-void emitBindJcc(CodeBlock& cb, CodeBlock& stubs, JIT::ConditionCode cc,
+void emitBindJcc(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
                  SrcKey dest) {
-  emitBindJ(cb, stubs, dest, cc, REQ_BIND_JCC);
+  emitBindJ(cb, frozen, dest, cc, REQ_BIND_JCC, TransFlags{});
 }
-
-void emitBindSideExit(CodeBlock& cb, CodeBlock& stubs, SrcKey dest,
-                      JIT::ConditionCode cc) {
-  emitBindJ(cb, stubs, dest, cc, REQ_BIND_SIDE_EXIT);
-}
-
-//////////////////////////////////////////////////////////////////////
-
-int32_t emitNativeImpl(CodeBlock& cb, const Func* func) {
-
-  BuiltinFunction builtinFuncPtr = func->builtinFuncPtr();
-
-  MacroAssembler a { cb };
-  a.  Mov  (argReg(0), rVmFp);
-  if (mcg->fixupMap().eagerRecord(func)) {
-    a.Mov  (rAsm, func->getEntry());
-    a.Str  (rAsm, rGContextReg[offsetof(ExecutionContext, m_pc)]);
-    a.Str  (rVmFp, rGContextReg[offsetof(ExecutionContext, m_fp)]);
-    a.Str  (rVmSp, rGContextReg[offsetof(ExecutionContext, m_stack) +
-                                Stack::topOfStackOffset()]);
-  }
-  auto syncPoint = emitCall(a, CppCall(builtinFuncPtr));
-
-  Offset pcOffset = 0;
-  Offset stackOff = func->numLocals();
-  mcg->fixupMap().recordSyncPoint(syncPoint, pcOffset, stackOff);
-
-  int nLocalCells = func->numSlotsInFrame();
-  a.  Ldr  (rVmFp, rVmFp[AROFF(m_sfp)]);
-
-  return sizeof(ActRec) + cellsToBytes(nLocalCells - 1);
-}
-
-int32_t emitBindCall(CodeBlock& mainCode, CodeBlock& stubsCode,
-                  SrcKey srcKey, const Func* funcd, int numArgs) {
-  if (isNativeImplCall(funcd, numArgs)) {
-    MacroAssembler a { mainCode };
-
-    // We need to store the return address into the AR, but we don't know it
-    // yet. Write out a mov instruction (two instructions, under the hood) with
-    // a placeholder address, and we'll overwrite it later.
-    auto toOverwrite = mainCode.frontier();
-    a.    Mov  (rAsm, toOverwrite);
-    a.    Str  (rAsm, rVmSp[cellsToBytes(numArgs) + AROFF(m_savedRip)]);
-
-    emitRegGetsRegPlusImm(a, rVmFp, rVmSp, cellsToBytes(numArgs));
-    emitCheckSurpriseFlagsEnter(mainCode, stubsCode, true, mcg->fixupMap(),
-                                Fixup(0, numArgs));
-    // rVmSp is already correctly adjusted, because there's no locals other than
-    // the arguments passed.
-
-    auto retval = emitNativeImpl(mainCode, funcd);
-    {
-      auto realRetAddr = mainCode.frontier();
-      // Go back and overwrite with the proper return address.
-      CodeCursor cc(mainCode, toOverwrite);
-      a.  Mov  (rAsm, realRetAddr);
-    }
-
-    return retval;
-  }
-
-  MacroAssembler a { mainCode };
-  emitRegGetsRegPlusImm(a, rStashedAR, rVmSp, cellsToBytes(numArgs));
-
-  ReqBindCall* req = mcg->globalData().alloc<ReqBindCall>();
-
-  auto toSmash = mainCode.frontier();
-  mcg->backEnd().emitSmashableCall(mainCode, stubsCode.frontier());
-
-  MacroAssembler astubs { stubsCode };
-  astubs.  Mov  (serviceReqArgReg(1), rStashedAR);
-  // Put return address into pre-live ActRec, and restore the saved one.
-  emitStoreRetIntoActRec(astubs);
-
-  emitServiceReq(stubsCode, REQ_BIND_CALL, req);
-
-  req->m_toSmash = toSmash;
-  req->m_nArgs = numArgs;
-  req->m_sourceInstr = srcKey;
-  req->m_isImmutable = (bool)funcd;
-
-  return 0;
-}
-
 
 }}}

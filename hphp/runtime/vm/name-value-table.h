@@ -19,7 +19,7 @@
 
 #include <boost/noncopyable.hpp>
 
-#include "folly/Bits.h"
+#include <folly/Bits.h>
 
 #include "hphp/runtime/base/complex-types.h"
 
@@ -30,27 +30,27 @@ namespace HPHP {
 struct ActRec;
 
 /*
- * This class implements a name to TypedValue map.  Basically a
- * hashtable from StringData* to TypedValue.
+ * This class implements a name to TypedValue map.  Basically a hashtable from
+ * StringData* to TypedValue.
  *
- * This is for use in variable environments in bytecode.cpp, and is
- * also used for the global variable environment ($GLOBALS via
- * NameValueTableWrapper).
+ * This is for use in variable environments in bytecode.cpp, and is also used
+ * for the global variable environment ($GLOBALS via GlobalsArray).
  *
- * The table may be optionally attached to an ActRec, in which case
- * it will contain a KindOfNamedLocal TypedValue per every named local
- * defined in ActRec's function. This is to keep storage for locals in
- * functions with a VarEnv in their normal location, but still make them
- * accessible by name through this table.
+ * The table may be optionally attached to an ActRec, in which case it will
+ * contain a kNamedLocalDataType TypedValue per every named local defined in
+ * ActRec's function.  This is to keep storage for locals in functions with a
+ * VarEnv in their normal location, but still make them accessible by name
+ * through this table.
  */
 struct NameValueTable : private boost::noncopyable {
   struct Iterator {
     explicit Iterator(const NameValueTable* tab);
+    static Iterator getLast(const NameValueTable* tab);
     static Iterator getEnd(const NameValueTable* tab);
 
     /*
      * The following two constructors are primarily for using this with
-     * the ArrayData interface (see NameValueTableWrapper), which
+     * the ArrayData interface (see GlobalsArray), which
      * expects iterators to be represented by a ssize_t.
      *
      * The constructor taking `pos' must be given a value previously
@@ -98,9 +98,9 @@ struct NameValueTable : private boost::noncopyable {
   ~NameValueTable();
 
   /**
-   * Suspend locals into an in-continuation ActRec.
+   * Suspend locals into an in-resumable ActRec.
    */
-  void suspend(ActRec* oldFP, ActRec* newFP);
+  void suspend(const ActRec* oldFP, ActRec* newFP);
 
   /**
    * Attach to a new ActRec and populate its locals with TypedValues stored
@@ -172,11 +172,10 @@ private:
   Elm* findElm(const StringData* name) const;
 
 private:
-  ActRec* m_fp;
-  // Power of two sized hashtable.
-  Elm* m_table;
-  uint32_t m_tabMask;
-  uint32_t m_elms;
+  ActRec* m_fp{nullptr};
+  Elm* m_table{nullptr}; // Power of two sized hashtable.
+  uint32_t m_tabMask{0};
+  uint32_t m_elms{0};
 };
 
 //////////////////////////////////////////////////////////////////////

@@ -79,7 +79,6 @@ struct ProfileDump {
     m_numDumps = 1;
     auto &current = m_currentlyAllocated[trace];
     current -= size;
-    assert(current.m_count >= 0 && current.m_bytes >= 0);
   }
 
   std::string toPProfFormat() const;
@@ -140,8 +139,8 @@ struct ProfileController {
   static bool isTracking();
   static bool isProfiling();
   static ProfileType profileType();
-private:
-  static void cleanup(const std::unique_lock<std::mutex>& lock);
+
+  static void enqueueOrphanedUnit(const Unit*);
 };
 
 }

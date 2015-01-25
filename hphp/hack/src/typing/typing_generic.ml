@@ -8,11 +8,10 @@
  *
  *)
 
-open Utils
-open Silent
 open Typing_defs
 
 module Env = Typing_env
+module ShapeMap = Nast.ShapeMap
 
 
 (* Module checking if a type is generic, I like to use an exception for this sort
@@ -31,15 +30,18 @@ end = struct
   and ty_ = function
     | Tgeneric ("this", ty) -> ty_opt ty
     | Tgeneric (x, _) -> raise (Found x)
-    | Tanon _
+    | Tanon _ | Taccess _
     | Tany | Tmixed | Tprim _ -> ()
-    | Tarray (_, ty1, ty2) ->
+    | Tarray (ty1, ty2) ->
         ty_opt ty1; ty_opt ty2
     | Tvar _ -> () (* Expansion got rid of Tvars ... *)
     | Toption x -> ty x
     | Tfun fty ->
         List.iter ty (List.map snd fty.ft_params);
-        ty fty.ft_ret
+        ty fty.ft_ret;
+        (match fty.ft_arity with
+          | Fvariadic (_min, (_name, var_ty)) -> ty var_ty
+          | _ -> ())
     | Tabstract (_, tyl, x) ->
         List.iter ty tyl; ty_opt x
     | Tapply (_, tyl)
@@ -47,7 +49,7 @@ end = struct
     | Tunresolved tyl -> List.iter ty tyl
     | Tobject -> ()
     | Tshape fdm ->
-        SMap.iter (fun _ v -> ty v) fdm
+        ShapeMap.iter (fun _ v -> ty v) fdm
 
   and ty_opt = function None -> () | Some x -> ty x
 
@@ -55,19 +57,19 @@ end = struct
 
 end
 
-let rename env old_name new_name ty_to_rename = 
+let rename env old_name new_name ty_to_rename =
   let rec ty env (r, t) = (match t with
-    | Tgeneric (x, ty) -> 
+    | Tgeneric (x, ty) ->
         let name = if x = old_name then new_name else x in
         let env, ty = ty_opt env ty in
         env, (r, Tgeneric (name, ty))
     | Tanon _
     | Tany | Tmixed | Tprim _-> env, (r, t)
-    | Tarray (local, ty1, ty2) ->
+    | Tarray (ty1, ty2) ->
         let env, ty1 = ty_opt env ty1 in
         let env, ty2 = ty_opt env ty2 in
-        env, (r, Tarray (local, ty1, ty2))
-    | Tvar n -> 
+        env, (r, Tarray (ty1, ty2))
+    | Tvar n ->
         let env, t = Env.get_type env n in
         let n' = Env.fresh() in
         let env = Env.rename env n n' in
@@ -83,17 +85,25 @@ let rename env old_name new_name ty_to_rename =
           env, (s_opt, t)::params
         ) fty.ft_params (env, []) in
         let env, ret = ty env fty.ft_ret in
+        let env, arity = match fty.ft_arity with
+          | Fvariadic (min, (s_opt, t)) ->
+            let env, t = ty env t in
+            env, Fvariadic (min, (s_opt, t))
+          | x -> env, x
+        in
         env, (r, Tfun { fty with
+          ft_arity = arity;
           ft_params = params;
           ft_ret = ret;
         })
-    | Tabstract (id, l, x) -> 
-        let env, tyl = tyl env l in
+    | Tabstract (id, l, x) ->
+        let env, l = tyl env l in
         let env, x = ty_opt env x in
         env, (r, Tabstract (id, l, x))
-    | Tapply (id, l) -> 
+    | Tapply (id, l) ->
         let env, l = tyl env l in
         env, (r, Tapply(id, l))
+    | Taccess (_, _, _) as x -> env, (r, x)
     | Ttuple l ->
         let env, l = tyl env l in
         env, (r, Ttuple l)
@@ -101,16 +111,16 @@ let rename env old_name new_name ty_to_rename =
         let env, l = tyl env l in
         env, (r, Tunresolved l)
     | Tobject -> env, (r, Tobject)
-    | Tshape fdm -> 
-        let env, fdm = SMap.fold (fun k v (env, fdm) ->
+    | Tshape fdm ->
+        let env, fdm = ShapeMap.fold (fun k v (env, fdm) ->
           let env, v = ty env v in
-          env, SMap.add k v fdm
-        ) fdm (env, SMap.empty) in
+          env, ShapeMap.add k v fdm
+        ) fdm (env, ShapeMap.empty) in
         env, (r, Tshape fdm ))
 
-  and ty_opt env = function 
-    | None -> env, None 
-    | Some x -> 
+  and ty_opt env = function
+    | None -> env, None
+    | Some x ->
         let env, x = ty env x in
         env, Some x
 
@@ -129,6 +139,6 @@ let no_generic p local_var_id env =
   let ty = Typing_expand.fully_expand env ty in
   match IsGeneric.ty ty with
   | None -> env
-  | Some _ when !is_silent_mode -> env
-  | Some x -> error p ("This static variable cannot use the parameter "^
-                       x^".")
+  | Some x ->
+      Errors.generic_static p x;
+      env

@@ -37,6 +37,8 @@ clearstatcache();
 
 echo "\n--- Done ---";
 ?>
+
+<?php error_reporting(0); ?>
 <?php
 $file_path = dirname(__FILE__);
 rmdir("$file_path/lstat_stat_variation1a");

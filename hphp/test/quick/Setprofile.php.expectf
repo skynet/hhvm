@@ -582,15 +582,15 @@ array(3) {
     object(Exception)#1 (7) {
       ["message":protected]=>
       string(4) "test"
+      ["string":"Exception":private]=>
+      string(0) ""
       ["code":protected]=>
       int(0)
-      ["previous":protected]=>
-      NULL
       ["file":protected]=>
       string(%d) "%s"
       ["line":protected]=>
       int(16)
-      ["trace":protected]=>
+      ["trace":"Exception":private]=>
       array(2) {
         [0]=>
         array(4) {
@@ -617,8 +617,8 @@ array(3) {
           }
         }
       }
-      ["inited":"Exception":private]=>
-      bool(true)
+      ["previous":"Exception":private]=>
+      NULL
     }
   }
 }
@@ -640,17 +640,13 @@ array(3) {
   [1]=>
   string(3) "gen"
   [2]=>
-  array(1) {
-    ["return"]=>
-    object(Continuation)#2 (0) {
-    }
-  }
+  NULL
 }
 array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(20) "Continuation::rewind"
+  string(17) "Generator::rewind"
   [2]=>
   array(1) {
     ["args"]=>
@@ -662,7 +658,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(18) "Continuation::next"
+  string(15) "Generator::next"
   [2]=>
   array(1) {
     ["args"]=>
@@ -694,7 +690,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(18) "Continuation::next"
+  string(15) "Generator::next"
   [2]=>
   array(1) {
     ["return"]=>
@@ -705,7 +701,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(20) "Continuation::rewind"
+  string(17) "Generator::rewind"
   [2]=>
   array(1) {
     ["return"]=>
@@ -716,7 +712,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(19) "Continuation::valid"
+  string(16) "Generator::valid"
   [2]=>
   array(1) {
     ["args"]=>
@@ -728,7 +724,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(19) "Continuation::valid"
+  string(16) "Generator::valid"
   [2]=>
   array(1) {
     ["return"]=>
@@ -739,7 +735,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(21) "Continuation::current"
+  string(18) "Generator::current"
   [2]=>
   array(1) {
     ["args"]=>
@@ -751,7 +747,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(21) "Continuation::current"
+  string(18) "Generator::current"
   [2]=>
   array(1) {
     ["return"]=>
@@ -762,7 +758,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(18) "Continuation::next"
+  string(15) "Generator::next"
   [2]=>
   array(1) {
     ["args"]=>
@@ -794,7 +790,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(18) "Continuation::next"
+  string(15) "Generator::next"
   [2]=>
   array(1) {
     ["return"]=>
@@ -805,7 +801,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(19) "Continuation::valid"
+  string(16) "Generator::valid"
   [2]=>
   array(1) {
     ["args"]=>
@@ -817,7 +813,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(19) "Continuation::valid"
+  string(16) "Generator::valid"
   [2]=>
   array(1) {
     ["return"]=>
@@ -828,7 +824,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(21) "Continuation::current"
+  string(18) "Generator::current"
   [2]=>
   array(1) {
     ["args"]=>
@@ -840,7 +836,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(21) "Continuation::current"
+  string(18) "Generator::current"
   [2]=>
   array(1) {
     ["return"]=>
@@ -851,7 +847,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(18) "Continuation::next"
+  string(15) "Generator::next"
   [2]=>
   array(1) {
     ["args"]=>
@@ -877,13 +873,16 @@ array(3) {
   [1]=>
   string(3) "gen"
   [2]=>
-  NULL
+  array(1) {
+    ["return"]=>
+    NULL
+  }
 }
 array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(18) "Continuation::next"
+  string(15) "Generator::next"
   [2]=>
   array(1) {
     ["return"]=>
@@ -894,7 +893,7 @@ array(3) {
   [0]=>
   string(5) "enter"
   [1]=>
-  string(19) "Continuation::valid"
+  string(16) "Generator::valid"
   [2]=>
   array(1) {
     ["args"]=>
@@ -906,7 +905,7 @@ array(3) {
   [0]=>
   string(4) "exit"
   [1]=>
-  string(19) "Continuation::valid"
+  string(16) "Generator::valid"
   [2]=>
   array(1) {
     ["return"]=>

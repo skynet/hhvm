@@ -6,10 +6,6 @@ Mustache_Test_Cache_AbstractCacheTest::testGetSetLogger
 .
 Mustache_Test_Cache_AbstractCacheTest::testSetLoggerThrowsExceptions
 .
-Mustache_Test_Cache_FilesystemCacheTest::testCacheGetNone
-.
-Mustache_Test_Cache_FilesystemCacheTest::testCachePut
-.
 Mustache_Test_CompilerTest::testCompile with data set #0
 .
 Mustache_Test_CompilerTest::testCompile with data set #1
@@ -439,7 +435,7 @@ Mustache_Test_Loader_CascadingLoaderTest::testMissingTemplatesThrowExceptions
 Mustache_Test_Loader_FilesystemLoaderTest::testConstructor
 .
 Mustache_Test_Loader_FilesystemLoaderTest::testConstructorWithProtocol
-E
+.
 Mustache_Test_Loader_FilesystemLoaderTest::testEmptyExtensionString
 .
 Mustache_Test_Loader_FilesystemLoaderTest::testLoadTemplates

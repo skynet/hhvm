@@ -21,19 +21,31 @@
 
 #include "hphp/runtime/vm/jit/abi-x64.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
-namespace HPHP {
-namespace JIT {
-
-static const DataType BitwiseKindOfString = KindOfString;
+namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
 
 // Generate an if-then block into a.  thenBlock is executed if cc is true.
 template <class Then>
-void ifThen(JIT::X64Assembler& a, ConditionCode cc, Then thenBlock) {
+void ifThen(jit::X64Assembler& a, ConditionCode cc, Then thenBlock) {
   Label done;
   a.jcc8(ccNegate(cc), done);
-  thenBlock();
+  thenBlock(a);
   asm_label(a, done);
+}
+
+template <class Then>
+void ifThen(Vout& v, ConditionCode cc, Vreg sf, Then thenBlock) {
+  auto then = v.makeBlock();
+  auto done = v.makeBlock();
+  v << jcc{cc, sf, {done, then}};
+  v = then;
+  thenBlock(v);
+  if (!v.closed()) v << jmp{done};
+  v = done;
 }
 
 // Helper structs for jcc vs. jcc8.
@@ -133,7 +145,7 @@ locToRegDisp(const Location& l, PhysReg *outbase, int *outdisp,
                           l.space == Location::Local ||
                           l.space == Location::Iter));
   *outdisp = cellsToBytes(locPhysicalOffset(l, f));
-  *outbase = l.space == Location::Stack ? X64::rVmSp : X64::rVmFp;
+  *outbase = l.space == Location::Stack ? x64::rVmSp : x64::rVmFp;
 }
 
 // Common code emission patterns.
@@ -142,11 +154,11 @@ static_assert(sizeof(DataType) == 1,
               "Your DataType has an unsupported size.");
 static inline Reg8 toByte(const Reg32& x)   { return rbyte(x); }
 static inline Reg8 toByte(const Reg64& x)   { return rbyte(x); }
-static inline Reg8 toByte(PhysReg x)        { return rbyte(x); }
+static inline Reg8 toByte(PhysReg x)        { return rbyte(Reg64(x)); }
 
 static inline Reg32 toReg32(const Reg64& x) { return r32(x); }
 static inline Reg32 toReg32(const Reg8& x)  { return r32(x); }
-static inline Reg32 toReg32(PhysReg x)      { return r32(x); }
+static inline Reg32 toReg32(PhysReg x)      { return r32(Reg64(x)); }
 
 // For other operand types, let whatever conversions (or compile
 // errors) exist handle it.
@@ -157,7 +169,7 @@ static OpndType toReg32(const OpndType& x) { return x; }
 
 template<typename OpndType>
 static inline void verifyTVOff(const OpndType& op) { /* nop */ }
-static inline void verifyTVOff(const MemoryRef& mr) {
+static inline void verifyTVOff(MemoryRef mr) {
   DEBUG_ONLY auto disp = mr.r.disp;
   // Make sure that we're operating on the m_type field of a
   // TypedValue*.
@@ -165,9 +177,16 @@ static inline void verifyTVOff(const MemoryRef& mr) {
 }
 
 template<typename SrcType, typename OpndType>
-static inline void
-emitTestTVType(X64Assembler& a, SrcType src, OpndType tvOp) {
+void emitTestTVType(X64Assembler& a, SrcType src, OpndType tvOp) {
   a.  testb(src, toByte(tvOp));
+}
+
+inline void emitTestTVType(Vout& v, Vreg sf, Immed s0, Vreg s1) {
+  v << testbi{s0, s1, sf};
+}
+
+inline void emitTestTVType(Vout& v, Vreg sf, Immed s0, Vptr s1) {
+  v << testbim{s0, s1, sf};
 }
 
 template<typename SrcType, typename OpndType>
@@ -177,16 +196,35 @@ emitLoadTVType(X64Assembler& a, SrcType src, OpndType tvOp) {
   a.  loadzbl(src, toReg32(tvOp));
 }
 
+inline void emitLoadTVType(Vout& v, Vptr mem, Vreg d) {
+  v << loadzbq{mem, d};
+}
+
 template<typename SrcType, typename OpndType>
-static inline void
-emitCmpTVType(X64Assembler& a, SrcType src, OpndType tvOp) {
+void emitCmpTVType(X64Assembler& a, SrcType src, OpndType tvOp) {
   a.  cmpb(src, toByte(tvOp));
 }
 
+inline void emitCmpTVType(Vout& v, Vreg sf, Immed s0, Vptr s1) {
+  v << cmpbim{s0, s1, sf};
+}
+
+inline void emitCmpTVType(Vout& v, Vreg sf, Immed s0, Vreg s1) {
+  v << cmpbi{s0, s1, sf};
+}
+
 template<typename DestType, typename OpndType>
-static inline void
-emitStoreTVType(X64Assembler& a, OpndType tvOp, DestType dest) {
+void emitStoreTVType(X64Assembler& a, OpndType tvOp, DestType dest) {
   a.  storeb(toByte(tvOp), dest);
+}
+
+inline void emitStoreTVType(Vout& v, Vreg src, Vptr dest) {
+  v << storeb{src, dest};
+}
+
+inline void
+emitStoreTVType(Vout& v, DataType src, Vptr dest) {
+  v << storebi{src, dest};
 }
 
 // emitDeref --
@@ -203,19 +241,6 @@ emitDeref(X64Assembler &a, PhysReg src, PhysReg dest) {
   a.    loadq (src[TVOFF(m_data)], dest);
 }
 
-static inline void
-emitDerefIfVariant(X64Assembler &a, PhysReg reg) {
-  emitCmpTVType(a, KindOfRef, reg[TVOFF(m_type)]);
-  if (RefData::tvOffset() == 0) {
-    a.    cload_reg64_disp_reg64(CC_E, reg, TVOFF(m_data), reg);
-  } else {
-    ifThen(a, CC_E, [&] {
-      a.  loadq(reg[TVOFF(m_data)], reg);
-      a.  addq(RefData::tvOffset(), reg);
-    });
-  }
-}
-
 // NB: leaves count field unmodified. Does not store to m_data if type
 // is a null type.
 static inline void
@@ -225,7 +250,7 @@ emitStoreTypedValue(X64Assembler& a, DataType type, PhysReg val,
     emitStoreTVType(a, type, dest[disp + TVOFF(m_type)]);
   }
   if (!IS_NULL_TYPE(type)) {
-    assert(val != reg::noreg);
+    assert(val != InvalidReg);
     a.  storeq(val, dest[disp + TVOFF(m_data)]);
   }
 }
@@ -247,20 +272,19 @@ emitCopyTo(X64Assembler& a,
            PhysReg scratch) {
   assert(src != scratch);
   // This is roughly how gcc compiles this.  Blow off m_aux.
-  auto s64 = r64(scratch);
-  auto s32 = r32(scratch);
-  a.    loadq  (src[srcOff + TVOFF(m_data)], s64);
-  a.    storeq (s64, dest[destOff + TVOFF(m_data)]);
-  emitLoadTVType(a, src[srcOff + TVOFF(m_type)], s32);
-  emitStoreTVType(a, s32, dest[destOff + TVOFF(m_type)]);
+  a.    loadq  (src[srcOff + TVOFF(m_data)], scratch);
+  a.    storeq (scratch, dest[destOff + TVOFF(m_data)]);
+  emitLoadTVType(a, src[srcOff + TVOFF(m_type)], r32(scratch));
+  emitStoreTVType(a, r32(scratch), dest[destOff + TVOFF(m_type)]);
 }
 
 // Pops the return address pushed by fcall and stores it into the
 // actrec in rStashedAR.
 inline void emitPopRetIntoActRec(X64Assembler& a) {
-  a.    pop  (X64::rStashedAR[AROFF(m_savedRip)]);
+  a.    pop  (x64::rStashedAR[AROFF(m_savedRip)]);
 }
 
+///////////////////////////////////////////////////////////////////////////////
 }}
 
 #endif

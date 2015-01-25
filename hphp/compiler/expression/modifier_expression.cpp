@@ -41,6 +41,12 @@ void ModifierExpression::add(int modifier) {
   m_modifiers.push_back(modifier);
 }
 
+void ModifierExpression::remove(int modifier) {
+  m_modifiers.erase(
+    std::remove(m_modifiers.begin(), m_modifiers.end(), modifier),
+    m_modifiers.end());
+}
+
 int ModifierExpression::operator[](int index) {
   assert(index >= 0 && index < getCount());
   return m_modifiers[index];
@@ -69,6 +75,19 @@ bool ModifierExpression::hasModifier(int modifier) const {
       return true;
     }
   }
+  return false;
+}
+
+bool ModifierExpression::hasDuplicates() const {
+  std::set<int> seen;
+  for (unsigned int i = 0; i < m_modifiers.size(); i++) {
+    if (seen.find(m_modifiers[i]) != seen.end()) {
+      return true;
+    }
+
+    seen.insert(m_modifiers[i]);
+  }
+
   return false;
 }
 
@@ -137,12 +156,6 @@ bool ModifierExpression::validForTraitAliasRule() const {
 
 void ModifierExpression::analyzeProgram(AnalysisResultPtr ar) {
   // do nothing
-}
-
-TypePtr ModifierExpression::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                       bool coerce) {
-  assert(false);
-  return TypePtr();
 }
 
 ///////////////////////////////////////////////////////////////////////////////

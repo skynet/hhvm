@@ -20,9 +20,15 @@
 
 #include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/debuggable.h"
+#include "hphp/runtime/base/ini-setting.h"
+#include "hphp/util/exception.h"
 #include "hphp/util/hdf.h"
+#include "hphp/runtime/version.h"
 #include "hphp/runtime/vm/native.h"
 #include "hphp/runtime/vm/bytecode.h"
+
+#include <set>
+#include <string>
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -44,7 +50,7 @@ namespace HPHP {
 #define NO_EXTENSION_VERSION_YET "\0"
 
 #define IMPLEMENT_DEFAULT_EXTENSION_VERSION(name, v)    \
-  static class name ## Extension : public Extension {   \
+  static class name ## Extension final : public Extension {   \
   public:                                               \
     name ## Extension() : Extension(#name, #v) {}       \
   } s_ ## name ## _extension
@@ -54,11 +60,12 @@ namespace HPHP {
 class Extension : public IDebuggable {
 public:
   static bool IsLoaded(const String& name);
+  static bool IsSystemlibPath(const std::string& path);
   static Array GetLoadedExtensions();
   static Extension *GetExtension(const String& name);
 
   // called by RuntimeOption to initialize all configurations of extension
-  static void LoadModules(Hdf hdf);
+  static void LoadModules(const IniSetting::Map& ini, Hdf hdf);
 
   // called by hphp_process_init/exit
   static void InitModules();
@@ -84,8 +91,8 @@ public:
 
   // override these functions to implement module specific init/shutdown
   // sequences and information display.
-  virtual void moduleLoad(Hdf hdf) {}
-  virtual void moduleInfo(Array &info) { info.set(m_name, true);}
+  virtual void moduleLoad(const IniSetting::Map& ini, Hdf hdf) {}
+  virtual void moduleInfo(Array &info) { info.set(String(m_name), true);}
   virtual void moduleInit() {}
   virtual void moduleShutdown() {}
   virtual void threadInit() {}
@@ -93,25 +100,37 @@ public:
   virtual void requestInit() {}
   virtual void requestShutdown() {}
 
+  // override this to control extension_loaded() return value
+  virtual bool moduleEnabled() const { return true; }
+
+  typedef std::set<std::string> DependencySet;
+  typedef std::map<Extension*, DependencySet> DependencySetMap;
+  virtual const DependencySet getDeps() const {
+    // No dependencies by default
+    return DependencySet();
+  }
+
   void setDSOName(const std::string &name) {
     m_dsoName = name;
   }
 
-  const String & getName() const {
+  const std::string& getName() const {
     return m_name;
   }
 
 private:
+  static void SortDependencies();
+
   // Indicates which version of the HHVM Extension API
   // this module was built against.
   int64_t m_hhvmAPIVersion;
 
-  const String m_name;
+  std::string m_name;
   std::string m_version;
   std::string m_dsoName;
 };
 
-#define HHVM_API_VERSION 20131007L
+#define HHVM_API_VERSION 20150112L
 
 #ifdef HHVM_BUILD_DSO
 #define HHVM_GET_MODULE(name) \
@@ -144,9 +163,8 @@ TypedValue* getArg(ActRec *ar, unsigned arg) {
 /**
  * Get numbered arg (zero based) as a Variant
  */
-template <DataType DType>
-typename std::enable_if<DType == KindOfAny, Variant>::type
-getArg(ActRec *ar, unsigned arg, Variant def = uninit_null()) {
+inline Variant getArgVariant(ActRec *ar, unsigned arg,
+                             Variant def = uninit_null()) {
   auto tv = getArg(ar, arg);
   return tv ? tvAsVariant(tv) : def;
 }
@@ -176,7 +194,7 @@ getArg(ActRec *ar, unsigned arg) {
  * Throws warning and returns 0/nullptr if arg not passed
  */
 template <DataType DType>
-typename std::enable_if<(DType != KindOfAny) && (DType != KindOfRef),
+typename std::enable_if<DType != KindOfRef,
   typename DataTypeCPPType<DType>::type>::type
 getArg(ActRec *ar, unsigned arg) {
   auto tv = getArg(ar, arg);
@@ -215,13 +233,57 @@ getArg(ActRec *ar, unsigned arg,
   return unpack_tv<DType>(tv);
 }
 
+struct IncoercibleArgumentException : Exception {};
+
 /**
- * Reports the arg typed as passed
+ * Get numbered arg (zero based) and return data (coerce if needed)
+ *
+ * e.g.: double dval = getArg<KindOfDouble>(ar, 0);
+ *
+ * Raise warning and throw IncoercibleArgumentException if argument
+ * is not provided/not coercible
  */
-inline
-DataType getArgType(ActRec *ar, unsigned arg) {
+template <DataType DType>
+typename std::enable_if<DType != KindOfRef,
+  typename DataTypeCPPType<DType>::type>::type
+getArgStrict(ActRec *ar, unsigned arg) {
+  auto tv = getArg(ar, arg);
+  if (!tv) {
+    raise_warning("Required parameter %d not passed", (int)arg);
+    throw IncoercibleArgumentException();
+  }
+  if (!tvCoerceParamInPlace(tv, DType)) {
+    raise_param_type_warning(ar->func()->name()->data(),
+                             arg + 1, DType, tv->m_type);
+    throw IncoercibleArgumentException();
+  }
+  return unpack_tv<DType>(tv);
+}
+
+/**
+ * Get numbered arg (zero based) and return data (coerce if needed)
+ *
+ * e.g. int64_t lval = getArg<KindOfInt64>(ar, 1, 42);
+ *
+ * Raise warning and throw IncoercibleArgumentException if argument
+ * is not coercible
+ *
+ * Returns default value (42 in example) if arg not passed
+ */
+template <DataType DType>
+typename DataTypeCPPType<DType>::type
+getArgStrict(ActRec *ar, unsigned arg,
+       typename DataTypeCPPType<DType>::type def) {
   TypedValue *tv = getArg(ar, arg);
-  return tv ? tv->m_type : KindOfUnknown;
+  if (!tv) {
+    return def;
+  }
+  if (!tvCoerceParamInPlace(tv, DType)) {
+    raise_param_type_warning(ar->func()->name()->data(),
+                             arg + 1, DType, tv->m_type);
+    throw IncoercibleArgumentException();
+  }
+  return unpack_tv<DType>(tv);
 }
 
 /**

@@ -22,8 +22,18 @@
 
 #include "hphp/runtime/base/datatype.h"
 
+#ifdef ERROR
+#undef ERROR
+#endif
+
+#ifdef STRICT
+#undef STRICT
+#endif
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
+enum class HackStrictOption;
 
 class ErrorConstants {
 public:
@@ -56,7 +66,10 @@ public:
         COMPILE_ERROR | COMPILE_WARNING | USER_ERROR | USER_WARNING |
         USER_NOTICE | RECOVERABLE_ERROR | PHP_DEPRECATED | USER_DEPRECATED,
 
-    HPHP_ALL = PHP_ALL | FATAL_ERROR
+    HPHP_ALL = PHP_ALL | FATAL_ERROR,
+
+    // Errors that can be upgraded to E_USER_ERROR
+    UPGRADEABLE_ERROR = WARNING | USER_WARNING | NOTICE | USER_NOTICE
   };
 };
 
@@ -65,14 +78,19 @@ void raise_error(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
 void raise_error_without_first_frame(const std::string &msg);
 void raise_recoverable_error(const std::string &msg);
 void raise_recoverable_error(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+void raise_recoverable_error_without_first_frame(const std::string &msg);
 void raise_strict_warning(const std::string &msg);
 void raise_strict_warning(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+void raise_strict_warning_without_first_frame(const std::string &msg);
 void raise_warning(const std::string &msg);
 void raise_warning(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+void raise_warning_without_first_frame(const std::string &msg);
 void raise_notice(const std::string &msg);
 void raise_notice(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+void raise_notice_without_first_frame(const std::string &msg);
 void raise_deprecated(const std::string &msg);
 void raise_deprecated(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+void raise_deprecated_without_first_frame(const std::string &msg);
 void raise_debugging(const std::string &msg);
 void raise_debugging(const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
 void raise_message(ErrorConstants::ErrorModes mode,
@@ -81,22 +99,36 @@ void raise_message(ErrorConstants::ErrorModes mode,
 void raise_message(ErrorConstants::ErrorModes mode,
                    const char *fmt,
                    ...) ATTRIBUTE_PRINTF(2, 3);
-void raise_message(ErrorConstants::ErrorModes mode, const std::string &msg);
+void raise_message(ErrorConstants::ErrorModes mode,
+                   bool skipTop,
+                   const std::string &msg);
 void raise_param_type_warning(
     const char* func_name,
     int param_num,
     DataType expected_type,
     DataType actual_type);
+void raise_hack_strict(HackStrictOption option, const char *ini_setting,
+                       const std::string& msg);
+void raise_hack_strict(HackStrictOption option, const char *ini_setting,
+                       const char *fmt, ...);
 
 /*
- * Raise typehint error is the same as raise_recoverable_error, except
- * when compiled in RepoAuthoritative mode with HardTypeHints the
- * error handler is not allowed to recover.
+ * raise_typehint_error() is the same as raise_recoverable_error(), except
+ * when compiled in RepoAuthoritative mode with HardTypeHints the error
+ * handler is not allowed to recover.
  */
 void raise_typehint_error(const std::string& msg);
+
+/*
+ * raise_return_typehint_error() is the same as raise_recoverable_error(),
+ * except when compiled in RepoAuthoritative mode with HardReturnTypeHints
+ * the error handler is not allowed to recover.
+ */
+void raise_return_typehint_error(const std::string& msg);
+
+void raise_disallowed_dynamic_call(const std::string& msg);
 
 ///////////////////////////////////////////////////////////////////////////////
 }
 
 #endif // incl_HPHP_RUNTIME_ERROR_H_
-

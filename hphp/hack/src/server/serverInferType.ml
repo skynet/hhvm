@@ -8,21 +8,15 @@
  *
  *)
 
-let go (fn, line, char) oc =
-  let clean () =
-    Typing_defs.infer_type := None;
-    Typing_defs.infer_target := None;
-    Typing_defs.infer_pos := None;
-  in
-  clean ();
-  Typing_defs.infer_target := Some (line, char);
-  ServerIdeUtils.recheck [fn];
-  let pos = match !Typing_defs.infer_pos with
-    | None -> "(unknown)"
-    | Some pos -> Pos.string pos in
-  let ty = match !Typing_defs.infer_type with
-    | None -> "(unknown)"
-    | Some ty -> ty in
-  clean ();
-  Marshal.to_channel oc (pos, ty) [];
+open Utils
+
+type result = Pos.absolute option * string option
+
+let go env (fn, line, char) oc =
+  let get_result = InferAtPosService.attach_hooks line char in
+  ignore (ServerIdeUtils.check_file_input env.ServerEnv.files_info fn);
+  let pos, ty = get_result () in
+  let pos = opt_map Pos.to_absolute pos in
+  InferAtPosService.detach_hooks ();
+  Marshal.to_channel oc ((pos, ty) : result) [];
   flush oc

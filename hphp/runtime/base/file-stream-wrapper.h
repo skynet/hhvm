@@ -25,6 +25,17 @@
 #include "hphp/runtime/base/file.h"
 #include "hphp/runtime/base/mem-file.h"
 #include "hphp/runtime/base/stream-wrapper.h"
+#include <folly/String.h>
+
+#define ERROR_RAISE_WARNING(exp)        \
+  int ret = (exp);                      \
+  if (ret != 0) {                       \
+    raise_warning(                      \
+      "%s(): %s",                       \
+      __FUNCTION__,                     \
+      folly::errnoStr(errno).c_str()    \
+    );                                  \
+  }                                     \
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -33,52 +44,42 @@ class Directory;
 
 class FileStreamWrapper : public Stream::Wrapper {
  public:
-  static MemFile* openFromCache(const String& filename, const String& mode);
-  virtual File* open(const String& filename, const String& mode,
-                     int options, const Variant& context);
+  static SmartPtr<MemFile> openFromCache(
+    const String& filename, const String& mode);
+  virtual SmartPtr<File> open(const String& filename, const String& mode,
+                              int options, const Variant& context);
   virtual int access(const String& path, int mode) {
-    return valid(path) ? ::access(TranslatePath(path).data(), mode) : -1;
+    return ::access(File::TranslatePath(path).data(), mode);
   }
   virtual int stat(const String& path, struct stat* buf) {
-    return valid(path) ? ::stat(TranslatePath(path).data(), buf) : -1;
+    return ::stat(File::TranslatePath(path).data(), buf);
   }
   virtual int lstat(const String& path, struct stat* buf) {
-    return valid(path) ? ::lstat(TranslatePath(path).data(), buf) : -1;
+    return ::lstat(File::TranslatePath(path).data(), buf);
   }
   virtual int unlink(const String& path) {
-    return valid(path) ? ::unlink(TranslatePath(path).data()) : -1;
+    int ret = ::unlink(File::TranslatePath(path).data());
+    if (ret != 0) {
+      raise_warning(
+        "%s(%s): %s",
+        __FUNCTION__,
+        path.c_str(),
+        folly::errnoStr(errno).c_str()
+      );
+    }
+    return ret;
   }
   virtual int rename(const String& oldname, const String& newname);
   virtual int mkdir(const String& path, int mode, int options);
   virtual int rmdir(const String& path, int options) {
-    return valid(path) ? ::rmdir(TranslatePath(path).data()) : -1;
+    ERROR_RAISE_WARNING(::rmdir(File::TranslatePath(path).data()));
+    return ret;
   }
 
-  virtual Directory* opendir(const String& path);
+  virtual SmartPtr<Directory> opendir(const String& path);
 
  private:
   int mkdir_recursive(const String& path, int mode);
-  virtual bool valid(const String& path) {
-    assert(strncmp(path.c_str(), "file://", sizeof("file://") - 1) == 0);
-    if (path.data()[7] == '/') { // not just file://, but file:///
-      return true;
-    }
-    raise_warning("Only hostless file::// URLs are supported: %s", path.data());
-    errno = ENOENT;
-    return false;
-  }
-  virtual String TranslatePath(const String& filename) {
-    assert(valid(filename));
-    return File::TranslatePath(filename.substr(sizeof("file://") - 1));
-  }
-};
-
-class PlainStreamWrapper : public FileStreamWrapper {
- private:
-  virtual bool valid(const String& path) { return true; }
-  virtual  String TranslatePath(const String& filename) {
-    return File::TranslatePath(filename);
-  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////

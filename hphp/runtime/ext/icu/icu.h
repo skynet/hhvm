@@ -23,6 +23,7 @@
 #include <unicode/ucnv.h>
 #include <unicode/ustring.h>
 #include "hphp/runtime/base/request-event-handler.h"
+#include "hphp/runtime/base/request-local.h"
 
 namespace HPHP {
 /////////////////////////////////////////////////////////////////////////////
@@ -64,15 +65,8 @@ class IntlError {
 };
 
 template<class T>
-T* GetData(Object obj, const String& ctx) {
-  if (obj.isNull()) {
-    raise_error("NULL object passed");
-    return nullptr;
-  }
-  auto ret = Native::data<T>(obj.get());
-  if (!ret) {
-    return nullptr;
-  }
+T* GetData(ObjectData* obj, const String& ctx) {
+  auto const ret = Native::data<T>(obj);
   if (!ret->isValid()) {
     ret->setError(U_ILLEGAL_ARGUMENT_ERROR,
                   "Found unconstructed %s", ctx.c_str());
@@ -80,6 +74,9 @@ T* GetData(Object obj, const String& ctx) {
   }
   return ret;
 }
+
+template<class T>
+T* GetData(Object, const String&);  // get a link error.
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -102,7 +99,7 @@ inline String u8(const icu::UnicodeString& u16, UErrorCode& error) {
   return u8(u16.getBuffer(), u16.length(), error);
 }
 
-class IntlExtension : public Extension {
+class IntlExtension final : public Extension {
  public:
   IntlExtension() : Extension("intl", "1.1.0") {}
 
@@ -114,9 +111,11 @@ class IntlExtension : public Extension {
     initTimeZone();
     initIterator();
     initDateFormatter();
+    initDatePatternGenerator();
     initCalendar();
     initGrapheme();
     initBreakIterator(); // Must come after initIterator()
+    initUChar();
     initUConverter();
     initUcsDet();
     initUSpoof();
@@ -131,7 +130,7 @@ class IntlExtension : public Extension {
   void threadInit() override {
     bindIniSettings();
   }
-
+  void threadShutdown() override;
  private:
   void bindIniSettings();
   void bindConstants();
@@ -141,9 +140,11 @@ class IntlExtension : public Extension {
   void initTimeZone();
   void initIterator();
   void initDateFormatter();
+  void initDatePatternGenerator();
   void initCalendar();
   void initGrapheme();
   void initBreakIterator();
+  void initUChar();
   void initUConverter();
   void initUcsDet();
   void initUSpoof();

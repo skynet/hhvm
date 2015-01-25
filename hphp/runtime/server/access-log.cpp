@@ -323,22 +323,22 @@ bool AccessLog::genField(std::ostringstream &out, const char* &format,
       out << note.c_str();
     }
     break;
+  case 'o':
+    out << ServerStats::Get("request.memory_exceeded.non_psp");
+    break;
+  case 'O':
+    out << ServerStats::Get("request.memory_exceeded.psp");
+    break;
+  case 'p':
+    out << ServerStats::Get("request.timed_out.non_psp");
+    break;
+  case 'P':
+    out << ServerStats::Get("request.timed_out.psp");
+    break;
   case 'r':
     {
-      const char *method = nullptr;
-      switch (transport->getMethod()) {
-      case Transport::Method::GET: method = "GET"; break;
-      case Transport::Method::POST:
-        if (transport->getExtendedMethod() == nullptr) {
-          method = "POST";
-        } else {
-          method = transport->getExtendedMethod();
-        }
-        break;
-      case Transport::Method::HEAD: method = "HEAD"; break;
-      default: break;
-      }
-      if (!method) return false;
+      const char *method = transport->getMethodName();
+      if (!method || !method[0]) return false;
       out << method << " ";
 
       const char *url = transport->getUrl();

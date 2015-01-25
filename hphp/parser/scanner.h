@@ -28,6 +28,11 @@
 #include "hphp/parser/location.h"
 #include "hphp/parser/hphp.tab.hpp"
 
+#ifndef YY_TYPEDEF_YY_SIZE_T
+#define YY_TYPEDEF_YY_SIZE_T
+typedef size_t yy_size_t;
+#endif
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -128,7 +133,7 @@ struct TokenStore {
     LookaheadSlab* s = m_head;
     LookaheadSlab* next;
     while (s) {
-      next = m_head->m_next;
+      next = s->m_next;
       delete s;
       s = next;
     }
@@ -200,7 +205,7 @@ public:
   };
 
 public:
-  Scanner(const char *filename, int type, bool md5 = false);
+  Scanner(const std::string& filename, int type, bool md5 = false);
   Scanner(std::istream &stream, int type, const char *fileName = "",
           bool md5 = false);
   Scanner(const char *source, int len, int type, const char *fileName = "",
@@ -238,7 +243,9 @@ public:
   /**
    * Called by lex.yy.cpp for YY_INPUT (see hphp.x)
    */
-  int read(char *text, int &result, int max);
+  int read(char *text, yy_size_t &result, yy_size_t max);
+  // Overload for older versions of flex.
+  int read(char *text, int &result, yy_size_t max);
 
   /**
    * Called by scanner rules.
@@ -266,7 +273,6 @@ public:
     }
     incLoc(rawText, rawLeng, type);
   }
-  void setHashBang(const char *rawText, int rawLeng, int type = -1);
   // also used for YY_FATAL_ERROR in hphp.x
   void error(const char* fmt, ...) ATTRIBUTE_PRINTF(2,3);
   void warn(const char* fmt, ...) ATTRIBUTE_PRINTF(2,3);

@@ -15,16 +15,18 @@
 */
 #include "hphp/util/stack-trace.h"
 
+#if (!defined(__CYGWIN__) && !defined(__MINGW__) && !defined(__MSC_VER))
 #include <execinfo.h>
+#endif
 #include <bfd.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#include "folly/String.h"
-#include "folly/ScopeGuard.h"
-#include "folly/Conv.h"
+#include <folly/String.h>
+#include <folly/ScopeGuard.h>
+#include <folly/Conv.h>
 
 #include "hphp/util/process.h"
 #include "hphp/util/lock.h"
@@ -76,6 +78,9 @@ struct NamedBfd {
 // statics
 
 bool StackTraceBase::Enabled = true;
+static const char* s_defaultBlacklist[] = {"_ZN4HPHP16StackTraceNoHeap"};
+const char** StackTraceBase::FunctionBlacklist = s_defaultBlacklist;
+unsigned int StackTraceBase::FunctionBlacklistCount = 1;
 
 ///////////////////////////////////////////////////////////////////////////////
 // constructor and destructor
@@ -228,14 +233,12 @@ void StackTraceNoHeap::ClearAllExtraLogging() {
   StackTraceLog::s_logData->data.clear();
 }
 
-void StackTraceNoHeap::log(const char *errorType, const char *tracefn,
-                           const char *pid, const char *buildId,
+void StackTraceNoHeap::log(const char *errorType, int fd, const char *buildId,
                            int debuggerCount) const {
-  int fd = ::open(tracefn, O_CREAT|O_TRUNC|O_WRONLY, S_IRUSR|S_IWUSR);
-  if (fd < 0) return;
+  assert(fd >= 0);
 
   dprintf(fd, "Host: %s\n",Process::GetHostName().c_str());
-  dprintf(fd, "ProcessID: %s\n", pid);
+  dprintf(fd, "ProcessID: %u\n", Process::GetProcessId());
   dprintf(fd, "ThreadID: %" PRIx64"\n", (int64_t)Process::GetThreadId());
   dprintf(fd, "ThreadPID: %u\n", Process::GetThreadPid());
   dprintf(fd, "Name: %s\n", Process::GetAppName().c_str());
@@ -251,8 +254,6 @@ void StackTraceNoHeap::log(const char *errorType, const char *tracefn,
   dprintf(fd, "\n");
 
   printStackTrace(fd);
-
-  ::close(fd);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -378,8 +379,13 @@ bool StackTraceNoHeap::Translate(int fd, void *frame, int frame_num,
                                             : dlInfo.dli_sname;
   if (!funcname) funcname = "??";
 
-  // ignore frames in the StackTrace class
-  if (strstr(funcname, "StackTraceNoHeap")) return false ;
+  // ignore some frames that are always present
+  for (int i = 0; i < FunctionBlacklistCount; i++) {
+    auto ignoreFunc = FunctionBlacklist[i];
+    if (strncmp(funcname, ignoreFunc, strlen(ignoreFunc)) == 0) {
+      return false;
+    }
+  }
 
   dprintf(fd, "# %d%s ", frame_num, frame_num < 10 ? " " : "");
   Demangle(fd, funcname);

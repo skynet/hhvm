@@ -20,13 +20,15 @@
 #include "hphp/compiler/expression/expression.h"
 #include "hphp/compiler/statement/statement.h"
 #include "hphp/compiler/statement/use_trait_statement.h"
-#include "hphp/compiler/statement/trait_require_statement.h"
+#include "hphp/compiler/statement/class_require_statement.h"
 #include "hphp/compiler/statement/trait_prec_statement.h"
 #include "hphp/compiler/statement/trait_alias_statement.h"
 #include "hphp/compiler/statement/typedef_statement.h"
 
 #include "hphp/runtime/vm/func.h"
+#include "hphp/runtime/vm/func-emitter.h"
 #include "hphp/runtime/vm/unit.h"
+#include "hphp/runtime/vm/unit-emitter.h"
 #include "hphp/util/hash.h"
 
 #include <deque>
@@ -59,24 +61,6 @@ namespace Compiler {
 class Label;
 class EmitterVisitor;
 
-// Helper for creating unit MetaInfo.
-struct MetaInfoBuilder {
-  void add(int pos, Unit::MetaInfo::Kind kind,
-           bool mVector, int arg, Id data);
-  void addKnownDataType(DataType dt,
-                        bool     dtPredicted,
-                        int      pos,
-                        bool     mVector,
-                        int      arg);
-  void deleteInfo(Offset bcOffset);
-  void setForUnit(UnitEmitter&) const;
-
-private:
-  typedef std::vector<Unit::MetaInfo> Vec;
-  typedef std::map<Offset,Vec> Map;
-  Map m_metaMap;
-};
-
 class Emitter {
 public:
   Emitter(ConstructPtr node, UnitEmitter& ue, EmitterVisitor& ev)
@@ -104,31 +88,31 @@ public:
     Id id;
   };
 
-#define O(name, imm, pop, push, flags) \
-  void name(imm);
 #define NA
 #define ONE(typ) \
-  typ a1
+  IMM_##typ
 #define TWO(typ1, typ2) \
-  typ1 a1, typ2 a2
+  IMM_##typ1, IMM_##typ2
 #define THREE(typ1, typ2, typ3) \
-  typ1 a1, typ2 a2, typ3 a3
+  IMM_##typ1, IMM_##typ2, IMM_##typ3
 #define FOUR(typ1, typ2, typ3, typ4) \
-  typ1 a1, typ2 a2, typ3 a3, typ4 a4
-#define MA std::vector<unsigned char>
-#define BLA std::vector<Label*>&
-#define SLA std::vector<StrOff>&
-#define ILA std::vector<IterPair>&
-#define IVA int32_t
-#define LA int32_t
-#define IA int32_t
-#define I64A int64_t
-#define DA double
-#define SA const StringData*
-#define AA ArrayData*
-#define BA Label&
-#define OA(type) type
-#define VSA std::vector<std::string>&
+  IMM_##typ1, IMM_##typ2, IMM_##typ3, IMM_##typ4
+#define IMM_MA std::vector<unsigned char>
+#define IMM_BLA std::vector<Label*>&
+#define IMM_SLA std::vector<StrOff>&
+#define IMM_ILA std::vector<IterPair>&
+#define IMM_IVA int32_t
+#define IMM_LA int32_t
+#define IMM_IA int32_t
+#define IMM_I64A int64_t
+#define IMM_DA double
+#define IMM_SA const StringData*
+#define IMM_RATA RepoAuthType
+#define IMM_AA ArrayData*
+#define IMM_BA Label&
+#define IMM_OA(type) type
+#define IMM_VSA std::vector<std::string>&
+#define O(name, imm, pop, push, flags) void name(imm);
   OPCODES
 #undef O
 #undef NA
@@ -136,20 +120,22 @@ public:
 #undef TWO
 #undef THREE
 #undef FOUR
-#undef MA
-#undef BLA
-#undef SLA
-#undef ILA
-#undef IVA
-#undef LA
-#undef IA
-#undef I64A
-#undef DA
-#undef SA
-#undef AA
-#undef BA
-#undef OA
-#undef VSA
+#undef IMM_MA
+#undef IMM_BLA
+#undef IMM_SLA
+#undef IMM_ILA
+#undef IMM_IVA
+#undef IMM_LA
+#undef IMM_IA
+#undef IMM_I64A
+#undef IMM_DA
+#undef IMM_SA
+#undef IMM_RATA
+#undef IMM_AA
+#undef IMM_BA
+#undef IMM_OA
+#undef IMM_VSA
+
 private:
   ConstructPtr m_node;
   UnitEmitter& m_ue;
@@ -171,7 +157,6 @@ struct SymbolicStack {
   enum MetaType {
     META_NONE,
     META_LITSTR,
-    META_DATA_TYPE
   };
 
 private:
@@ -194,9 +179,6 @@ private:
     explicit SymEntry(char s = 0)
       : sym(s)
       , metaType(META_NONE)
-      , notRef(false)
-      , notNull(false)
-      , dtPredicted(false)
       , className(nullptr)
       , intval(-1)
       , unnamedLocalStart(InvalidAbsoluteOffset)
@@ -204,12 +186,8 @@ private:
     {}
     char sym;
     MetaType metaType;
-    bool notRef:1;
-    bool notNull:1;
-    bool dtPredicted:1;
     union {
       const StringData* name;   // META_LITSTR
-      DataType dt;              // META_DATA_TYPE
     }   metaData;
     const StringData* className;
     int64_t intval; // used for L and I symbolic flavors
@@ -252,11 +230,7 @@ public:
   void setInt(int64_t v);
   void setString(const StringData* s);
   void setKnownCls(const StringData* s, bool nonNull);
-  void setNotRef();
-  bool getNotRef() const;
-  void setKnownType(DataType dt, bool predicted = false);
   void cleanTopMeta();
-  DataType getKnownType(int index = -1, bool noRef = true) const;
   void setClsBaseType(ClassBaseType);
   void setUnnamedLocal(int index, int localId, Offset startOffset);
   void pop();
@@ -462,7 +436,6 @@ public:
   ~EmitterVisitor();
 
   bool visit(ConstructPtr c);
-  bool visitImpl(ConstructPtr c);
   void visitKids(ConstructPtr c);
   void visit(FileScopePtr file);
   void assignLocalVariableIds(FunctionScopePtr fs);
@@ -470,9 +443,13 @@ public:
   void fixReturnType(Emitter& e, FunctionCallPtr fn,
                      Func* builtinFunc = nullptr);
 
-  void visitListAssignmentLHS(Emitter& e, ExpressionPtr exp,
+  void listAssignmentVisitLHS(Emitter& e, ExpressionPtr exp,
                               IndexChain& indexChain,
                               std::vector<IndexChain*>& chainList);
+  void listAssignmentAssignElements(Emitter& e,
+                                    std::vector<IndexChain*>& indexChains,
+                                    std::function<void()> emitSrc);
+
   void visitIfCondition(ExpressionPtr cond, Emitter& e, Label& tru, Label& fals,
                         bool truFallthrough);
   const SymbolicStack& getEvalStack() const { return m_evalStack; }
@@ -501,7 +478,7 @@ public:
   void setPrevOpcode(Op op) { m_prevOpcode = op; }
   Op getPrevOpcode() const { return m_prevOpcode; }
   bool currentPositionIsReachable() {
-    return (m_ue.bcPos() == m_curFunc->base()
+    return (m_ue.bcPos() == m_curFunc->base
             || isJumpTarget(m_ue.bcPos())
             || (instrFlags(getPrevOpcode()) & TF) == 0);
   }
@@ -640,6 +617,14 @@ private:
 
 private:
   static const size_t kMinStringSwitchCases = 8;
+  static const bool systemlibDefinesIdx =
+#ifdef FACEBOOK
+    true
+#else
+    false
+#endif
+    ;
+
   UnitEmitter& m_ue;
   FuncEmitter* m_curFunc;
   FileScopePtr m_file;
@@ -653,14 +638,14 @@ private:
   std::deque<PostponedNonScalars> m_postponedCinits;
   std::deque<PostponedClosureCtor> m_postponedClosureCtors;
   PendingIterVec m_pendingIters;
-  hphp_hash_set<std::string> m_topMethodEmitted;
+  hphp_hash_map<std::string, FuncEmitter*> m_topMethodEmitted;
   SymbolicStack m_evalStack;
   bool m_evalStackIsUnknown;
   hphp_hash_map<Offset, SymbolicStack> m_jumpTargetEvalStacks;
   int m_actualStackHighWater;
   int m_fdescHighWater;
   typedef tbb::concurrent_hash_map<const StringData*, int,
-                                   StringDataHashCompare> EmittedClosures;
+                                   StringDataHashICompare> EmittedClosures;
   static EmittedClosures s_emittedClosures;
   std::deque<Funclet*> m_funclets;
   std::map<StatementPtr, Funclet*> m_memoizedFunclets;
@@ -680,8 +665,6 @@ private:
   // Unnamed local variables used by the "finally router" logic
   Id m_stateLocal;
   Id m_retLocal;
-
-  MetaInfoBuilder m_metaInfo;
 
 public:
   bool checkIfStackEmpty(const char* forInstruction) const;
@@ -719,15 +702,14 @@ public:
   void emitConvertSecondToCell(Emitter& e);
   void emitConvertToVar(Emitter& e);
   void emitFPass(Emitter& e, int paramID, PassByRefKind passByRefKind);
-  void emitVirtualLocal(int localId, DataType dt = KindOfUnknown);
+  void emitVirtualLocal(int localId);
   template<class Expr> void emitVirtualClassBase(Emitter&, Expr* node);
   void emitResolveClsBase(Emitter& e, int pos);
   void emitClsIfSPropBase(Emitter& e);
   Id emitVisitAndSetUnnamedL(Emitter& e, ExpressionPtr exp);
   Id emitSetUnnamedL(Emitter& e);
   void emitPushAndFreeUnnamedL(Emitter& e, Id tempLocal, Offset start);
-  void emitContinuationSwitch(Emitter& e, int ncase);
-  DataType analyzeSwitch(SwitchStatementPtr s, SwitchState& state);
+  MaybeDataType analyzeSwitch(SwitchStatementPtr s, SwitchState& state);
   void emitIntegerSwitch(Emitter& e, SwitchStatementPtr s,
                          std::vector<Label>& caseLabels, Label& done,
                          const SwitchState& state);
@@ -762,12 +744,15 @@ public:
                           bool top);
   void fillFuncEmitterParams(FuncEmitter* fe,
                              ExpressionListPtr params,
-                             bool builtin = false);
+                             bool coerce_params = false);
   void emitMethodPrologue(Emitter& e, MethodStatementPtr meth);
   void emitMethod(MethodStatementPtr meth);
+  void emitMemoizeProp(Emitter& e, MethodStatementPtr meth, Id localID,
+                       const std::vector<Id>& paramIDs, uint numParams);
+  void addMemoizeProp(MethodStatementPtr meth);
+  void emitMemoizeMethod(MethodStatementPtr meth, const StringData* methName);
   void emitConstMethodCallNoParams(Emitter& e, string name);
-  void emitCreateStaticWaitHandle(Emitter& e, std::string cls,
-                                  std::function<void()> emitParam);
+  bool emitHHInvariant(Emitter& e, SimpleFunctionCallPtr);
   void emitMethodDVInitializers(Emitter& e,
                                 MethodStatementPtr& meth,
                                 Label& topOfBody);
@@ -789,6 +774,7 @@ public:
     CallUserFuncForwardArray = CallUserFuncForward | CallUserFuncArray
   };
 
+  bool emitSystemLibVarEnvFunc(Emitter& e, SimpleFunctionCallPtr node);
   bool emitCallUserFunc(Emitter& e, SimpleFunctionCallPtr node);
   Func* canEmitBuiltinCall(const std::string& name, int numParams);
   void emitFuncCall(Emitter& e, FunctionCallPtr node,
@@ -797,13 +783,15 @@ public:
   void emitFuncCallArg(Emitter& e, ExpressionPtr exp, int paramId);
   void emitBuiltinCallArg(Emitter& e, ExpressionPtr exp, int paramId,
                          bool byRef);
-  void emitBuiltinDefaultArg(Emitter& e, Variant& v, DataType t, int paramId);
+  void emitBuiltinDefaultArg(Emitter& e, Variant& v,
+                             MaybeDataType t, int paramId);
   void emitClass(Emitter& e, ClassScopePtr cNode, bool topLevel);
   void emitTypedef(Emitter& e, TypedefStatementPtr);
   void emitForeachListAssignment(Emitter& e,
                                  ListAssignmentPtr la,
-                                 int vLocalId);
+                                 std::function<void()> emitSrc);
   void emitForeach(Emitter& e, ForEachStatementPtr fe);
+  void emitForeachAwaitAs(Emitter& e, ForEachStatementPtr fe);
   void emitRestoreErrorReporting(Emitter& e, Id oldLevelLoc);
   void emitMakeUnitFatal(Emitter& e,
                          const char* msg,
@@ -817,7 +805,7 @@ public:
   // These methods handle the return, break, continue, and goto operations.
   // These methods are aware of try/finally blocks and foreach blocks and
   // will free iterators and jump to finally epilogues as appropriate.
-  void emitReturn(Emitter& e, char sym, bool hasConstraint, StatementPtr s);
+  void emitReturn(Emitter& e, char sym, StatementPtr s);
   void emitBreak(Emitter& e, int depth, StatementPtr s);
   void emitContinue(Emitter& e, int depth, StatementPtr s);
   void emitGoto(Emitter& e, StringData* name, StatementPtr s);
@@ -840,6 +828,10 @@ public:
                               std::vector<Label*>& cases, int depth);
   void emitGotoTrampoline(Emitter& e, Region* entry,
                           std::vector<Label*>& cases, StringData* name);
+
+  // Returns true if VerifyRetType should be emitted before Ret for
+  // the current function.
+  bool shouldEmitVerifyRetType();
 
   Funclet* addFunclet(Thunklet* body);
   Funclet* addFunclet(StatementPtr stmt,
@@ -913,10 +905,12 @@ public:
                                 StringData* name, bool alloc);
 };
 
-void emitAllHHBC(AnalysisResultPtr ar);
+void emitAllHHBC(AnalysisResultPtr&& ar);
+
 
 extern "C" {
-  String hphp_compiler_serialize_code_model_for(String code, String prefix);
+  StringData* hphp_compiler_serialize_code_model_for(String code,
+                                                     String prefix);
   Unit* hphp_compiler_parse(const char* code, int codeLen, const MD5& md5,
                             const char* filename);
   Unit* hphp_build_native_func_unit(const HhbcExtFuncInfo* builtinFuncs,

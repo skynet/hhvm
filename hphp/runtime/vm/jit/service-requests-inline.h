@@ -19,9 +19,9 @@
 #include "hphp/runtime/vm/jit/service-requests.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
-inline ServiceReqArgInfo ccServiceReqArgInfo(JIT::ConditionCode cc) {
+inline ServiceReqArgInfo ccServiceReqArgInfo(jit::ConditionCode cc) {
   return ServiceReqArgInfo{ServiceReqArgInfo::CondCode, { uint64_t(cc) }};
 }
 
@@ -52,17 +52,23 @@ inline void packServiceReqArgs(ServiceReqArgVec& argv) {
 
 //////////////////////////////////////////////////////////////////////
 
+inline bool isEphemeralServiceReq(ServiceRequest sr) {
+  return sr == REQ_BIND_JMPCC_FIRST ||
+         sr == REQ_BIND_JMP ||
+         sr == REQ_BIND_JCC ||
+         sr == REQ_BIND_ADDR;
+}
+
 template<typename... Arg>
 TCA emitServiceReq(CodeBlock& cb, SRFlags flags, ServiceRequest sr, Arg... a) {
   // These should reuse stubs. Use emitEphemeralServiceReq.
-  assert(sr != REQ_BIND_JMPCC_FIRST &&
-         sr != REQ_BIND_JMPCC_SECOND &&
-         sr != REQ_BIND_JMP);
+  assert(!isEphemeralServiceReq(sr));
 
   ServiceReqArgVec argv;
   packServiceReqArgs(argv, a...);
-  return mcg->backEnd().emitServiceReqWork(cb, cb.frontier(), true, flags, sr,
-                                           argv);
+  return mcg->backEnd().emitServiceReqWork(cb, cb.frontier(),
+                                           flags | SRFlags::Persist,
+                                           sr, argv);
 }
 
 template<typename... Arg>
@@ -73,15 +79,12 @@ TCA emitServiceReq(CodeBlock& cb, ServiceRequest sr, Arg... a) {
 template<typename... Arg>
 TCA emitEphemeralServiceReq(CodeBlock& cb, TCA start, ServiceRequest sr,
                             Arg... a) {
-  assert(sr == REQ_BIND_JMPCC_FIRST ||
-         sr == REQ_BIND_JMPCC_SECOND ||
-         sr == REQ_BIND_JMP);
-  assert(cb.contains(start));
+  assert(isEphemeralServiceReq(sr) ||
+         sr == REQ_RETRANSLATE);
 
   ServiceReqArgVec argv;
   packServiceReqArgs(argv, a...);
-  return mcg->backEnd().emitServiceReqWork(cb, start, false, SRFlags::None, sr,
-                                           argv);
+  return mcg->backEnd().emitServiceReqWork(cb, start, SRFlags::None, sr, argv);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -90,8 +93,8 @@ TCA emitEphemeralServiceReq(CodeBlock& cb, TCA start, ServiceRequest sr,
 
 namespace std {
 
-template<> struct hash<HPHP::JIT::ServiceRequest> {
-  size_t operator()(const HPHP::JIT::ServiceRequest& sr) const {
+template<> struct hash<HPHP::jit::ServiceRequest> {
+  size_t operator()(const HPHP::jit::ServiceRequest& sr) const {
     return sr;
   }
 };

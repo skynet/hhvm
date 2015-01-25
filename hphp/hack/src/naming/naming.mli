@@ -22,11 +22,15 @@ open Utils
  * mapped here in ifuns to a freshly created unique integer identifier.
  *)
 type env = {
-    iclasses  : (Pos.t * Ident.t) SMap.t;
-    ifuns     : (Pos.t * Ident.t) SMap.t;
-    itypedefs : (Pos.t * Ident.t) SMap.t;
-    iconsts   : (Pos.t * Ident.t) SMap.t;
-  }
+  iassume_php : bool;
+  iclasses  : ((Pos.t * Ident.t) SMap.t) * (String.t SMap.t);
+  ifuns     : ((Pos.t * Ident.t) SMap.t) * (String.t SMap.t);
+  itypedefs : (Pos.t * Ident.t) SMap.t;
+  iconsts   : (Pos.t * Ident.t) SMap.t;
+}
+
+(* Canonicalizes a key *)
+val canon_key: String.t -> String.t
 
 (* The empty naming environment *)
 val empty: env
@@ -39,14 +43,19 @@ val empty: env
  * passed as parameters to this old environment.
 *)
 val make_env:
-    env -> 
-      funs:Ast.id list -> 
+    env ->
+      funs:Ast.id list ->
       classes:Ast.id list ->
       typedefs:Ast.id list ->
       consts:Ast.id list -> env
 
 (* Solves the local names within a function *)
 val fun_: env -> Ast.fun_ -> Nast.fun_
+
+(* Uses a default empty environment to extract the use list
+  of a lambda expression. This exists only for the sake of
+  the dehackificator and is not meant for general use. *)
+val uselist_lambda: Ast.fun_ -> string list
 
 (* Solves the local names of a class *)
 val class_: env -> Ast.class_ -> Nast.class_
@@ -83,6 +92,6 @@ val is_null:   string
 val is_resource:  string
 
 val ndecl_file:
-  string -> FileInfo.t ->
-  Utils.error list * SSet.t * env ->
-  Utils.error list * SSet.t * env
+  Relative_path.t -> FileInfo.t ->
+  Errors.t * Relative_path.Set.t * env ->
+  Errors.t * Relative_path.Set.t * env

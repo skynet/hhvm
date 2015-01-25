@@ -16,25 +16,471 @@
 
 #include <array>
 
-#include <boost/range/adaptors.hpp>
-
-#include "folly/MapUtil.h"
+#include <folly/MapUtil.h>
 
 #include "hphp/util/trace.h"
-#include "hphp/runtime/vm/jit/ir.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
 #include "hphp/runtime/vm/jit/ir-unit.h"
 #include "hphp/runtime/vm/jit/mutation.h"
 #include "hphp/runtime/vm/jit/opt.h"
 #include "hphp/runtime/vm/jit/print.h"
-#include "hphp/runtime/vm/jit/simplifier.h"
+#include "hphp/runtime/vm/jit/simplify.h"
 #include "hphp/runtime/vm/jit/state-vector.h"
 #include "hphp/runtime/vm/jit/timer.h"
+#include "hphp/runtime/vm/jit/cfg.h"
 
-namespace HPHP {
-namespace JIT {
+namespace HPHP { namespace jit {
 namespace {
 
-TRACE_SET_MOD(hhir);
+TRACE_SET_MOD(hhir_dce);
+
+bool canDCE(IRInstruction* inst) {
+  switch (inst->op()) {
+  case AssertNonNull:
+  case AbsDbl:
+  case AddInt:
+  case SubInt:
+  case MulInt:
+  case AndInt:
+  case AddDbl:
+  case SubDbl:
+  case MulDbl:
+  case Sqrt:
+  case OrInt:
+  case XorInt:
+  case Shl:
+  case Shr:
+  case Floor:
+  case Ceil:
+  case XorBool:
+  case Mod:
+  case ConvBoolToArr:
+  case ConvDblToArr:
+  case ConvIntToArr:
+  case ConvStrToArr:
+  case ConvArrToBool:
+  case ConvDblToBool:
+  case ConvIntToBool:
+  case ConvStrToBool:
+  case ConvObjToBool:
+  case ConvCellToBool:
+  case ConvArrToDbl:
+  case ConvBoolToDbl:
+  case ConvIntToDbl:
+  case ConvStrToDbl:
+  case ConvArrToInt:
+  case ConvBoolToInt:
+  case ConvDblToInt:
+  case ConvStrToInt:
+  case ConvBoolToStr:
+  case ConvDblToStr:
+  case ConvIntToStr:
+  case ConvClsToCctx:
+  case Gt:
+  case Gte:
+  case Lt:
+  case Lte:
+  case Eq:
+  case Neq:
+  case Same:
+  case NSame:
+  case GtInt:
+  case GteInt:
+  case LtInt:
+  case LteInt:
+  case EqInt:
+  case NeqInt:
+  case GtDbl:
+  case GteDbl:
+  case LtDbl:
+  case LteDbl:
+  case EqDbl:
+  case NeqDbl:
+  case InstanceOf:
+  case InstanceOfIface:
+  case ExtendsClass:
+  case InstanceOfBitmask:
+  case NInstanceOfBitmask:
+  case InterfaceSupportsArr:
+  case InterfaceSupportsStr:
+  case InterfaceSupportsInt:
+  case InterfaceSupportsDbl:
+  case IsType:
+  case IsNType:
+  case IsTypeMem:
+  case IsNTypeMem:
+  case IsScalarType:
+  case IsWaitHandle:
+  case ClsNeq:
+  case UnboxPtr:
+  case BoxPtr:
+  case LdStk:
+  case LdLoc:
+  case LdStkAddr:
+  case LdLocAddr:
+  case LdRDSAddr:
+  case LdMem:
+  case LdContField:
+  case LdElem:
+  case LdRef:
+  case LdCtx:
+  case CastCtxThis:
+  case LdCctx:
+  case LdClsCtx:
+  case LdClsCctx:
+  case DefConst:
+  case Conjure:
+  case LdClsCachedSafe:
+  case LdClsInitData:
+  case LookupClsRDSHandle:
+  case DerefClsRDSHandle:
+  case LdCns:
+  case LdClsMethodFCacheFunc:
+  case GetCtxFwdCallDyn:
+  case GetCtxFwdCall:
+  case LdClsMethodCacheFunc:
+  case LdClsMethodCacheCls:
+  case LdClsMethod:
+  case LdPropAddr:
+  case LdObjClass:
+  case LdClsName:
+  case LdFuncCachedSafe:
+  case LdARFuncPtr:
+  case LdFuncNumParams:
+  case LdStrLen:
+  case LdStaticLocCached:
+  case NewInstanceRaw:
+  case NewArray:
+  case NewMixedArray:
+  case NewMIArray:
+  case NewMSArray:
+  case NewVArray:
+  case NewLikeArray:
+  case NewCol:
+  case FreeActRec:
+  case DefInlineFP:
+  case LdRetAddr:
+  case Mov:
+  case TakeRef:
+  case ReDefSP:
+  case CountArray:
+  case CountArrayFast:
+  case CountCollection:
+  case Nop:
+  case AKExists:
+  case LdBindAddr:
+  case LdSwitchDblIndex:
+  case LdSwitchStrIndex:
+  case LdSSwitchDestFast:
+  case CreateSSWH:
+  case LdContActRec:
+  case LdContArValue:
+  case LdContArKey:
+  case LdAsyncArParentChain:
+  case LdWHState:
+  case LdWHResult:
+  case LdAFWHActRec:
+  case LdResumableArObj:
+  case DefMIStateBase:
+  case LdMIStateAddr:
+  case StringIsset:
+  case ColIsEmpty:
+  case ColIsNEmpty:
+  case LdUnwinderValue:
+  case LdColArray:
+    assert(!inst->isControlFlow());
+    return true;
+
+  case AdjustSP:
+  case StStk:
+  case SpillFrame:
+  case CufIterSpillFrame:
+  case CheckType:
+  case CheckNullptr:
+  case AssertType:
+  case CheckTypeMem:
+  case GuardLoc:
+  case HintLocInner:
+  case CheckLoc:
+  case AssertLoc:
+  case GuardStk:
+  case HintStkInner:
+  case CheckStk:
+  case AssertStk:
+  case CastStk:
+  case CoerceStk:
+  case CoerceCellToBool:
+  case CoerceCellToInt:
+  case CoerceStrToInt:
+  case CoerceCellToDbl:
+  case CoerceStrToDbl:
+  case CheckInit:
+  case CheckInitMem:
+  case CheckCold:
+  case GuardRefs:
+  case CheckRefs:
+  case EndGuards:
+  case CheckNonNull:
+  case CheckStaticLocInit:
+  case DivDbl:
+  case AddIntO:
+  case SubIntO:
+  case MulIntO:
+  case ConvObjToArr:
+  case ConvCellToArr:
+  case ConvObjToDbl:
+  case ConvCellToDbl:
+  case ConvObjToInt:
+  case ConvCellToInt:
+  case ConvCellToObj:
+  case ConvObjToStr:
+  case ConvResToStr:
+  case ConvCellToStr:
+  case GtX:
+  case GteX:
+  case LtX:
+  case LteX:
+  case EqX:
+  case NeqX:
+  case JmpZero:
+  case JmpNZero:
+  case JmpSSwitchDest:
+  case JmpSwitchDest:
+  case CheckSurpriseFlags:
+  case ReturnHook:
+  case SuspendHookE:
+  case SuspendHookR:
+  case Halt:
+  case Jmp:
+  case DefLabel:
+  case Box:
+  case TakeStk:
+  case LdLocPseudoMain:
+  case LdVectorBase:
+  case LdPairBase:
+  case CheckRefInner:
+  case CheckCtxThis:
+  case LdClsCtor:
+  case LdCls:
+  case LdClsCached:
+  case LookupCns:
+  case LookupCnsE:
+  case LookupCnsU:
+  case LookupClsCns:
+  case LookupClsMethodFCache:
+  case LookupClsMethodCache:
+  case LookupClsMethod:
+  case LdGblAddr:
+  case LdGblAddrDef:
+  case LdClsPropAddrOrNull:
+  case LdClsPropAddrOrRaise:
+  case LdObjMethod:
+  case LdObjInvoke:
+  case LdArrFuncCtx:
+  case LdArrFPushCuf:
+  case LdStrFPushCuf:
+  case LdFunc:
+  case LdFuncCached:
+  case LdFuncCachedU:
+  case AllocObj:
+  case RegisterLiveObj:
+  case CheckInitProps:
+  case InitProps:
+  case CheckInitSProps:
+  case InitSProps:
+  case InitObjProps:
+  case ConstructInstance:
+  case CustomInstanceInit:
+  case AllocPackedArray:
+  case InitPackedArray:
+  case InitPackedArrayLoop:
+  case NewStructArray:
+  case Clone:
+  case InlineReturn:
+  case CallArray:
+  case Call:
+  case NativeImpl:
+  case CallBuiltin:
+  case RetCtrl:
+  case StRetVal:
+  case RetAdjustStk:
+  case ReleaseVVOrExit:
+  case GenericRetDecRefs:
+  case StMem:
+  case StElem:
+  case StLoc:
+  case StLocNT:
+  case StLocPseudoMain:
+  case StRef:
+  case EagerSyncVMRegs:
+  case ReqBindJmp:
+  case ReqRetranslate:
+  case ReqRetranslateOpt:
+  case IncRef:
+  case IncRefCtx:
+  case DecRefLoc:
+  case DecRefStk:
+  case DecRefThis:
+  case DecRef:
+  case DecRefMem:
+  case DecRefNZ:
+  case DefFP:
+  case DefSP:
+  case Count:
+  case VerifyParamCls:
+  case VerifyParamCallable:
+  case VerifyParamFail:
+  case VerifyRetCallable:
+  case VerifyRetCls:
+  case VerifyRetFail:
+  case RaiseUninitLoc:
+  case WarnNonObjProp:
+  case RaiseUndefProp:
+  case RaiseError:
+  case RaiseWarning:
+  case RaiseNotice:
+  case RaiseArrayIndexNotice:
+  case RaiseArrayKeyNotice:
+  case ClosureStaticLocInit:
+  case StaticLocInitCached:
+  case PrintStr:
+  case PrintInt:
+  case PrintBool:
+  case ConcatIntStr:
+  case ConcatStrInt:
+  case ConcatStrStr:
+  case ConcatCellCell:
+  case ConcatStr3:
+  case ConcatStr4:
+  case AddElemStrKey:
+  case AddElemIntKey:
+  case AddNewElem:
+  case ArrayAdd:
+  case ArrayIdx:
+  case GetMemoKey:
+  case GenericIdx:
+  case LdSwitchObjIndex:
+  case LdSSwitchDestSlow:
+  case InterpOne:
+  case InterpOneCF:
+  case OODeclExists:
+  case StClosureCtx:
+  case StClosureFunc:
+  case StClosureArg:
+  case CreateCont:
+  case CreateAFWH:
+  case AFWHPrepareChild:
+  case ContEnter:
+  case ContPreNext:
+  case ContStartedCheck:
+  case ContValid:
+  case ContArIncKey:
+  case ContArIncIdx:
+  case ContArUpdateIdx:
+  case LdContResumeAddr:
+  case StContArState:
+  case StContArResume:
+  case StContArValue:
+  case StContArKey:
+  case StAsyncArSucceeded:
+  case StAsyncArResume:
+  case StAsyncArResult:
+  case AFWHBlockOn:
+  case ABCUnblock:
+  case IncStat:
+  case IncTransCounter:
+  case IncStatGrouped:
+  case IncProfCounter:
+  case DbgAssertRefCount:
+  case DbgAssertPtr:
+  case DbgAssertType:
+  case DbgAssertRetAddr:
+  case RBTrace:
+  case ZeroErrorLevel:
+  case RestoreErrorLevel:
+  case IterInit:
+  case IterInitK:
+  case WIterInit:
+  case WIterInitK:
+  case MIterInit:
+  case MIterInitK:
+  case IterNext:
+  case IterNextK:
+  case WIterNext:
+  case WIterNextK:
+  case MIterNext:
+  case MIterNextK:
+  case IterFree:
+  case MIterFree:
+  case DecodeCufIter:
+  case CIterFree:
+  case BaseG:
+  case PropX:
+  case PropDX:
+  case CGetProp:
+  case VGetProp:
+  case BindProp:
+  case SetProp:
+  case UnsetProp:
+  case SetOpProp:
+  case IncDecProp:
+  case EmptyProp:
+  case IssetProp:
+  case ElemX:
+  case ElemArray:
+  case ElemArrayW:
+  case ElemDX:
+  case ElemUX:
+  case ArrayGet:
+  case StringGet:
+  case MapGet:
+  case CGetElem:
+  case VGetElem:
+  case BindElem:
+  case ArraySet:
+  case ArraySetRef:
+  case MapSet:
+  case SetElem:
+  case SetWithRefElem:
+  case UnsetElem:
+  case SetOpElem:
+  case IncDecElem:
+  case SetNewElem:
+  case SetNewElemArray:
+  case SetWithRefNewElem:
+  case BindNewElem:
+  case ArrayIsset:
+  case VectorIsset:
+  case PairIsset:
+  case MapIsset:
+  case IssetElem:
+  case EmptyElem:
+  case CheckBounds:
+  case ProfilePackedArray:
+  case ProfileStructArray:
+  case ProfileStr:
+  case CheckPackedArrayBounds:
+  case CheckTypePackedArrayElem:
+  case IsPackedArrayElemNull:
+  case LdPackedArrayElem:
+  case LdStructArrayElem:
+  case LdVectorSize:
+  case VectorDoCow:
+  case VectorHasImmCopy:
+  case ColAddNewElemC:
+  case ColAddElemC:
+  case BeginCatch:
+  case EndCatch:
+  case UnwindCheckSideExit:
+  case DeleteUnwinderException:
+  case CountBytecode:
+  case DbgTrashStk:
+  case DbgTrashFrame:
+  case DbgTrashMem:
+    return false;
+  }
+  not_reached();
+}
 
 /* DceFlags tracks the state of one instruction during dead code analysis. */
 struct DceFlags {
@@ -90,15 +536,15 @@ static_assert(sizeof(DceFlags) == 1, "sizeof(DceFlags) should be 1 byte");
 
 // DCE state indexed by instr->id().
 typedef StateVector<IRInstruction, DceFlags> DceState;
-typedef smart::hash_map<SSATmp*, uint32_t> UseCounts;
-typedef smart::list<const IRInstruction*> WorkList;
+typedef StateVector<SSATmp, uint32_t> UseCounts;
+typedef jit::vector<const IRInstruction*> WorkList;
 
 void removeDeadInstructions(IRUnit& unit, const DceState& state) {
   postorderWalk(unit, [&](Block* block) {
     block->remove_if([&] (const IRInstruction& inst) {
-      ONTRACE(7,
+      ONTRACE(4,
               if (state[inst].isDead()) {
-                FTRACE(3, "Removing dead instruction {}\n", inst.toString());
+                FTRACE(1, "Removing dead instruction {}\n", inst.toString());
               });
 
       // For now, all control flow instructions are essential. If we ever
@@ -110,52 +556,18 @@ void removeDeadInstructions(IRUnit& unit, const DceState& state) {
   });
 }
 
-bool isUnguardedLoad(IRInstruction* inst) {
-  if (!inst->hasDst() || !inst->dst()) return false;
-  Opcode opc = inst->op();
-  SSATmp* dst = inst->dst();
-  Type type = dst->type();
-  return ((opc == LdStack && (type == Type::Gen || type == Type::Cell)) ||
-          (opc == LdLoc && type == Type::Gen) ||
-          (opc == LdRef && type == Type::Cell) ||
-          (opc == LdMem && type == Type::Cell &&
-           inst->src(0)->type() == Type::PtrToCell) ||
-          (opc == Unbox && type == Type::Cell));
-}
-
 // removeUnreachable erases unreachable blocks from unit, and returns
 // a sorted list of the remaining blocks.
 BlockList prepareBlocks(IRUnit& unit) {
-  FTRACE(5, "RemoveUnreachable:vvvvvvvvvvvvvvvvvvvv\n");
-  SCOPE_EXIT { FTRACE(5, "RemoveUnreachable:^^^^^^^^^^^^^^^^^^^^\n"); };
+  FTRACE(1, "RemoveUnreachable:vvvvvvvvvvvvvvvvvvvv\n");
+  SCOPE_EXIT { FTRACE(1, "RemoveUnreachable:^^^^^^^^^^^^^^^^^^^^\n"); };
 
-  BlockList blocks = rpoSortCfg(unit);
-  bool needsResort = false;
+  auto const blocks = rpoSortCfg(unit);
 
-  // 1. simplify unguarded loads to remove unnecssary branches, and
-  //    perform copy propagation on every instruction. Targets that become
-  //    unreachable from this pass will be eliminated in step 2 below.
+  // 1. perform copy propagation on every instruction
   for (auto block : blocks) {
     for (auto& inst : *block) {
       copyProp(&inst);
-    }
-    auto inst = &block->back();
-    // if this is a load that does not generate a guard, then get rid
-    // of its label so that its not an essential control-flow
-    // instruction
-    if (isUnguardedLoad(inst) && inst->taken()) {
-      // LdStack and LdLoc instructions that produce generic types
-      // and LdStack instruction that produce Cell types will not
-      // generate guards, so remove the label from this instruction so
-      // that it's no longer an essential control-flow instruction
-      ITRACE(4, "removing taken branch of unguarded load {}\n",
-             *inst);
-      inst->setTaken(nullptr);
-      needsResort = true;
-      if (inst->next()) {
-        block->push_back(unit.gen(Jmp, inst->marker(), inst->next()));
-        inst->setNext(nullptr);
-      }
     }
   }
 
@@ -167,322 +579,225 @@ BlockList prepareBlocks(IRUnit& unit) {
   //    instructions.
   if (needsReflow) reflowTypes(unit);
 
-  if (needsResort) blocks = rpoSortCfg(unit);
   return blocks;
 }
 
-WorkList
-initInstructions(const BlockList& blocks, DceState& state) {
-  TRACE(5, "DCE(initInstructions):vvvvvvvvvvvvvvvvvvvv\n");
-  // mark reachable, essential, instructions live and enqueue them
+WorkList initInstructions(const IRUnit& unit, const BlockList& blocks,
+                          DceState& state) {
+  TRACE(1, "DCE(initInstructions):vvvvvvvvvvvvvvvvvvvv\n");
+  // Mark reachable, essential, instructions live and enqueue them.
   WorkList wl;
-  for (Block* block : blocks) {
-    for (IRInstruction& inst : *block) {
-      if (inst.isEssential()) {
-        state[inst].setLive();
-        wl.push_back(&inst);
+  wl.reserve(unit.numInsts());
+  forEachInst(blocks, [&] (IRInstruction* inst) {
+    if (!canDCE(inst)) {
+      state[inst].setLive();
+      wl.push_back(inst);
+    }
+  });
+  TRACE(1, "DCE:^^^^^^^^^^^^^^^^^^^^\n");
+  return wl;
+}
+
+//////////////////////////////////////////////////////////////////////
+
+/*
+ * A use of an inlined frame that can be modified to work without the
+ * frame is called a "weak use" here.  For example, storing to a local
+ * on a frame is weak because if no other uses of the frame are
+ * keeping it alive (for example a load of that same local), we can
+ * just remove the store.
+ *
+ * This routine counts the weak uses of inlined frames and marks them
+ * dead if they have no non-weak uses.  Returns true if any inlined
+ * frames were marked dead.
+ */
+bool findWeakActRecUses(const BlockList& blocks,
+                        DceState& state,
+                        IRUnit& unit,
+                        const UseCounts& uses) {
+  bool killedFrames = false;
+
+  auto const incWeak = [&] (const IRInstruction* inst, const SSATmp* src) {
+    assert(src->isA(Type::FramePtr));
+    auto const frameInst = src->inst();
+    if (frameInst->op() == DefInlineFP) {
+      ITRACE(3, "weak use of {} from {}\n", *frameInst, *inst);
+      state[frameInst].incWeakUse();
+    }
+  };
+
+  forEachInst(blocks, [&] (IRInstruction* inst) {
+    if (state[inst].isDead()) return;
+
+    switch (inst->op()) {
+    // We don't need to generate stores to a frame if it can be eliminated.
+    case StLocNT:
+    case StLoc:
+      incWeak(inst, inst->src(0));
+      break;
+
+    case InlineReturn:
+      {
+        auto const frameInst = inst->src(0)->inst();
+        assert(frameInst->is(DefInlineFP));
+        auto const frameUses = uses[frameInst->dst()];
+        auto const weakUses  = state[frameInst].weakUseCount();
+        /*
+         * We can kill the frame if all uses of the frame are counted
+         * as weak uses.  Note that this InlineReturn counts as a weak
+         * use, but we haven't incremented for it yet, which is where
+         * the "+ 1" comes from below.
+         */
+        ITRACE(2, "frame {}: weak/strong {}/{}\n",
+          *frameInst, weakUses, frameUses);
+        if (frameUses - (weakUses + 1) == 0) {
+          ITRACE(1, "killing frame {}\n", *frameInst);
+          killedFrames = true;
+          state[inst].setDead();
+          state[frameInst].setDead();
+        }
+      }
+      break;
+
+    default:
+      // Default is conservative: we don't increment a weak use if it
+      // uses the frame (or stack), so they can't be eliminated.
+      break;
+    }
+  });
+
+  return killedFrames;
+}
+
+/*
+ * The first time through, we've counted up weak uses of the frame and
+ * then finally marked it dead.  The instructions in between that were
+ * weak uses may need modifications now that their frame is going
+ * away.
+ *
+ * Also, if we eliminated some frames, DecRef instructions (which can
+ * re-enter the VM without requiring a materialized frame) need to
+ * have stack depths in their markers adjusted so they can't stomp on
+ * parts of the outer function.  We handle this conservatively by just
+ * pushing all DecRef markers where the DecRef is from a function
+ * other than the outer function down to a safe re-entry depth.
+ */
+void performActRecFixups(const BlockList& blocks,
+                         DceState& state,
+                         IRUnit& unit,
+                         const UseCounts& uses) {
+  // We limit the total stack depth during inlining, so this is the deepest
+  // we'll ever have to worry about.
+  auto const outerFunc = blocks.front()->front().marker().func();
+  auto const safeDepth = outerFunc->maxStackCells() + kStackCheckLeafPadding;
+  ITRACE(3, "safeDepth: {}, outerFunc depth: {}\n",
+         safeDepth,
+         outerFunc->maxStackCells());
+
+  for (auto block : blocks) {
+    ITRACE(2, "Visiting block {}\n", block->id());
+    Trace::Indent indenter;
+
+    for (auto& inst : *block) {
+      ITRACE(5, "{}\n", inst.toString());
+
+      switch (inst.op()) {
+      case DefInlineFP:
+        ITRACE(3, "DefInlineFP ({}): weak/strong uses: {}/{}\n",
+             inst, state[inst].weakUseCount(), uses[inst.dst()]);
+        break;
+
+      case StLocNT:
+      case StLoc:
+        if (state[inst.src(0)->inst()].isDead()) {
+          ITRACE(3, "marking {} as dead\n", inst);
+          state[inst].setDead();
+        }
+        break;
+
+      /*
+       * DecRef* are special: they're the only instructions that can reenter
+       * but not throw. This means it's safe to elide their inlined frame, as
+       * long as we adjust their markers to a depth that is guaranteed to not
+       * stomp on the caller's frame if it reenters.
+       */
+      case DecRef:
+      case DecRefLoc:
+      case DecRefStk:
+      case DecRefMem:
+        if (inst.marker().func() != outerFunc) {
+          ITRACE(3, "pushing stack depth of {} to {}\n", safeDepth, inst);
+          inst.marker().setSpOff(safeDepth);
+        }
+        break;
+
+      default:
+        break;
       }
     }
   }
-  TRACE(5, "DCE:^^^^^^^^^^^^^^^^^^^^\n");
-  return wl;
 }
 
 /*
  * Look for InlineReturn instructions that are the only "non-weak" use
  * of a DefInlineFP.  In this case we can kill both, which may allow
  * removing a SpillFrame as well.
+ *
+ * Prior to calling this routine, `uses' should contain the direct
+ * (non-transitive) use counts of each DefInlineFP instruction.  If
+ * the weak references are equal to the normal references, the
+ * instruction is not necessary and can be removed (if we make the
+ * required changes to each instruction that used it weakly).
  */
-void optimizeActRecs(BlockList& blocks, DceState& state, IRUnit& unit,
+void optimizeActRecs(const BlockList& blocks,
+                     DceState& state,
+                     IRUnit& unit,
                      const UseCounts& uses) {
-  FTRACE(3, "AR:vvvvvvvvvvvvvvvvvvvvv\n");
-  if (do_assert) {
-    for (UNUSED auto const& pair : uses) {
-      assert(pair.first->isA(Type::FramePtr));
-      assert(pair.first->inst()->is(DefInlineFP));
-    }
-  }
+  FTRACE(1, "AR:vvvvvvvvvvvvvvvvvvvvv\n");
+  SCOPE_EXIT { FTRACE(1, "AR:^^^^^^^^^^^^^^^^^^^^^\n"); };
 
-  SCOPE_EXIT { FTRACE(3, "AR:^^^^^^^^^^^^^^^^^^^^^\n"); };
-  using Trace::Indent;
-  Indent _i;
-
-  bool killedFrames = false;
-
-  smart::hash_map<SSATmp*, Offset> retFixupMap;
-  forEachInst(blocks, [&](IRInstruction* inst) {
-    if (state[inst].isDead()) return;
-
-    switch (inst->op()) {
-      // We don't need to generate stores to a frame if it can be eliminated.
-      case StLoc: {
-        auto const frameInst = frameRoot(inst->src(0)->inst());
-        if (frameInst->op() == DefInlineFP) {
-          ITRACE(4, "{} weak use of {}\n", *inst, *frameInst->dst());
-          state[frameInst].incWeakUse();
-        }
-        break;
-      }
-
-      case PassFP: {
-        auto frameInst = frameRoot(inst->src(0)->inst());
-        if (frameInst->op() == DefInlineFP) {
-          ITRACE(4, "{} weak use of {}\n", *inst, *frameInst->dst());
-          state[frameInst].incWeakUse();
-        }
-        break;
-      }
-
-      /* DefInlineFP counts as two weak uses of its containing frame, one for
-       * the DefInlineFP itself and one for the SpillFrame used here. We wait
-       * until this instruction to mark the SpillFrame's use as weak so a
-       * normal Call will prevent frames from being elided. */
-      case DefInlineFP: {
-        auto outerFrame = frameRoot(inst->src(2)->inst());
-        if (outerFrame->is(DefInlineFP)) {
-          ITRACE(4, "{} weak use of {}\n", *inst, *outerFrame->dst());
-          state[outerFrame].incWeakUse();
-
-          auto DEBUG_ONLY spillFrame = findSpillFrame(inst->src(0));
-          assert(spillFrame);
-          ITRACE(4, "{} weak use of {}\n", *spillFrame, *outerFrame->dst());
-          state[outerFrame].incWeakUse();
-        }
-        break;
-      }
-
-      case ReDefSP:
-      case DefInlineSP: {
-        auto const frameInst = frameRoot(inst->src(1)->inst());
-        if (frameInst->op() == DefInlineFP) {
-          ITRACE(4, "{} weak use of {}\n", *inst, *frameInst->dst());
-          state[frameInst].incWeakUse();
-        }
-        break;
-      }
-
-      case InlineReturn: {
-        auto* frameInst = frameRoot(inst->src(0)->inst());
-        assert(frameInst->is(DefInlineFP));
-        auto frameUses = folly::get_default(uses, frameInst->dst(), 0);
-        auto* spillInst = findSpillFrame(frameInst->src(0));
-
-        auto weakUses = state[frameInst].weakUseCount();
-        // We haven't counted this InlineReturn as a weak use yet,
-        // which is where this '1' comes from.
-        if (frameUses - weakUses == 1) {
-          ITRACE(4, "killing frame {}\n", *frameInst);
-          killedFrames = true;
-
-          Offset retBCOff = frameInst->extra<DefInlineFP>()->retBCOff;
-          retFixupMap[frameInst->dst()] = retBCOff;
-          ITRACE(4, "replacing {} and {} with PassFP/PassSP, removing {}\n",
-                 *frameInst, *spillInst, *inst);
-          unit.replace(frameInst, PassFP, frameInst->src(2));
-          unit.replace(spillInst, PassSP, spillInst->src(0));
-          inst->convertToNop();
-        } else {
-          ITRACE(3, "not killing frame {}, weak/strong {}/{}\n",
-                 *frameInst, weakUses, frameUses);
-        }
-        break;
-      }
-
-      default: {
-        break;
-      }
-    }
-  });
-
-  if (!killedFrames) return;
-
-  /*
-   * The first time through, we've counted up weak uses of the frame and then
-   * finally marked it dead.  The instructions in between that were weak uses
-   * may need modifications now that their frame is going away.
-   *
-   * frameDepths is used to keep track of the current maximum distance the
-   * stack could be from the enclosing frame pointer. This is used to update
-   * the BCMarkers of instructions that may be sensitive to having their
-   * enclosing frame elided.
-   */
-  smart::hash_map<Block*, uint32_t> frameDepths;
-  auto depth = [](const Func* func) {
-    return func->numSlotsInFrame() + func->maxStackCells();
-  };
-  frameDepths[blocks.front()] = 0;
-
-  // We limit the total stack depth during inlining, so this is the deepest
-  // we'll ever have to worry about.
-  auto* outerFunc = blocks.front()->front().marker().func();
-  auto const maxDepth = depth(outerFunc) + kStackCheckLeafPadding;
-
-  ITRACE(3, "Killed some frames. Iterating over blocks for fixups.\n");
-  for (auto* block : blocks) {
-    ITRACE(5, "Visiting block {}\n", block->id());
-    Indent _i;
-    assert(frameDepths.count(block));
-    auto curDepth = frameDepths[block];
-    frameDepths.erase(block);
-    ITRACE(5, "loaded depth {}\n", curDepth);
-
-    for (auto& inst : *block) {
-      switch (inst.op()) {
-        case DefInlineFP: {
-          auto* spillInst = findSpillFrame(inst.src(0));
-          assert(spillInst);
-          curDepth += depth(spillInst->marker().func());
-          ITRACE(4, "DefInlineFP ({}): weak/strong uses: {}/{}\n",
-                 inst, state[inst].weakUseCount(),
-                 folly::get_default(uses, inst.dst(), 0));
-          break;
-        }
-
-        case InlineReturn: {
-          auto* fpInst = frameRoot(inst.src(0)->inst());
-          assert(fpInst->is(DefInlineFP));
-          auto* spillInst = findSpillFrame(fpInst->src(0));
-          assert(spillInst);
-          curDepth -= depth(spillInst->marker().func());
-          assert(findPassFP(inst.src(0)->inst()) == nullptr &&
-                 "Eliminated DefInlineFP but left its InlineReturn");
-          break;
-        }
-
-        case DefInlineSP: {
-          if (findPassFP(inst.src(1)->inst())) {
-            ITRACE(4, "replacing {} with PassSP\n", inst);
-            unit.replace(&inst, PassSP, inst.src(0));
-            break;
-          }
-          break;
-        }
-
-        case StLoc: {
-          if (findPassFP(inst.src(0)->inst())) {
-            ITRACE(4, "marking {} as dead\n", inst);
-            state[inst].setDead();
-          }
-          break;
-        }
-
-        /*
-         * DecRef* are special: they're the only instructions that can reenter
-         * but not throw. This means it's safe to elide their inlined frame, as
-         * long as we adjust their markers to a depth that is guaranteed to not
-         * stomp on the caller's frame if it reenters.
-         */
-        case DecRef:
-        case DecRefLoc:
-        case DecRefStack:
-        case DecRefMem: {
-          DEBUG_ONLY auto spOff = inst.marker().spOff();
-          auto newDepth = int32_t(maxDepth - curDepth);
-          assert(spOff <= newDepth);
-          ITRACE(4, "adjusting marker spOff for {} from {} to {}\n",
-                 inst, spOff, newDepth);
-          inst.marker().setSpOff(newDepth);
-          break;
-        }
-
-        case ReDefSP: {
-          // The first real frame enclosing this ReDefSP may have changed, so
-          // update its frameOffset.
-          auto* fpInst = frameRoot(inst.src(1)->inst());
-          auto* realFp = fpInst->dst();
-          int32_t offset = 0;
-          auto const& extra = *inst.extra<ReDefSP>();
-          ITRACE(4, "calculating new offset for {}\n", inst);
-          Indent _i;
-
-          for (unsigned i = 0; i < extra.nFrames; ++i) {
-            auto& frame = extra.frames[i];
-            ITRACE(4, "adding {} for {}\n", frame.spOff, *frame.fp);
-            offset += frame.spOff;
-            if (frame.fp == realFp) break;
-            assert(i < extra.nFrames - 1);
-          }
-          ITRACE(4, "final offset: {}\n", offset);
-          inst.extra<ReDefSP>()->spOffset = offset;
-          break;
-        }
-
-        /*
-         * When we unroll the stack during an exception the unwinder relies on
-         * m_soff whenever it encounters an ActRec to properly restore the PC
-         * once the frame has been destroyed.  When we elide a frame from the
-         * stack we also update the PC pushed in any ActRec's pushed by a Call
-         * so that they reflect the frame that they logically fall inside of.
-         */
-        case Call: {
-          if (auto fpInst = findPassFP(inst.src(1)->inst())) {
-            not_reached(); // TODO t3203284
-            assert(retFixupMap.count(fpInst->dst()));
-            ITRACE(4, "{} repairing\n", inst);
-            Offset retBCOff = retFixupMap[fpInst->dst()];
-            inst.setSrc(2, unit.cns(retBCOff));
-          }
-          break;
-        }
-
-        default: {
-          break;
-        }
-      }
-    }
-
-    ITRACE(5, "finishing block B{} with depth {}\n", block->id(), curDepth);
-    if (auto* taken = block->taken()) {
-      if (!frameDepths.count(taken)) {
-        frameDepths[taken] = curDepth;
-      } else {
-        assert(frameDepths[taken] == curDepth);
-      }
-    }
-    if (auto* next = block->next()) {
-      if (!frameDepths.count(next)) {
-        frameDepths[next] = curDepth;
-      } else {
-        assert(frameDepths[next] == curDepth);
-      }
-    }
+  // Make a pass to find if we can kill any of the frames.  If so, we
+  // have to do some fixups.  These two routines are coupled---most
+  // cases in findWeakActRecUses should have a corresponding case in
+  // performActRecFixups to deal with the frame being removed.
+  auto const killedFrames = findWeakActRecUses(blocks, state, unit, uses);
+  if (killedFrames) {
+    ITRACE(1, "Killed some frames. Iterating over blocks for fixups.\n");
+    performActRecFixups(blocks, state, unit, uses);
   }
 }
+
+//////////////////////////////////////////////////////////////////////
 
 } // anonymous namespace
 
 // Publicly exported functions:
 
 void eliminateDeadCode(IRUnit& unit) {
-  Timer _t(Timer::optimize_dce);
+  Timer dceTimer(Timer::optimize_dce);
 
   // kill unreachable code and remove any traces that are now empty
-  BlockList blocks = prepareBlocks(unit);
+  auto const blocks = prepareBlocks(unit);
 
   // mark the essential instructions and add them to the initial
   // work list; this will also mark reachable exit traces. All
   // other instructions marked dead.
   DceState state(unit, DceFlags());
-  UseCounts uses;
-  WorkList wl = initInstructions(blocks, state);
+  UseCounts uses(unit, 0);
+  WorkList wl = initInstructions(unit, blocks, state);
 
   // process the worklist
   while (!wl.empty()) {
-    auto* inst = wl.front();
-    wl.pop_front();
-    for (uint32_t i = 0; i < inst->numSrcs(); i++) {
-      SSATmp* src = inst->src(i);
+    auto* inst = wl.back();
+    wl.pop_back();
+    for (auto src : inst->srcs()) {
       IRInstruction* srcInst = src->inst();
-      if (srcInst->op() == DefConst) {
-        continue;
-      }
+      if (srcInst->op() == DefConst) continue;
 
-      if (RuntimeOption::EvalHHIRInlineFrameOpts &&
-          src->isA(Type::FramePtr) && !srcInst->is(LdRaw, LdContActRec)) {
-        auto* root = frameRoot(srcInst);
-        if (root->is(DefInlineFP)) {
-          FTRACE(4, "adding use to {} from {}\n", *src, *inst);
-          ++uses[root->dst()];
+      if (RuntimeOption::EvalHHIRInlineFrameOpts) {
+        if (srcInst->is(DefInlineFP)) {
+          FTRACE(3, "adding use to {} from {}\n", *src, *inst);
+          ++uses[src];
         }
       }
 
@@ -494,12 +809,11 @@ void eliminateDeadCode(IRUnit& unit) {
   }
 
   if (RuntimeOption::EvalHHIRInlineFrameOpts) {
-    // Optimize unused inlined activation records.
     optimizeActRecs(blocks, state, unit, uses);
   }
 
-  // now remove instructions whose id == DEAD
+  // Now remove instructions whose state is DEAD.
   removeDeadInstructions(unit, state);
 }
 
-} }
+}}

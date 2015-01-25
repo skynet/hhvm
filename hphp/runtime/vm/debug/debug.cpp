@@ -30,7 +30,7 @@
 #include <cxxabi.h>
 #include <bfd.h>
 
-using namespace HPHP::JIT;
+using namespace HPHP::jit;
 
 namespace HPHP {
 namespace Debug {
@@ -151,8 +151,8 @@ void DebugInfo::generatePidMapOverlay() {
 }
 
 void DebugInfo::recordStub(TCRange range, const char* name) {
-  if (range.isAstubs()) {
-    m_astubsDwarfInfo.addTracelet(range, name, nullptr, nullptr, false, false);
+  if (range.isAcold()) {
+    m_acoldDwarfInfo.addTracelet(range, name, nullptr, nullptr, false, false);
   } else {
     m_aDwarfInfo.addTracelet(range, name, nullptr, nullptr, false, false);
   }
@@ -178,10 +178,10 @@ void DebugInfo::recordBCInstr(TCRange range, uint32_t op) {
 #undef O
   };
 
-  static const char* astubOpcodeName[] = {
-    "OpAstubStart",
+  static const char* acoldOpcodeName[] = {
+    "OpAcoldStart",
 #define O(name, imm, push, pop, flags) \
-#name "-Astub",
+#name "-Acold",
     OPCODES
 #undef O
   };
@@ -200,20 +200,21 @@ void DebugInfo::recordBCInstr(TCRange range, uint32_t op) {
     const char* name;
     if (op < Op_count) {
       name = opcodeName[op];
-    } else if (op < OpAstubCount) {
-      name = astubOpcodeName[op - OpAstubStart];
+    } else if (op < OpAcoldCount) {
+      name = acoldOpcodeName[op - OpAcoldStart];
     } else {
       name = highOpcodeName[op - OpHighStart];
     }
     fprintf(m_perfMap, "%lx %x %s\n",
             uintptr_t(range.begin()), range.size(), name);
+    fflush(m_perfMap);
   }
 }
 
 void DebugInfo::recordTracelet(TCRange range, const Func* func,
     const Op* instr, bool exit, bool inPrologue) {
-  if (range.isAstubs()) {
-    m_astubsDwarfInfo.addTracelet(range, nullptr, func,
+  if (range.isAcold()) {
+    m_acoldDwarfInfo.addTracelet(range, nullptr, func,
                                   instr, exit, inPrologue);
   } else {
     m_aDwarfInfo.addTracelet(range, nullptr, func, instr, exit, inPrologue);
@@ -238,7 +239,7 @@ void DebugInfo::recordDataMapImpl(void* from, void* to,
 
 void DebugInfo::debugSync() {
   m_aDwarfInfo.syncChunks();
-  m_astubsDwarfInfo.syncChunks();
+  m_acoldDwarfInfo.syncChunks();
 }
 
 std::string lookupFunction(const Func* f,

@@ -21,13 +21,15 @@
 #include <vector>
 #include <utility>
 
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 #include "hphp/util/arena.h"
-#include "hphp/runtime/vm/jit/ir.h"
+#include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
+#include "hphp/runtime/vm/jit/block.h"
 #include "hphp/runtime/vm/jit/cse.h"
 #include "hphp/runtime/base/memory-manager.h"
 
-namespace HPHP {  namespace JIT {
+namespace HPHP { namespace jit {
 
 //////////////////////////////////////////////////////////////////////
 
@@ -140,7 +142,7 @@ private:
 
   // Finally we end up here.
   Ret stop(IRInstruction* inst) {
-    if (debug) assertOperandTypes(inst);
+    assert(checkOperandTypes(inst));
     return func(inst);
   }
 
@@ -159,6 +161,10 @@ makeInstruction(Func func, Args&&... args) {
 
 //////////////////////////////////////////////////////////////////////
 
+/* Map from DefLabel instructions to produced references. See comment in
+ * IRBuilder::cond for more details. */
+using LabelRefs = jit::hash_map<const IRInstruction*, jit::vector<uint32_t>>;
+
 /*
  * IRUnit is the compilation unit for the JIT.  It owns an Arena used for
  * allocating and controlling the lifetime of Block, IRInstruction, ExtraData,
@@ -173,7 +179,7 @@ class IRUnit {
   TRACE_SET_MOD(hhir);
 
 public:
-  explicit IRUnit(Offset initialBcOffset);
+  explicit IRUnit(TransContext context);
 
   /*
    * Create an IRInstruction with lifetime equivalent to this IRUnit.
@@ -245,18 +251,7 @@ public:
                                   SSATmp* dst = nullptr) {
     auto newInst = new (m_arena) IRInstruction(
       m_arena, inst, IRInstruction::Id(m_nextInstId++));
-    if (newInst->modifiesStack()) {
-      assert(newInst->naryDst());
-      assert(!dst);
-      // The instruction is an opcode that modifies the stack, returning a new
-      // StkPtr.
-      int numDsts = 1 + (newInst->hasMainDst() ? 1 : 0);
-      SSATmp* dsts = (SSATmp*)m_arena.alloc(numDsts * sizeof(SSATmp));
-      for (int dstNo = 0; dstNo < numDsts; ++dstNo) {
-        new (&dsts[dstNo]) SSATmp(m_nextOpndId++, newInst, dstNo);
-      }
-      newInst->setDsts(numDsts, dsts);
-    } else if (dst) {
+    if (dst) {
       newInst->setDst(dst);
       dst->setInstruction(newInst, 0);
     } else {
@@ -269,8 +264,9 @@ public:
   /*
    * Some helpers for creating specific instruction patterns.
    */
-  IRInstruction* defLabel(unsigned numDst, BCMarker marker);
-  Block* defBlock();
+  IRInstruction* defLabel(unsigned numDst, BCMarker marker,
+                          const jit::vector<uint32_t>& producedRefs);
+  Block* defBlock(Block::Hint hint = Block::Hint::Neither);
 
   template<typename T> SSATmp* cns(T val) {
     return cns(Type::cns(val));
@@ -287,12 +283,14 @@ public:
    */
   IRInstruction* mov(SSATmp* dst, SSATmp* src, BCMarker marker);
 
-  Arena&   arena()               { return m_arena; }
-  uint32_t numTmps() const       { return m_nextOpndId; }
-  uint32_t numBlocks() const     { return m_nextBlockId; }
-  uint32_t numInsts() const      { return m_nextInstId; }
-  CSEHash& constTable()          { return m_constTable; }
-  uint32_t bcOff() const         { return m_bcOff; }
+  const TransContext& context() const { return m_context; }
+  Arena&   arena()                    { return m_arena; }
+  uint32_t numTmps() const            { return m_nextOpndId; }
+  uint32_t numBlocks() const          { return m_nextBlockId; }
+  uint32_t numInsts() const           { return m_nextInstId; }
+  CSEHash& constTable()               { return m_constTable; }
+  uint32_t bcOff() const              { return m_context.initBcOffset; }
+  SrcKey   initSrcKey() const         { return m_context.srcKey(); }
 
   // This should return a const Block*. t3538578
   Block*   entry() const         { return m_entry; }
@@ -302,6 +300,11 @@ public:
   uint32_t numIds(const Block*) const { return numBlocks(); }
   uint32_t numIds(const IRInstruction*) const { return numInsts(); }
 
+  const LabelRefs& labelRefs() const { return m_labelRefs; }
+
+  void collectPostConditions();
+  const PostConditions& postConditions() const;
+
   std::string toString() const;
 
 private:
@@ -310,11 +313,15 @@ private:
 private:
   Arena m_arena; // contains Block, IRInstruction, and SSATmp objects
   CSEHash m_constTable; // DefConst's for each unique constant in this IR
-  uint32_t m_nextBlockId;
-  uint32_t m_nextOpndId;
-  uint32_t m_nextInstId;
-  uint32_t m_bcOff; // bytecode offset where this unit starts
+  TransContext const m_context;
+  uint32_t m_nextBlockId{0};
+  uint32_t m_nextOpndId{0};
+  uint32_t m_nextInstId{0};
   Block* m_entry; // entry point
+
+  // Information collected for optimization passes
+  LabelRefs m_labelRefs;
+  PostConditions m_postConds;
 };
 
 //////////////////////////////////////////////////////////////////////

@@ -21,7 +21,6 @@
 #include <cstdint>
 
 #include "hphp/util/tls-pod-bag.h"
-#include "hphp/util/min-max-macros.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/smart-ptr.h"
 #include "hphp/runtime/base/complex-types.h"
@@ -32,22 +31,25 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 struct TypedValue;
-class c_Vector;
+class BaseVector;
 class BaseMap;
-class c_Set;
-class c_Pair;
+class BaseSet;
 class c_ImmVector;
 class c_ImmSet;
+class c_Pair;
 struct Iter;
 
 enum class IterNextIndex : uint16_t {
   ArrayPacked = 0,
   ArrayMixed,
+  ArrayStruct,
   Array,
   Vector,
   ImmVector,
   Map,
+  ImmMap,
   Set,
+  ImmSet,
   Pair,
   Object,
 };
@@ -78,7 +80,7 @@ struct ArrayIter {
    * Constructors.  Note that sometimes ArrayIter objects are created
    * without running their C++ constructor.  (See new_iter_array.)
    */
-  ArrayIter() : m_pos(ArrayData::invalid_index) {
+  ArrayIter() {
     m_data = nullptr;
   }
   explicit ArrayIter(const ArrayData* data);
@@ -86,8 +88,6 @@ struct ArrayIter {
     setArrayData(data);
     if (data) {
       m_pos = data->iter_begin();
-    } else {
-      m_pos = ArrayData::invalid_index;
     }
   }
   explicit ArrayIter(const MixedArray*) = delete;
@@ -95,14 +95,14 @@ struct ArrayIter {
   explicit ArrayIter(ObjectData* obj);
   ArrayIter(ObjectData* obj, NoInc);
   explicit ArrayIter(const Object& obj);
-  explicit ArrayIter(const Cell& c);
+  explicit ArrayIter(Cell);
   explicit ArrayIter(const Variant& v);
 
   // Copy ctor
   ArrayIter(const ArrayIter& iter);
 
   // Move ctor
-  ArrayIter(ArrayIter&& iter) {
+  ArrayIter(ArrayIter&& iter) noexcept {
     m_data = iter.m_data;
     m_pos = iter.m_pos;
     m_version = iter.m_version;
@@ -129,19 +129,21 @@ struct ArrayIter {
 
   explicit operator bool() { return !end(); }
   void operator++() { next(); }
-  bool end() {
+  bool end() const {
     if (LIKELY(hasArrayData())) {
-      return m_pos == ArrayData::invalid_index;
+      auto* ad = getArrayData();
+      return !ad || m_pos == ad->iter_end();
+      return endHelper();
     }
     return endHelper();
   }
-  bool endHelper();
+  bool endHelper() const;
 
   void next() {
     if (LIKELY(hasArrayData())) {
       const ArrayData* ad = getArrayData();
       assert(ad);
-      assert(m_pos != ArrayData::invalid_index);
+      assert(m_pos != ad->iter_end());
       m_pos = ad->iter_advance(m_pos);
       return;
     }
@@ -153,7 +155,7 @@ struct ArrayIter {
     if (LIKELY(hasArrayData())) {
       const ArrayData* ad = getArrayData();
       assert(ad);
-      assert(m_pos != ArrayData::invalid_index);
+      assert(m_pos != ad->iter_end());
       return ad->getKey(m_pos);
     }
     return firstHelper();
@@ -161,7 +163,7 @@ struct ArrayIter {
   Variant firstHelper();
   void nvFirst(TypedValue* out) {
     const ArrayData* ad = getArrayData();
-    assert(ad && m_pos != ArrayData::invalid_index);
+    assert(ad && m_pos != ad->iter_end());
     const_cast<ArrayData*>(ad)->nvGetKey(out, m_pos);
   }
 
@@ -186,23 +188,17 @@ struct ArrayIter {
   // Inline version of secondRef.  Only for use in iterator helpers.
   const TypedValue* nvSecond() const {
     const ArrayData* ad = getArrayData();
-    assert(ad && m_pos != ArrayData::invalid_index);
+    assert(ad && m_pos != ad->iter_end());
     return ad->getValueRef(m_pos).asTypedValue();
   }
-
-  /*
-   * Used by the ext_zend_compat layer.
-   * Identical to nvSecond but the output is boxed.
-   */
-  RefData* zSecond();
 
   bool hasArrayData() const {
     return !((intptr_t)m_data & 1);
   }
-  bool hasCollection() {
+  bool hasCollection() const {
     return (!hasArrayData() && getObject()->isCollection());
   }
-  bool hasIteratorObj() {
+  bool hasIteratorObj() const {
     return (!hasArrayData() && !getObject()->isCollection());
   }
 
@@ -286,7 +282,7 @@ struct ArrayIter {
     return m_nextHelperIdx;
   }
 
-  ObjectData* getObject() {
+  ObjectData* getObject() const {
     assert(!hasArrayData());
     return (ObjectData*)((intptr_t)m_obj & ~1);
   }
@@ -295,13 +291,14 @@ private:
   friend int64_t new_iter_array(Iter*, ArrayData*, TypedValue*);
   template<bool withRef>
   friend int64_t new_iter_array_key(Iter*, ArrayData*, TypedValue*,
-    TypedValue*);
+                                    TypedValue*);
+
   void arrInit(const ArrayData* arr);
 
   template <bool incRef>
   void objInit(ObjectData* obj);
 
-  void cellInit(const Cell& c);
+  void cellInit(Cell);
 
   static void VectorInit(ArrayIter* iter, ObjectData* obj);
   static void MapInit(ArrayIter* iter, ObjectData* obj);
@@ -317,24 +314,28 @@ private:
 
   void destruct();
 
-  c_Vector* getVector() {
-    assert(hasCollection() && getCollectionType() == Collection::VectorType);
-    return (c_Vector*)((intptr_t)m_obj & ~1);
+  BaseVector* getVector() const {
+    assert(hasCollection());
+    assert(getCollectionType() == Collection::VectorType ||
+           getCollectionType() == Collection::ImmVectorType);
+    return (BaseVector*)((intptr_t)m_obj & ~1);
   }
-  BaseMap* getMappish() {
+  BaseMap* getMap() const {
     assert(hasCollection());
     assert(Collection::isMapType(getCollectionType()));
     return (BaseMap*)((intptr_t)m_obj & ~1);
   }
-  c_Set* getSet() {
-    assert(hasCollection() && getCollectionType() == Collection::SetType);
-    return (c_Set*)((intptr_t)m_obj & ~1);
+  BaseSet* getSet() const {
+    assert(hasCollection());
+    assert(getCollectionType() == Collection::SetType ||
+           getCollectionType() == Collection::ImmSetType);
+    return (BaseSet*)((intptr_t)m_obj & ~1);
   }
-  c_Pair* getPair() {
+  c_Pair* getPair() const {
     assert(hasCollection() && getCollectionType() == Collection::PairType);
     return (c_Pair*)((intptr_t)m_obj & ~1);
   }
-  c_ImmVector* getImmVector() {
+  c_ImmVector* getImmVector() const {
     assert(hasCollection() &&
            getCollectionType() == Collection::ImmVectorType);
 
@@ -344,11 +345,11 @@ private:
     assert(hasCollection() && getCollectionType() == Collection::ImmSetType);
     return (c_ImmSet*)((intptr_t)m_obj & ~1);
   }
-  Collection::Type getCollectionType() {
+  Collection::Type getCollectionType() const {
     ObjectData* obj = getObject();
     return obj->getCollectionType();
   }
-  ObjectData* getIteratorObj() {
+  ObjectData* getIteratorObj() const {
     assert(hasIteratorObj());
     return getObject();
   }
@@ -378,6 +379,8 @@ private:
     ObjectData* m_obj;
   };
  public:
+  // m_pos is used by the array implementation to track the current position
+  // in the array. Beware that when m_data is null, m_pos is uninitialized.
   ssize_t m_pos;
  private:
   int m_version;
@@ -551,8 +554,8 @@ private:
     ArrayData* m_data;
   };
 public:
-  // m_pos is an opaque value used by the array implementation to track the
-  // current position in the array.
+  // m_pos is used by the array implementation to track the current position
+  // in the array.
   ssize_t m_pos;
 private:
   // m_container keeps track of which array we're "registered" with. Normally
@@ -562,7 +565,7 @@ private:
   ArrayData* m_container;
   // The m_resetFlag is used to indicate a mutable array iterator is
   // "before the first" position in the array.
-  uint32_t m_unused;
+  UNUSED uint32_t m_unused;
   uint32_t m_resetFlag;
 };
 
@@ -636,9 +639,9 @@ class CufIter {
   }
   void setName(StringData* name) { m_name = name; }
 
-  static uint32_t funcOff() { return offsetof(CufIter, m_func); }
-  static uint32_t ctxOff()  { return offsetof(CufIter, m_ctx); }
-  static uint32_t nameOff() { return offsetof(CufIter, m_name); }
+  static constexpr uint32_t funcOff() { return offsetof(CufIter, m_func); }
+  static constexpr uint32_t ctxOff()  { return offsetof(CufIter, m_ctx); }
+  static constexpr uint32_t nameOff() { return offsetof(CufIter, m_name); }
  private:
   const Func* m_func;
   void* m_ctx;
@@ -666,7 +669,7 @@ private:
     MArrayIter maiter;
     CufIter cufiter;
   } m_u;
-} __attribute__ ((aligned(16)));
+} __attribute__ ((__aligned__(16)));
 
 //////////////////////////////////////////////////////////////////////
 

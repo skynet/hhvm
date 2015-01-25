@@ -79,19 +79,25 @@
 #include <vector>
 #include <boost/algorithm/string.hpp>
 #include <boost/format.hpp>
-#include <boost/lexical_cast.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/noncopyable.hpp>
 #include <boost/bind.hpp>
 
-#include "folly/String.h"
+#include <folly/Conv.h>
+#include <folly/Range.h>
+#include <folly/String.h>
 
 #include "hphp/util/md5.h"
-#include "hphp/runtime/vm/as-shared.h"
-#include "hphp/runtime/vm/unit.h"
-#include "hphp/runtime/vm/hhbc.h"
-#include "hphp/runtime/vm/preclass-emit.h"
+
 #include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/repo-auth-type-codec.h"
+#include "hphp/runtime/base/repo-auth-type.h"
+#include "hphp/runtime/vm/as-shared.h"
+#include "hphp/runtime/vm/func-emitter.h"
+#include "hphp/runtime/vm/hhbc.h"
+#include "hphp/runtime/vm/preclass-emitter.h"
+#include "hphp/runtime/vm/unit.h"
+#include "hphp/runtime/vm/unit-emitter.h"
 #include "hphp/system/systemlib.h"
 
 TRACE_SET_MOD(hhas);
@@ -268,7 +274,7 @@ struct Input {
       }
     }
     error("EOF in string literal");
-    NOT_REACHED();
+    not_reached();
     return false;
   }
 
@@ -316,7 +322,7 @@ struct Input {
       buffer.push_back(c);
     }
     error("EOF in \"\"\"-string literal");
-    NOT_REACHED();
+    not_reached();
     return false;
   }
 
@@ -354,7 +360,7 @@ struct Input {
 private:
   struct is_bareword {
     bool operator()(int i) const {
-      return isalnum(i) || i == '_' || i == '.' || i == '$';
+      return isalnum(i) || i == '_' || i == '.' || i == '$' || i == '\\';
     }
   };
 
@@ -636,13 +642,13 @@ struct AsmState : private boost::noncopyable {
     for (std::vector<Id>::const_iterator it = label.dvInits.begin();
         it != label.dvInits.end();
         ++it) {
-      fe->setParamFuncletOff(*it, label.target);
+      fe->params[*it].funcletOff = label.target;
     }
 
     for (std::vector<size_t>::const_iterator it = label.ehFaults.begin();
         it != label.ehFaults.end();
         ++it) {
-      fe->ehtab()[*it].m_fault = label.target;
+      fe->ehtab[*it].m_fault = label.target;
     }
 
     for (Label::CatchesMap::const_iterator it = label.ehCatches.begin();
@@ -652,7 +658,7 @@ struct AsmState : private boost::noncopyable {
       for (std::vector<size_t>::const_iterator idx_it = it->second.begin();
           idx_it != it->second.end();
           ++idx_it) {
-        fe->ehtab()[*idx_it].m_catches.push_back(
+        fe->ehtab[*idx_it].m_catches.push_back(
           std::make_pair(exId, label.target));
       }
     }
@@ -684,7 +690,10 @@ struct AsmState : private boost::noncopyable {
     // Stack depth should be 0 at the end of a function body
     enforceStackDepth(0);
 
-    fe->setMaxStackCells(stackHighWater + kNumActRecCells + fdescHighWater);
+    fe->maxStackCells = fe->numLocals() +
+                        fe->numIterators() * kNumIterCells +
+                        stackHighWater +
+                        fdescHighWater; // in units of cells already
     fe->finish(ue->bcPos(), false);
     ue->recordFunction(fe);
 
@@ -818,11 +827,11 @@ template<class Target> Target read_opcode_arg(AsmState& as) {
     as.error("expected opcode or directive argument");
   }
   try {
-    return boost::lexical_cast<Target>(strVal);
-  } catch (boost::bad_lexical_cast&) {
+    return folly::to<Target>(strVal);
+  } catch (std::range_error&) {
     as.error("couldn't convert input argument (" + strVal + ") to "
              "proper type");
-    NOT_REACHED();
+    not_reached();
   }
 }
 
@@ -833,7 +842,7 @@ uint8_t read_subop(AsmState& as) {
     return static_cast<uint8_t>(*ty);
   }
   as.error("unknown subop name");
-  NOT_REACHED();
+  not_reached();
 }
 
 const StringData* read_litstr(AsmState& as) {
@@ -947,6 +956,108 @@ std::vector<unsigned char> read_immvector(AsmState& as, int& stackCount) {
   }
 
   return ret;
+}
+
+RepoAuthType read_repo_auth_type(AsmState& as) {
+  auto const str = read_opcode_arg<std::string>(as);
+  folly::StringPiece parse(str);
+
+  /*
+   * Note: no support for reading array types.  (The assembler only
+   * emits a single unit, so it can't really be involved in creating a
+   * ArrayTypeTable.)
+   */
+
+  using T = RepoAuthType::Tag;
+
+#define X(what, tag) \
+  if (parse.startsWith(what)) return RepoAuthType{tag}
+
+#define Y(what, tag)                                  \
+  if (parse.startsWith(what)) {                       \
+    parse.removePrefix(what);                         \
+    auto const cls = makeStaticString(parse.data());  \
+    as.ue->mergeLitstr(cls);                          \
+    return RepoAuthType{tag, cls};                    \
+  }
+
+  Y("Obj=",     T::ExactObj);
+  Y("?Obj=",    T::OptExactObj);
+  Y("?Obj<=",   T::OptSubObj);
+  Y("Obj<=",    T::SubObj);
+
+  X("Arr",      T::Arr);
+  X("?Arr",     T::OptArr);
+  X("Bool",     T::Bool);
+  X("?Bool",    T::OptBool);
+  X("Cell",     T::Cell);
+  X("Dbl",      T::Dbl);
+  X("?Dbl",     T::OptDbl);
+  X("Gen",      T::Gen);
+  X("InitCell", T::InitCell);
+  X("InitGen",  T::InitGen);
+  X("InitNull", T::InitNull);
+  X("InitUnc",  T::InitUnc);
+  X("Int",      T::Int);
+  X("?Int",     T::OptInt);
+  X("Null",     T::Null);
+  X("Obj",      T::Obj);
+  X("?Obj",     T::OptObj);
+  X("Ref",      T::Ref);
+  X("?Res",     T::OptRes);
+  X("Res",      T::Res);
+  X("?SArr",    T::OptSArr);
+  X("SArr",     T::SArr);
+  X("?SStr",    T::OptSStr);
+  X("SStr",     T::SStr);
+  X("?Str",     T::OptStr);
+  X("Str",      T::Str);
+  X("Unc",      T::Unc);
+  X("Uninit",   T::Uninit);
+
+#undef X
+#undef Y
+
+  // Make sure the above parsing code is revisited when new tags are
+  // added (we'll get a warning for a missing case label):
+  if (debug) switch (RepoAuthType{}.tag()) {
+  case T::Uninit:
+  case T::InitNull:
+  case T::Null:
+  case T::Int:
+  case T::OptInt:
+  case T::Dbl:
+  case T::OptDbl:
+  case T::Res:
+  case T::OptRes:
+  case T::Bool:
+  case T::OptBool:
+  case T::SStr:
+  case T::OptSStr:
+  case T::Str:
+  case T::OptStr:
+  case T::SArr:
+  case T::OptSArr:
+  case T::Arr:
+  case T::OptArr:
+  case T::Obj:
+  case T::OptObj:
+  case T::InitUnc:
+  case T::Unc:
+  case T::InitCell:
+  case T::Cell:
+  case T::Ref:
+  case T::InitGen:
+  case T::Gen:
+  case T::ExactObj:
+  case T::SubObj:
+  case T::OptExactObj:
+  case T::OptSubObj:
+    break;
+  }
+
+  as.error("unrecognized RepoAuthType format");
+  not_reached();
 }
 
 // Read in a vector of iterators the format for this vector is:
@@ -1071,6 +1182,7 @@ OpcodeParserMap opcode_parsers;
   }
 
 #define IMM_SA     as.ue->emitInt32(as.ue->mergeLitstr(read_litstr(as)))
+#define IMM_RATA   encodeRAT(*as.ue, read_repo_auth_type(as))
 #define IMM_I64A   as.ue->emitInt64(read_opcode_arg<int64_t>(as))
 #define IMM_DA     as.ue->emitDouble(read_opcode_arg<double>(as))
 #define IMM_LA     as.ue->emitIVA(as.getLocalId(  \
@@ -1192,7 +1304,7 @@ OpcodeParserMap opcode_parsers;
     }                                                                  \
                                                                        \
     /* Stack depth should be 1 after resume from suspend. */           \
-    if (thisOpcode == OpCreateCont || thisOpcode == OpAsyncSuspend ||  \
+    if (thisOpcode == OpCreateCont || thisOpcode == OpAwait ||         \
         thisOpcode == OpYield || thisOpcode == OpYieldK) {             \
       as.enforceStackDepth(1);                                         \
     }                                                                  \
@@ -1208,6 +1320,7 @@ OPCODES
 
 #undef IMM_I64A
 #undef IMM_SA
+#undef IMM_RATA
 #undef IMM_DA
 #undef IMM_IVA
 #undef IMM_LA
@@ -1325,13 +1438,13 @@ void parse_fault(AsmState& as, int nestLevel) {
   as.in.expectWs('{');
   parse_function_body(as, nestLevel + 1);
 
-  EHEnt& eh = as.fe->addEHEnt();
+  auto& eh = as.fe->addEHEnt();
   eh.m_type = EHEnt::Type::Fault;
   eh.m_base = start;
   eh.m_past = as.ue->bcPos();
   eh.m_iterId = iterId;
 
-  as.addLabelEHFault(label, as.fe->ehtab().size() - 1);
+  as.addLabelEHFault(label, as.fe->ehtab.size() - 1);
 }
 
 /*
@@ -1368,7 +1481,7 @@ void parse_catch(AsmState& as, int nestLevel) {
   as.in.expect('{');
   parse_function_body(as, nestLevel + 1);
 
-  EHEnt& eh = as.fe->addEHEnt();
+  auto& eh = as.fe->addEHEnt();
   eh.m_type = EHEnt::Type::Catch;
   eh.m_base = start;
   eh.m_past = as.ue->bcPos();
@@ -1377,7 +1490,7 @@ void parse_catch(AsmState& as, int nestLevel) {
   for (size_t i = 0; i < catches.size(); ++i) {
     as.addLabelEHCatch(catches[i].first,
                        catches[i].second,
-                       as.fe->ehtab().size() - 1);
+                       as.fe->ehtab.size() - 1);
   }
 }
 
@@ -1516,10 +1629,13 @@ void parse_parameter_list(AsmState& as) {
         as.error("expecting '...'");
       }
       as.in.expectWs(')');
-      as.fe->setAttrs(as.fe->attrs() | AttrMayUseVV);
+      as.fe->attrs |= AttrMayUseVV;
       break;
     }
-    if (ch == '&') { param.setRef(true); ch = as.in.getc(); }
+    if (ch == '&') {
+      param.byRef = true;
+      ch = as.in.getc();
+    }
     if (ch != '$') {
       as.error("function parameters must have a $ prefix");
     }
@@ -1537,13 +1653,13 @@ void parse_parameter_list(AsmState& as) {
       if (!as.in.readword(label)) {
         as.error("expected label name for dv-initializer");
       }
-      as.addLabelDVInit(label, as.fe->numParams());
+      as.addLabelDVInit(label, as.fe->params.size());
 
       as.in.skipWhitespace();
       ch = as.in.getc();
       if (ch == '(') {
         String str = parse_long_string(as);
-        param.setPhpCode(makeStaticString(str));
+        param.phpCode = makeStaticString(str);
         TypedValue tv;
         tvWriteUninit(&tv);
         if (str.size() == 4) {
@@ -1556,7 +1672,7 @@ void parse_parameter_list(AsmState& as) {
           tv = make_tv<KindOfBoolean>(false);
         }
         if (tv.m_type != KindOfUninit) {
-          param.setDefaultValue(tv);
+          param.defaultValue = tv;
         }
         as.in.expectWs(')');
         as.in.skipWhitespace();
@@ -1584,13 +1700,13 @@ void parse_function_flags(AsmState& as) {
     if (!as.in.readword(flag)) break;
 
     if (flag == "isGenerator") {
-      as.fe->setIsGenerator(true);
+      as.fe->isGenerator = true;
     } else if (flag == "isAsync") {
-      as.fe->setIsAsync(true);
+      as.fe->isAsync = true;
     } else if (flag == "isClosureBody") {
-      as.fe->setIsClosureBody(true);
+      as.fe->isClosureBody = true;
     } else if (flag == "isPairGenerator") {
-      as.fe->setIsPairGenerator(true);
+      as.fe->isPairGenerator = true;
     } else {
       as.error("Unexpected function flag \"" + flag + "\"");
     }
@@ -1715,8 +1831,8 @@ void parse_property(AsmState& as) {
 
   TypedValue tvInit = parse_member_tv_initializer(as);
   as.pce->addProperty(makeStaticString(name),
-                      attrs, empty_string.get(),
-                      empty_string.get(),
+                      attrs, staticEmptyString(),
+                      staticEmptyString(),
                       &tvInit,
                       RepoAuthType{});
 }
@@ -1735,8 +1851,8 @@ void parse_constant(AsmState& as) {
 
   TypedValue tvInit = parse_member_tv_initializer(as);
   as.pce->addConstant(makeStaticString(name),
-                      empty_string.get(), &tvInit,
-                      empty_string.get());
+                      staticEmptyString(), &tvInit,
+                      staticEmptyString());
 }
 
 /*
@@ -1937,7 +2053,7 @@ void parse_class(AsmState& as) {
                as.ue->bcPos(),
                attrs,
                makeStaticString(parentName),
-               empty_string.get());
+               staticEmptyString());
   for (size_t i = 0; i < ifaces.size(); ++i) {
     as.pce->addInterface(makeStaticString(ifaces[i]));
   }
@@ -1952,7 +2068,7 @@ void parse_class(AsmState& as) {
  */
 void parse_filepath(AsmState& as) {
   auto const str = read_litstr(as);
-  as.ue->setFilepath(str);
+  as.ue->m_filepath = str;
   as.in.expectWs(';');
 }
 
@@ -2052,7 +2168,7 @@ UnitEmitter* assemble_string(const char* code, int codeLen,
                              const char* filename, const MD5& md5) {
   std::unique_ptr<UnitEmitter> ue(new UnitEmitter(md5));
   StringData* sd = makeStaticString(filename);
-  ue->setFilepath(sd);
+  ue->m_filepath = sd;
 
   try {
     std::istringstream instr(std::string(code, codeLen));
@@ -2061,14 +2177,14 @@ UnitEmitter* assemble_string(const char* code, int codeLen,
     parse(as);
   } catch (const std::exception& e) {
     ue.reset(new UnitEmitter(md5));
-    ue->setFilepath(sd);
+    ue->m_filepath = sd;
     ue->initMain(1, 1);
     ue->emitOp(OpString);
     ue->emitInt32(ue->mergeLitstr(makeStaticString(e.what())));
     ue->emitOp(OpFatal);
     ue->emitByte(static_cast<uint8_t>(FatalOp::Runtime));
     FuncEmitter* fe = ue->getMain();
-    fe->setMaxStackCells(kNumActRecCells + 1);
+    fe->maxStackCells = 1;
     // XXX line numbers are bogus
     fe->finish(ue->bcPos(), false);
     ue->recordFunction(fe);

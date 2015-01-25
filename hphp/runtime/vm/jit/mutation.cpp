@@ -16,11 +16,11 @@
 
 #include "hphp/runtime/vm/jit/mutation.h"
 
+#include "hphp/runtime/vm/jit/cfg.h"
 #include "hphp/runtime/vm/jit/guard-relaxation.h"
-#include "hphp/runtime/vm/jit/simplifier.h"
 #include "hphp/runtime/vm/jit/state-vector.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 TRACE_SET_MOD(hhir);
 
@@ -116,22 +116,31 @@ void retypeDst(IRInstruction* inst, int num) {
     return;
   }
 
-  ssa->setType(outputType(inst, num));
+  // TODO: Task #6058731: remove this check and make things work with Bottom.
+  //
+  // Update the type of the SSATmp.  However, avoid generating type Bottom,
+  // which can happen when refining type of CheckType and AssertType.  In
+  // such cases, the code will be unreachable anyway.
+  auto newType = outputType(inst, num);
+  if (newType != Type::Bottom) {
+    ssa->setType(newType);
+  } else {
+    always_assert(inst->op() == CheckType || inst->op() == AssertType ||
+                  inst->op() == AssertNonNull);
+  }
 }
 }
 
-void retypeDests(IRInstruction* inst) {
+void retypeDests(IRInstruction* inst, const IRUnit* unit) {
   for (int i = 0; i < inst->numDsts(); ++i) {
     auto const ssa = inst->dst(i);
     auto const oldType = ssa->type();
     retypeDst(inst, i);
     if (!ssa->type().equals(oldType)) {
-      FTRACE(5, "reflowTypes: retyped {} in {}\n", oldType.toString(),
+      ITRACE(5, "reflowTypes: retyped {} in {}\n", oldType.toString(),
              inst->toString());
     }
   }
-
-  assertOperandTypes(inst);
 }
 
 /*
@@ -153,7 +162,7 @@ void reflowTypes(IRUnit& unit) {
     again = false;
     for (auto* block : blocklist.blocks) {
       FTRACE(5, "reflowTypes: visiting block {}\n", block->id());
-      for (auto& inst : *block) retypeDests(&inst);
+      for (auto& inst : *block) retypeDests(&inst, &unit);
       auto& jmp = block->back();
       auto n = jmp.numSrcs();
       if (!again && jmp.is(Jmp) && n > 0 && isBackEdge(block, jmp.taken())) {

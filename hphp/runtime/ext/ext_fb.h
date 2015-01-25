@@ -70,10 +70,18 @@ extern const int64_t k_XHPROF_FLAGS_VTSC;
 extern const int64_t k_XHPROF_FLAGS_TRACE;
 extern const int64_t k_XHPROF_FLAGS_MEASURE_XHPROF_DISABLE;
 extern const int64_t k_XHPROF_FLAGS_MALLOC;
+extern const int64_t k_XHPROF_FLAGS_I_HAVE_INFINITE_MEMORY;
 
 ///////////////////////////////////////////////////////////////////////////////
 
+enum FBCompactSerializeBehavior {
+  Base,
+  MemoizeParam,
+};
+
 Variant fb_unserialize(const char* str, int len, VRefParam success);
+String fb_compact_serialize(const Variant& thing,
+                            FBCompactSerializeBehavior behavior);
 Variant fb_compact_unserialize(const char* str, int len,
                                VRefParam success,
                                VRefParam errcode = null_variant);

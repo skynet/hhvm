@@ -17,19 +17,30 @@
 #include "hphp/runtime/vm/jit/arg-group.h"
 #include "hphp/runtime/vm/jit/code-gen-helpers.h"
 
-namespace HPHP {  namespace JIT {
+namespace HPHP { namespace jit {
 
 TRACE_SET_MOD(hhir);
 
-ArgDesc::ArgDesc(SSATmp* tmp, const PhysLoc& loc, bool val)
-  : m_zeroExtend(false), m_done(false) {
+const char* destTypeName(DestType dt) {
+  switch (dt) {
+    case DestType::None: return "None";
+    case DestType::SSA:  return "SSA";
+    case DestType::Byte: return "Byte";
+    case DestType::TV:   return "TV";
+    case DestType::Dbl:  return "Dbl";
+    case DestType::SIMD: return "SIMD";
+  }
+  not_reached();
+}
+
+ArgDesc::ArgDesc(SSATmp* tmp, Vloc loc, bool val) {
   if (tmp->isConst()) {
     // tmp is a constant
-    m_srcReg = InvalidReg;
     if (val) {
-      m_imm64 = tmp->type() <= Type::Null ? 0 : tmp->rawVal();
+      m_imm64 = tmp->rawVal();
     } else {
-      m_imm64 = toDataTypeForCall(tmp->type());
+      static_assert(offsetof(TypedValue, m_type) % 8 == 0, "");
+      m_imm64 = uint64_t(tmp->type().toDataType());
     }
     m_kind = Kind::Imm;
     return;
@@ -53,8 +64,8 @@ ArgDesc::ArgDesc(SSATmp* tmp, const PhysLoc& loc, bool val)
     return;
   }
   // arg is the (constant) type of a known-typed value.
-  m_srcReg = InvalidReg;
-  m_imm64 = toDataTypeForCall(tmp->type());
+  static_assert(offsetof(TypedValue, m_type) % 8 == 0, "");
+  m_imm64 = uint64_t(tmp->type().toDataType());
   m_kind = Kind::Imm;
 }
 

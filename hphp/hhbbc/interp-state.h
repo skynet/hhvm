@@ -18,12 +18,14 @@
 
 #include <vector>
 #include <string>
+#include <map>
 
 #include <boost/variant.hpp>
 
-#include "folly/Optional.h"
+#include <folly/Optional.h>
 
 #include "hphp/hhbbc/index.h"
+#include "hphp/hhbbc/misc.h"
 #include "hphp/hhbbc/type-system.h"
 #include "hphp/hhbbc/bc.h"
 
@@ -78,9 +80,34 @@ using Iter = boost::variant< UnknownIter
 
 /*
  * A program state at a position in a php::Block.
+ *
+ * The `initialized' flag indicates whether the state knows anything.  All
+ * other fields are invalid if a state is not initialized, and notably, after
+ * all analysis has run, any blocks that still don't have initialized input
+ * states are not reachable.
+ *
+ * The `unreachable' flag means we've produced this state from analysis, but
+ * the program cannot reach this program position.  This flag has two uses:
+ *
+ *    o It allows us to determine arbitrary mid-block positions where code
+ *      becomes unreachable, and eliminate that code in optimize.cpp.
+ *
+ *    o HHBC invariants can complicate removing unreachable code in FPI
+ *      regions---see the rules in bytecode.specification.  Inside FPI regions,
+ *      we still do abstract interpretation of the unreachable code, but this
+ *      flag is used when merging states to allow the interpreter to analyze
+ *      blocks that are unreachable without pessimizing states for reachable
+ *      blocks that would've been their successors.
+ *
+ * One other note: having the interpreter visit blocks when they are
+ * unreachable still potentially merges types into object properties that
+ * aren't possible at runtime.  We're only doing this to handle FPI regions for
+ * now, but it's not ideal.
+ *
  */
 struct State {
   bool initialized = false;
+  bool unreachable = false;
   bool thisAvailable = false;
   std::vector<Type> locals;
   std::vector<Iter> iters;
@@ -106,8 +133,9 @@ State without_stacks(const State&);
 //////////////////////////////////////////////////////////////////////
 
 /*
- * PropertiesInfo returns the PropState for private instance and static
- * properties.
+ * PropertiesInfo packages the PropState for private instance and
+ * static properties, which is cross-block information collected in
+ * CollectedInfo.
  *
  * During analysis the ClassAnalysis* is available and the PropState is
  * retrieved from there. However during optimization the ClassAnalysis is
@@ -127,6 +155,45 @@ private:
   ClassAnalysis* const m_cls;
   PropState m_privateProperties;
   PropState m_privateStatics;
+};
+
+//////////////////////////////////////////////////////////////////////
+
+/*
+ * Map from closure classes to types for each of their used vars.
+ * Shows up in a few different interpreter structures.
+ */
+using ClosureUseVarMap = std::map<
+  borrowed_ptr<php::Class>,
+  std::vector<Type>
+>;
+
+/*
+ * Merge the types in the vector as possible use vars for the closure
+ * `clo' into the destination map.
+ */
+void merge_closure_use_vars_into(ClosureUseVarMap& dst,
+                                 borrowed_ptr<php::Class> clo,
+                                 std::vector<Type>);
+
+//////////////////////////////////////////////////////////////////////
+
+/*
+ * Area used for writing down any information that is collected across
+ * a series of step operations (possibly cross block).
+ */
+struct CollectedInfo {
+  explicit CollectedInfo(const Index& index,
+                         Context ctx,
+                         ClassAnalysis* cls,
+                         PublicSPropIndexer* publicStatics)
+    : props{index, ctx, cls}
+    , publicStatics{publicStatics}
+  {}
+
+  ClosureUseVarMap closureUseTypes;
+  PropertiesInfo props;
+  PublicSPropIndexer* const publicStatics;
 };
 
 //////////////////////////////////////////////////////////////////////

@@ -8,8 +8,25 @@
  *
  *)
 
+(*
+ * This is how the javascript version of Hack figures out what dependencies
+ * it needs.
+ * On the IDE client, the user will open a file, and we'll try to typecheck it.
+ * When we finished typechecking, we needed to know what dependencies were
+ * missing (so we could pull them in)
+ *
+ * This was accomplished by replacing the Typing_deps module.
+ * By replacing the model, we can find out the names of every
+ * dependency the client has seen.
+ *)
 
 open Utils
+
+(* If we're currently adding a dependency. This should be false if we're adding
+ * a file we want to typecheck or autocomplete in. It should be true if it's
+ * a dependency of a file we're typechecking or autocompleting *)
+let is_dep = ref false
+
 (**********************************)
 (* Handling dependencies *)
 (**********************************)
@@ -17,6 +34,7 @@ open Utils
 module Dep = struct
   type t =
     | GConst of string
+    | GConstName of string
     | Const of string * string
     | Class of string
     | Fun of string
@@ -35,6 +53,7 @@ module Dep = struct
 
   let to_string = function
     | GConst s -> "const:"^s
+    | GConstName s -> "constname:"^s
     | Class s -> "class:"^s
     | Fun s -> "fun:"^s
     | FunName s -> "funname:"^s
@@ -72,6 +91,7 @@ let split_deps deps =
     match x with
     | Dep.Injectable -> funs, classes
     | Dep.GConst s
+    | Dep.GConstName s
     | Dep.Const (s, _)
     | Dep.CVar (s, _)
     | Dep.SCVar (s, _)
@@ -182,13 +202,28 @@ let add_idep root obj =
   | (Dep.FunName _ as x)
   | (Dep.Fun _ as x) -> deps := DSet.add x !deps
   | Dep.GConst s
+  | Dep.GConstName s
   | Dep.Const (s, _)
   | Dep.Class s
   | Dep.CVar (s, _)
   | Dep.SCVar (s, _)
   | Dep.Method (s, _)
   | Dep.SMethod (s, _)
-  | Dep.Cstr s -> deps := DSet.add (Dep.Class s) !deps
+  | Dep.Cstr s ->
+        (* Say we're typechecking FileA and FileA has a dependency on FileB.
+         * FileB has a dependency on FileC.
+         *
+         * When we typecheck FileA, we find out that we need FileB, so we
+         * hh_add_dep FileB.
+         *
+         * When FileB gets named and decled, it adds FileC to our dep set.
+         *
+         * However, we don't actually need FileC, unless FileB is inheriting
+         * from FileC.
+         *
+         * This If makes it so that FileC would not be added in this case.
+         *)
+      if not !is_dep then deps := DSet.add (Dep.Class s) !deps
   | Dep.Extends s -> 
       (match root with
       | Some (Dep.Class root) -> 

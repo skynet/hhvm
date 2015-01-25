@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <sys/types.h>
 
+#include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/base/array-common.h"
 
 namespace HPHP {
@@ -30,9 +31,7 @@ struct Variant;
 struct RefData;
 struct ArrayData;
 struct StringData;
-struct TypedValue;
 struct MArrayIter;
-struct APCHandle;
 struct MixedArray;
 
 //////////////////////////////////////////////////////////////////////
@@ -53,30 +52,24 @@ struct MixedArray;
 struct PackedArray {
   static void Release(ArrayData*);
   static const TypedValue* NvGetInt(const ArrayData*, int64_t ki);
-  static constexpr auto NvGetStr =
-    reinterpret_cast<const TypedValue* (*)(const ArrayData*,
-                                           const StringData*)>(
-      ArrayCommon::ReturnNull
-    );
+  static const TypedValue* NvGetIntConverted(const ArrayData*, int64_t ki);
+  static const TypedValue* NvGetStr(const ArrayData*, const StringData*);
   static void NvGetKey(const ArrayData*, TypedValue* out, ssize_t pos);
-  static ArrayData* SetInt(ArrayData*, int64_t k, const Variant& v, bool copy);
-  static ArrayData* SetStr(ArrayData*, StringData* k, const Variant& v,
-    bool copy);
+  static ArrayData* SetInt(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* SetIntConverted(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* SetStr(ArrayData*, StringData* k, Cell v, bool copy);
   static size_t Vsize(const ArrayData*);
   static const Variant& GetValueRef(const ArrayData* ad, ssize_t pos);
-  static constexpr auto IsVectorData =
-    reinterpret_cast<bool (*)(const ArrayData*)>(
-      ArrayCommon::ReturnTrue
-    );
+  static bool IsVectorData(const ArrayData*) {
+    return true;
+  }
   static bool ExistsInt(const ArrayData* ad, int64_t k);
-  static constexpr auto ExistsStr =
-    reinterpret_cast<bool (*)(const ArrayData*, const StringData*)>(
-      ArrayCommon::ReturnFalse
-    );
+  static bool ExistsStr(const ArrayData*, const StringData*);
   static ArrayData* LvalInt(ArrayData*, int64_t k, Variant*& ret, bool copy);
   static ArrayData* LvalStr(ArrayData*, StringData* k, Variant*& ret,
                             bool copy);
   static ArrayData* LvalNew(ArrayData*, Variant*& ret, bool copy);
+  static ArrayData* LvalNewRef(ArrayData*, Variant*& ret, bool copy);
   static ArrayData* SetRefInt(ArrayData*, int64_t k, Variant& v, bool copy);
   static ArrayData* SetRefStr(ArrayData*, StringData* k, Variant& v,
     bool copy);
@@ -85,6 +78,7 @@ struct PackedArray {
   static ArrayData* RemoveInt(ArrayData*, int64_t k, bool copy);
   static ArrayData* RemoveStr(ArrayData*, const StringData* k, bool copy);
   static ssize_t IterBegin(const ArrayData*);
+  static ssize_t IterLast(const ArrayData*);
   static ssize_t IterEnd(const ArrayData*);
   static ssize_t IterAdvance(const ArrayData*, ssize_t pos);
   static ssize_t IterRewind(const ArrayData*, ssize_t pos);
@@ -93,6 +87,7 @@ struct PackedArray {
   static ArrayData* Copy(const ArrayData* ad);
   static ArrayData* CopyWithStrongIterators(const ArrayData*);
   static ArrayData* NonSmartCopy(const ArrayData*);
+  static ArrayData* NonSmartCopyHelper(const ArrayData*);
   static ArrayData* EscalateForSort(ArrayData*);
   static void Ksort(ArrayData*, int, bool);
   static void Sort(ArrayData*, int, bool);
@@ -102,7 +97,7 @@ struct PackedArray {
   static bool Uasort(ArrayData*, const Variant&);
   static ArrayData* ZSetInt(ArrayData*, int64_t k, RefData* v);
   static ArrayData* ZSetStr(ArrayData*, StringData* k, RefData* v);
-  static ArrayData* ZAppend(ArrayData*, RefData* v);
+  static ArrayData* ZAppend(ArrayData*, RefData* v, int64_t* key_ptr);
   static ArrayData* Append(ArrayData*, const Variant& v, bool copy);
   static ArrayData* AppendRef(ArrayData*, Variant& v, bool copy);
   static ArrayData* AppendWithRef(ArrayData*, const Variant& v, bool copy);
@@ -111,26 +106,31 @@ struct PackedArray {
   static ArrayData* Pop(ArrayData*, Variant& value);
   static ArrayData* Dequeue(ArrayData*, Variant& value);
   static ArrayData* Prepend(ArrayData*, const Variant& v, bool copy);
-  static constexpr auto Renumber =
-    reinterpret_cast<void (*)(ArrayData*)>(
-      ArrayCommon::NoOp
-    );
+  static void Renumber(ArrayData*) {}
   static void OnSetEvalScalar(ArrayData*);
-  static constexpr auto Escalate =
-    reinterpret_cast<ArrayData* (*)(const ArrayData*)>(
-      ArrayCommon::ReturnFirstArg
-    );
-  static constexpr auto GetAPCHandle =
-    reinterpret_cast<APCHandle* (*)(const ArrayData*)>(
-      ArrayCommon::ReturnNull
-    );
+  static ArrayData* Escalate(const ArrayData* ad) {
+    return const_cast<ArrayData*>(ad);
+  }
 
   //////////////////////////////////////////////////////////////////////
 
   static bool checkInvariants(const ArrayData*);
 
+  /*
+   * Accepts any array of any kind satisfying isVectorData() and makes a
+   * non-smart packed copy, like NonSmartCopy().
+   */
+  static ArrayData* NonSmartConvert(const ArrayData*);
+  static ArrayData* NonSmartConvertHelper(const ArrayData*);
+
+  static ptrdiff_t entriesOffset();
+  static uint32_t getMaxCapInPlaceFast(uint32_t cap);
+
+  static size_t heapSize(const ArrayData*);
+
 private:
   static ArrayData* Grow(ArrayData*);
+  static ArrayData* GrowHelper(ArrayData*);
   static MixedArray* ToMixedHeader(const ArrayData*, size_t);
   static MixedArray* ToMixed(ArrayData*);
   static MixedArray* ToMixedCopy(const ArrayData*);
@@ -138,6 +138,25 @@ private:
   static ArrayData* CopyAndResizeIfNeededSlow(const ArrayData*);
   static ArrayData* CopyAndResizeIfNeeded(const ArrayData*);
   static ArrayData* ResizeIfNeeded(ArrayData*);
+
+public:
+  enum class Reason : uint8_t {
+    kForeachByRef,
+    kTakeByRef,
+    kSetRef,
+    kAppendRef,
+    kRemoveInt,
+    kRemoveStr,
+    kOutOfOrderIntKey,
+    kGetStr,
+    kSetStr,
+    kNumericString,
+    kPlusNotSupported,
+    kMergeNotSupported,
+    kSortNotSupported
+  };
+  static void downgradeAndWarn(ArrayData* ad, const Reason r);
+  static void warnUsage(const Reason r);
 };
 
 //////////////////////////////////////////////////////////////////////

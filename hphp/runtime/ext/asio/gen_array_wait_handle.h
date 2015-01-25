@@ -31,8 +31,7 @@ namespace HPHP {
  * preserves structure (order and keys) of the original array. If one of the
  * wait handles failed, the exception is propagated by failure.
  */
-FORWARD_DECLARE_CLASS(GenArrayWaitHandle);
-class c_GenArrayWaitHandle : public c_BlockableWaitHandle {
+class c_GenArrayWaitHandle final : public c_BlockableWaitHandle {
  public:
   DECLARE_CLASS_NO_SWEEP(GenArrayWaitHandle)
 
@@ -41,19 +40,17 @@ class c_GenArrayWaitHandle : public c_BlockableWaitHandle {
   {}
   ~c_GenArrayWaitHandle() {}
 
-  void t___construct();
   static void ti_setoncreatecallback(const Variant& callback);
   static Object ti_create(const Array& dependencies);
 
  public:
-  String getName();
-
- protected:
   void onUnblocked();
+  String getName();
   c_WaitableWaitHandle* getChild();
   void enterContextImpl(context_idx_t ctx_idx);
 
  private:
+  void setState(uint8_t state) { setKindState(Kind::GenArray, state); }
   void initialize(const Object& exception, const Array& deps,
                   ssize_t iter_pos, c_WaitableWaitHandle* child);
 
@@ -62,6 +59,11 @@ class c_GenArrayWaitHandle : public c_BlockableWaitHandle {
   Array m_deps;       // invariant: always kPackedKind or kMixedKind
   ssize_t m_iterPos;
 };
+
+inline c_GenArrayWaitHandle* c_WaitHandle::asGenArray() {
+  assert(getKind() == Kind::GenArray);
+  return static_cast<c_GenArrayWaitHandle*>(this);
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 }

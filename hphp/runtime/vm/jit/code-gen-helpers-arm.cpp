@@ -20,8 +20,12 @@
 #include "hphp/runtime/vm/jit/abi-arm.h"
 #include "hphp/runtime/vm/jit/back-end.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
-namespace HPHP { namespace JIT { namespace ARM {
+namespace HPHP { namespace jit { namespace arm {
 
 void emitRegGetsRegPlusImm(vixl::MacroAssembler& as,
                            const vixl::Register& dstReg,
@@ -43,15 +47,19 @@ void emitStoreRetIntoActRec(vixl::MacroAssembler& a) {
 //////////////////////////////////////////////////////////////////////
 
 TCA emitCall(vixl::MacroAssembler& a, CppCall call) {
-  if (call.isDirect()) {
-    a. Mov  (rHostCallReg, reinterpret_cast<intptr_t>(call.getAddress()));
-  } else if (call.isVirtual()) {
+  switch (call.kind()) {
+  case CppCall::Kind::Direct:
+    a. Mov  (rHostCallReg, reinterpret_cast<intptr_t>(call.address()));
+    break;
+  case CppCall::Kind::Virtual:
     a. Ldr  (rHostCallReg, argReg(0)[0]);
-    a. Ldr  (rHostCallReg, rHostCallReg[call.getOffset()]);
-  } else {
-    // call indirect currently not implemented. It'll be somthing like
-    // a.Br(x2a(call.getReg()))
+    a. Ldr  (rHostCallReg, rHostCallReg[call.vtableOffset()]);
+    break;
+  case CppCall::Kind::ArrayVirt:
+  case CppCall::Kind::Destructor:
     not_implemented();
+    always_assert(0);
+    break;
   }
 
   using namespace vixl;
@@ -67,8 +75,32 @@ TCA emitCall(vixl::MacroAssembler& a, CppCall call) {
   return fixupAddr;
 }
 
+Vpoint emitCall(Vout& v, CppCall call, RegSet args) {
+  PhysReg arg0(argReg(0));
+  PhysReg rHostCall(rHostCallReg);
+  switch (call.kind()) {
+  case CppCall::Kind::Direct:
+    v << ldimmq{reinterpret_cast<intptr_t>(call.address()), rHostCall};
+    break;
+  case CppCall::Kind::Virtual:
+    v << load{arg0[0], rHostCall};
+    v << load{rHostCall[call.vtableOffset()], rHostCall};
+    break;
+  case CppCall::Kind::ArrayVirt:
+  case CppCall::Kind::Destructor:
+    not_implemented();
+    always_assert(0);
+    break;
+  }
+  uint8_t argc = args.size();
+  args.add(rHostCall);
+  auto fixupAddr = v.makePoint();
+  v << hostcall{args, argc, fixupAddr};
+  return fixupAddr;
+}
+
 TCA emitCallWithinTC(vixl::MacroAssembler& a, TCA call) {
-  a. Mov  (rHostCallReg, reinterpret_cast<intptr_t>(call));
+  a.   Mov     (rHostCallReg, reinterpret_cast<intptr_t>(call));
 
   a.   Blr     (rHostCallReg);
   auto fixupAddr = a.frontier();
@@ -102,45 +134,66 @@ void emitRegRegMove(vixl::MacroAssembler& a, const vixl::CPURegister& dst,
 
 //////////////////////////////////////////////////////////////////////
 
-void emitTestSurpriseFlags(vixl::MacroAssembler& a) {
-  static_assert(RequestInjectionData::LastFlag < (1 << 8),
-                "Translator assumes RequestInjectionFlags fit in one byte");
-  a.  Ldrb  (rAsm, rVmTl[RDS::kConditionFlagsOff]);
-  a.  Tst   (rAsm, 0xff);
+void emitTestSurpriseFlags(vixl::MacroAssembler& a, PhysReg rds) {
+  // Keep this in sync with vasm version below
+  static_assert(RequestInjectionData::LastFlag < (1LL << 32),
+                "Translator assumes RequestInjectionFlags fit in 32-bit int");
+  a.  Ldr   (rAsm.W(), vixl::Register(rds)[RDS::kConditionFlagsOff]);
+  a.  Tst   (rAsm.W(), rAsm.W());
 }
 
-void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& stubsCode,
-                                 bool inTracelet, JIT::FixupMap& fixupMap,
-                                 JIT::Fixup fixup) {
+Vreg emitTestSurpriseFlags(Vout& v, Vreg rds) {
+  // Keep this in sync with arm version above
+  static_assert(RequestInjectionData::LastFlag < (1LL << 32),
+                "Translator assumes RequestInjectionFlags fit in 32-bit int");
+  auto flags = v.makeReg();
+  auto sf = v.makeReg();
+  v << loadl{rds[RDS::kConditionFlagsOff], flags};
+  v << testl{flags, flags, sf};
+  return sf;
+}
+
+void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
+                                 PhysReg rds, jit::Fixup fixup) {
+  // keep this in sync with vasm version below
   vixl::MacroAssembler a { mainCode };
-  vixl::MacroAssembler astubs { stubsCode };
+  vixl::MacroAssembler acold { coldCode };
 
-  emitTestSurpriseFlags(a);
-  mcg->backEnd().emitSmashableJump(mainCode, stubsCode.frontier(), CC_NZ);
+  emitTestSurpriseFlags(a, rds);
+  mcg->backEnd().emitSmashableJump(mainCode, coldCode.frontier(), CC_NZ);
 
-  astubs.  Mov  (argReg(0), rVmFp);
+  acold.  Mov  (argReg(0), rVmFp);
 
   auto fixupAddr =
-    emitCallWithinTC(astubs, tx->uniqueStubs.functionEnterHelper);
-  if (inTracelet) {
-    fixupMap.recordSyncPoint(fixupAddr,
-                             fixup.m_pcOffset, fixup.m_spOffset);
-  } else {
-    // If we're being called while generating a func prologue, we
-    // have to record the fixup directly in the fixup map instead of
-    // going through the pending fixup path like normal.
-    fixupMap.recordFixup(fixupAddr, fixup);
-  }
-  mcg->backEnd().emitSmashableJump(stubsCode, mainCode.frontier(), CC_None);
+      emitCallWithinTC(acold, mcg->tx().uniqueStubs.functionEnterHelper);
+  mcg->recordSyncPoint(fixupAddr, fixup.pcOffset, fixup.spOffset);
+  mcg->backEnd().emitSmashableJump(coldCode, mainCode.frontier(), CC_None);
+}
+
+void emitCheckSurpriseFlagsEnter(Vout& v, Vout& vc, Vreg rds,
+                                 jit::Fixup fixup) {
+  // keep this in sync with arm version above
+  PhysReg fp{rVmFp}, arg0{argReg(0)};
+  auto surprise = vc.makeBlock();
+  auto done = v.makeBlock();
+  auto sf = emitTestSurpriseFlags(v, rds);
+  v << jcc{CC_NZ, sf, {done, surprise}};
+
+  vc = surprise;
+  vc << copy{fp, arg0};
+  vc << callr{vc.cns(mcg->tx().uniqueStubs.functionEnterHelper), argSet(1)};
+  vc << syncpoint{fixup};
+  vc << jmp{done};
+  v = done;
 }
 
 //////////////////////////////////////////////////////////////////////
 
-void emitEagerVMRegSave(vixl::MacroAssembler& a, RegSaveFlags flags) {
-  a.    Str  (rVmSp, rGContextReg[offsetof(ExecutionContext, m_stack) +
-                                  Stack::topOfStackOffset()]);
+void emitEagerVMRegSave(vixl::MacroAssembler& a, vixl::Register rds,
+                        RegSaveFlags flags) {
+  a.    Str  (rVmSp, rds[RDS::kVmspOff]);
   if ((bool)(flags & RegSaveFlags::SaveFP)) {
-    a.  Str  (rVmFp, rGContextReg[offsetof(ExecutionContext, m_fp)]);
+    a.  Str  (rVmFp, rds[RDS::kVmfpOff]);
   }
 
   if ((bool)(flags & RegSaveFlags::SavePC)) {
@@ -149,19 +202,19 @@ void emitEagerVMRegSave(vixl::MacroAssembler& a, RegSaveFlags flags) {
     a.  Ldr  (rAsm, rAsm[Func::unitOff()]);
     a.  Ldr  (rAsm, rAsm[Unit::bcOff()]);
     a.  Add  (rAsm, rAsm, vixl::Operand(argReg(0), vixl::UXTW));
-    a.  Str  (rAsm, rGContextReg[offsetof(ExecutionContext, m_pc)]);
+    a.  Str  (rAsm, rds[RDS::kVmpcOff]);
   }
 }
 
 //////////////////////////////////////////////////////////////////////
 
 void emitTransCounterInc(vixl::MacroAssembler& a) {
-  if (!tx->isTransDBEnabled()) return;
+  if (!mcg->tx().isTransDBEnabled()) return;
 
   // TODO(#3057328): this is not thread-safe. This should be a "load-exclusive,
   // increment, store-exclusive, loop" sequence, but vixl doesn't yet support
   // the exclusive-access instructions.
-  a.   Mov   (rAsm, tx->getTransCounterAddr());
+  a.   Mov   (rAsm, mcg->tx().getTransCounterAddr());
   a.   Ldr   (rAsm2, rAsm[0]);
   a.   Add   (rAsm2, rAsm2, 1);
   a.   Str   (rAsm2, rAsm[0]);

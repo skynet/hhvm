@@ -1,6 +1,4 @@
 <?php
-ini_set('open_basedir', .);
-
 require_once "open_basedir.inc";
 $initdir = getcwd();
 test_open_basedir_before("symlink");
@@ -30,6 +28,7 @@ var_dump(unlink($symlink));
 
 test_open_basedir_after("symlink");
 ?>
+<?php error_reporting(0); ?>
 <?php
 require_once "open_basedir.inc";
 delete_directories();

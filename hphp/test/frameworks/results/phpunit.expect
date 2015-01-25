@@ -2,6 +2,20 @@ CountTest::testCount
 .
 CountTest::testCountDoesNotChangeIteratorKey
 .
+ExceptionMessageTest::testLiteralMessage
+.
+ExceptionMessageTest::testMessageWithXdebugScreamOn
+S
+ExceptionMessageTest::testPatialMessageBegin
+.
+ExceptionMessageTest::testPatialMessageEnd
+.
+ExceptionMessageTest::testPatialMessageMiddle
+.
+ExceptionMessageTest::testRegexMessage
+.
+ExceptionMessageTest::testRegexMessageExtreme
+.
 Extensions_RepeatedTestTest::testRepeatedMoreThanOnce
 .
 Extensions_RepeatedTestTest::testRepeatedNegative
@@ -1268,95 +1282,7 @@ Framework_AssertTest::testXMLStructureWrongNumberOfNodes
 .
 Framework_AssertTest::testXmlStringNotEqualsXmlFile
 .
-Framework_Assert_FunctionsTest::testLogicalAnd
-.
-Framework_Assert_FunctionsTest::testLogicalOr
-.
-Framework_Assert_FunctionsTest::testLogicalXor
-.
 Framework_BaseTestListenerTest::testEndEventsAreCounted
-.
-Framework_ComparatorTest::testGetInstance with data set #0
-.
-Framework_ComparatorTest::testGetInstance with data set #1
-.
-Framework_ComparatorTest::testGetInstance with data set #10
-.
-Framework_ComparatorTest::testGetInstance with data set #11
-.
-Framework_ComparatorTest::testGetInstance with data set #12
-.
-Framework_ComparatorTest::testGetInstance with data set #13
-.
-Framework_ComparatorTest::testGetInstance with data set #14
-.
-Framework_ComparatorTest::testGetInstance with data set #15
-.
-Framework_ComparatorTest::testGetInstance with data set #16
-.
-Framework_ComparatorTest::testGetInstance with data set #17
-.
-Framework_ComparatorTest::testGetInstance with data set #18
-.
-Framework_ComparatorTest::testGetInstance with data set #19
-.
-Framework_ComparatorTest::testGetInstance with data set #2
-.
-Framework_ComparatorTest::testGetInstance with data set #20
-.
-Framework_ComparatorTest::testGetInstance with data set #21
-.
-Framework_ComparatorTest::testGetInstance with data set #22
-.
-Framework_ComparatorTest::testGetInstance with data set #23
-.
-Framework_ComparatorTest::testGetInstance with data set #24
-.
-Framework_ComparatorTest::testGetInstance with data set #25
-.
-Framework_ComparatorTest::testGetInstance with data set #26
-.
-Framework_ComparatorTest::testGetInstance with data set #27
-.
-Framework_ComparatorTest::testGetInstance with data set #28
-.
-Framework_ComparatorTest::testGetInstance with data set #29
-.
-Framework_ComparatorTest::testGetInstance with data set #3
-.
-Framework_ComparatorTest::testGetInstance with data set #30
-.
-Framework_ComparatorTest::testGetInstance with data set #31
-.
-Framework_ComparatorTest::testGetInstance with data set #32
-.
-Framework_ComparatorTest::testGetInstance with data set #33
-.
-Framework_ComparatorTest::testGetInstance with data set #34
-.
-Framework_ComparatorTest::testGetInstance with data set #35
-.
-Framework_ComparatorTest::testGetInstance with data set #36
-.
-Framework_ComparatorTest::testGetInstance with data set #37
-.
-Framework_ComparatorTest::testGetInstance with data set #38
-.
-Framework_ComparatorTest::testGetInstance with data set #4
-.
-Framework_ComparatorTest::testGetInstance with data set #5
-.
-Framework_ComparatorTest::testGetInstance with data set #6
-.
-Framework_ComparatorTest::testGetInstance with data set #7
-.
-Framework_ComparatorTest::testGetInstance with data set #8
-.
-Framework_ComparatorTest::testGetInstance with data set #9
-.
-Framework_ComparatorTest::testRegister
-.
-Framework_ComparatorTest::testUnregister
 .
 Framework_ConstraintTest::testAttributeEqualTo
 .
@@ -1636,175 +1562,13 @@ Framework_Constraint_JsonMatches_ErrorMessageProviderTest::testTranslateTypeToPr
 .
 Framework_Constraint_JsonMatches_ErrorMessageProviderTest::testTranslateTypeToPrefix with data set "expected"
 .
-Framework_SelectorAssertionsTest::testAssertAdjacentSiblingContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertAdjacentSiblingSubAdjacentSibling
-.
-Framework_SelectorAssertionsTest::testAssertAncestorContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertChildContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertChildSubChildren
-.
-Framework_SelectorAssertionsTest::testAssertChildrenContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertDescendantContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertNotTagContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertNotTagTypeIdFalse
-.
-Framework_SelectorAssertionsTest::testAssertParentContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountAdjacentSiblingFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountAdjacentSiblingTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountChildFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountChildTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountDescendantFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountDescendantTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountGreaterThanEqualToFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountGreaterThanEqualToTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountGreaterThanFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountGreaterThanTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountLessThanEqualToFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountLessThanEqualToTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountLessThanFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountLessThanTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountNotPresentTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountPresentFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountPresentTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountRangeFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectCountRangeTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectEqualsContentNotPresentFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectEqualsContentNotPresentTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectEqualsContentPresentFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectEqualsContentPresentTrue
-.
-Framework_SelectorAssertionsTest::testAssertSelectNotPresentFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectRegExpContentPresentFalse
-.
-Framework_SelectorAssertionsTest::testAssertSelectRegExpContentPresentTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagAdjacentSiblingFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagAdjacentSiblingTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagAncestorFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagAncestorTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesMultiPartClassFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesMultiPartClassTrueA
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesMultiPartClassTrueB
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesRegexpFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesRegexpModifierFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesRegexpModifierTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesRegexpTrueA
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesRegexpTrueB
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesTrueA
-.
-Framework_SelectorAssertionsTest::testAssertTagAttributesTrueB
-.
-Framework_SelectorAssertionsTest::testAssertTagCdataContentTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagCdataontentFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagChildFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagChildTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenCountFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenCountTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenGreaterThanFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenGreaterThanTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenLessThanFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenLessThanTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenOnlyFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagChildrenOnlyTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagContentAttributes
-.
-Framework_SelectorAssertionsTest::testAssertTagDescendantFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagDescendantTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagIdFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagIdTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagMultiplePossibleChildren
-.
-Framework_SelectorAssertionsTest::testAssertTagParentFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagParentTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagRegexpContentFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagRegexpContentTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagRegexpModifierContentTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagStringContentFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagStringContentTrue
-.
-Framework_SelectorAssertionsTest::testAssertTagTypeFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagTypeIdFalse
-.
-Framework_SelectorAssertionsTest::testAssertTagTypeIdTrueA
-.
-Framework_SelectorAssertionsTest::testAssertTagTypeIdTrueB
-.
-Framework_SelectorAssertionsTest::testAssertTagTypeIdTrueC
-.
-Framework_SelectorAssertionsTest::testAssertTagTypeTrue
-.
 Framework_SuiteTest::testAddTestSuite
 .
 Framework_SuiteTest::testBeforeAnnotation
 .
 Framework_SuiteTest::testBeforeClassAndAfterClassAnnotations
+.
+Framework_SuiteTest::testDontSkipInheritedClass
 .
 Framework_SuiteTest::testInheritedTests
 .
@@ -1840,6 +1604,14 @@ Framework_TestCaseTest::testExceptionInTearDown
 .
 Framework_TestCaseTest::testExceptionInTest
 .
+Framework_TestCaseTest::testExceptionWithMessage
+.
+Framework_TestCaseTest::testExceptionWithRegexpMessage
+.
+Framework_TestCaseTest::testExceptionWithWrongMessage
+.
+Framework_TestCaseTest::testExceptionWithWrongRegexpMessage
+.
 Framework_TestCaseTest::testExpectOutputRegexFooActualBar
 .
 Framework_TestCaseTest::testExpectOutputRegexFooActualFoo
@@ -1861,6 +1633,8 @@ Framework_TestCaseTest::testNoException
 Framework_TestCaseTest::testRequiringAnExistingExtensionDoesNotSkip
 .
 Framework_TestCaseTest::testRequiringAnExistingFunctionDoesNotSkip
+.
+Framework_TestCaseTest::testRequiringAnExistingMethodDoesNotSkip
 .
 Framework_TestCaseTest::testRequiringAnExistingOsDoesNotSkip
 .
@@ -1904,6 +1678,10 @@ Util_ConfigurationTest::testFilterConfigurationIsReadCorrectly
 .
 Util_ConfigurationTest::testGroupConfigurationIsReadCorrectly
 .
+Util_ConfigurationTest::testHandlePHPConfigurationDoesNotOverriteVariablesFromPutEnv
+.
+Util_ConfigurationTest::testHandlePHPConfigurationDoesNotOverwrittenExistingEnvArrayVariables
+.
 Util_ConfigurationTest::testListenerConfigurationIsReadCorrectly
 .
 Util_ConfigurationTest::testLoggingConfigurationIsReadCorrectly
@@ -1916,7 +1694,23 @@ Util_ConfigurationTest::testPHPUnitConfigurationIsReadCorrectly
 .
 Util_ConfigurationTest::testSeleniumBrowserConfigurationIsReadCorrectly
 .
+Util_ConfigurationTest::testWithEmptyConfigurations
+.
 Util_ConfigurationTest::testXincludeInConfiguration
+.
+Util_RegexTest::testInvalidRegex with data set #0
+.
+Util_RegexTest::testInvalidRegex with data set #1
+.
+Util_RegexTest::testInvalidRegex with data set #2
+.
+Util_RegexTest::testValidRegex with data set #0
+.
+Util_RegexTest::testValidRegex with data set #1
+.
+Util_RegexTest::testValidRegex with data set #2
+.
+Util_RegexTest::testValidRegex with data set #3
 .
 Util_TestDox_NamePrettifierTest::testCaterForUserDefinedPrefix
 .

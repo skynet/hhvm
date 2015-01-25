@@ -16,7 +16,8 @@
 #ifndef incl_HPHP_PORTABILITY_H_
 #define incl_HPHP_PORTABILITY_H_
 
-#include "folly/Likely.h" // defining LIKELY/UNLIKELY is part of this header
+#include <folly/Likely.h> // defining LIKELY/UNLIKELY is part of this header
+#include <folly/CPortability.h> // defining FOLLY_DISABLE_ADDRESS_SANITIZER
 
 namespace HPHP {
 
@@ -87,7 +88,7 @@ namespace HPHP {
     __attribute__((__section__(".text.keep")))
 #else
 # define KEEP_SECTION \
-    __attribute__((__section__(".text.keep,")))
+    __attribute__((__section__(".text,.text.keep")))
 #endif
 
 //////////////////////////////////////////////////////////////////////
@@ -118,6 +119,14 @@ namespace HPHP {
 # error What are the stack and frame pointers called on your architecture?
 
 #endif
+
+//////////////////////////////////////////////////////////////////////
+
+// We reserve the exit status 127 to signal a failure in the
+// interpreter. 127 is a valid exit code on all reasonable
+// architectures: POSIX requires at least 8 unsigned bits and
+// Windows 32 signed bits.
+#define HPHP_EXIT_FAILURE 127
 
 //////////////////////////////////////////////////////////////////////
 

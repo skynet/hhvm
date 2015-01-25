@@ -16,26 +16,44 @@
 #ifndef incl_HPHP_PACKED_ARRAY_DEFS_H_
 #define incl_HPHP_PACKED_ARRAY_DEFS_H_
 
+#include "hphp/runtime/base/packed-array.h"
+#include "hphp/runtime/base/cap-code.h"
+
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
 constexpr uint32_t kPackedSmallSize = 3; // same as mixed-array for now
-constexpr uint32_t kMaxPackedCap = 1 << 24;
 
 //////////////////////////////////////////////////////////////////////
-
-namespace {
 
 /*
  * Return the payload from a ArrayData* that is kPackedKind.
  */
+ALWAYS_INLINE
 TypedValue* packedData(const ArrayData* arr) {
   return const_cast<TypedValue*>(
     reinterpret_cast<const TypedValue*>(arr + 1)
   );
 }
 
+ALWAYS_INLINE
+ArrayData* getArrayFromPackedData(const TypedValue* tv) {
+  return const_cast<ArrayData*>(
+    reinterpret_cast<const ArrayData*>(tv) - 1
+  );
+}
+
+ALWAYS_INLINE
+ptrdiff_t PackedArray::entriesOffset() {
+  return reinterpret_cast<ptrdiff_t>(
+    packedData(reinterpret_cast<ArrayData*>(0x0)));
+}
+
+ALWAYS_INLINE
+size_t PackedArray::heapSize(const ArrayData* ad) {
+  auto cap = packedCodeToCap(ad->m_packedCapCode);
+  return sizeof(ArrayData) + sizeof(TypedValue) * cap;
 }
 
 //////////////////////////////////////////////////////////////////////

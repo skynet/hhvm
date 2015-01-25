@@ -42,7 +42,7 @@ inline bool toBoolean(const ArrayData *v) {
 }
 inline bool toBoolean(const Array& v) { return toBoolean(v.get());}
 inline bool toBoolean(const ObjectData *v) {
-  return v ? v->o_toBoolean() : false;
+  return v ? v->toBoolean() : false;
 }
 inline bool toBoolean(const Object& v) { return toBoolean(v.get());}
 inline bool toBoolean(const Variant& v) { return v.toBoolean();}
@@ -58,7 +58,7 @@ inline int toInt32(const StringData *v) { return v ? v->toInt32() : 0;}
 inline int toInt32(const String& v) { return toInt32(v.get());}
 inline int toInt32(const ArrayData *v) { return (v && !v->empty()) ? 1 : 0;}
 inline int toInt32(const Array& v) { return toInt32(v.get());}
-inline int toInt32(const ObjectData *v) { return v ? v->o_toInt64() : 0;}
+inline int toInt32(const ObjectData *v) { return v ? v->toInt64() : 0;}
 inline int toInt32(const Object& v) { return toInt32(v.get());}
 inline int toInt32(const Variant& v) { return v.toInt32();}
 
@@ -80,7 +80,7 @@ inline int64_t toInt64(const StringData *v) { return v ? v->toInt64() : 0;}
 inline int64_t toInt64(const String& v) { return toInt64(v.get());}
 inline int64_t toInt64(const ArrayData *v) { return (v && !v->empty()) ? 1 : 0;}
 inline int64_t toInt64(const Array& v) { return toInt64(v.get());}
-inline int64_t toInt64(const ObjectData *v) { return v ? v->o_toInt64() : 0;}
+inline int64_t toInt64(const ObjectData *v) { return v ? v->toInt64() : 0;}
 inline int64_t toInt64(const Object& v) { return toInt64(v.get());}
 inline int64_t toInt64(const Variant& v) { return v.toInt64();}
 
@@ -97,7 +97,7 @@ inline double toDouble(const ArrayData *v) {
   return (v && !v->empty()) ? 1.0 : 0.0;
 }
 inline double toDouble(const Array& v) { return toDouble(v.get());}
-inline double toDouble(const ObjectData *v) { return v ? v->o_toDouble() : 0;}
+inline double toDouble(const ObjectData *v) { return v ? v->toDouble() : 0;}
 inline double toDouble(const Object& v) { return toDouble(v.get());}
 inline double toDouble(const Variant& v) { return v.toDouble();}
 
@@ -108,17 +108,18 @@ inline String toString(int     v) { return (int64_t)v;}
 inline String toString(int64_t   v) { return v;}
 inline String toString(double  v) { return v;}
 inline String toString(litstr  v) = delete;
-inline String toString(StringData *v) { return v ? String(v) : String("");}
+inline String toString(StringData *v) {
+  return v ? String(v) : empty_string();
+}
 inline String toString(const String& v) { return toString(v.get());}
 inline String toString(const ArrayData *v) {
-  if (v) {
-    raise_notice("Array to string conversion");
-  }
-  return v ? "Array" : "";
+  if (v == nullptr) return empty_string();
+  raise_notice("Array to string conversion");
+  return array_string;
 }
 inline String toString(const Array& v) { return toString(v.get());}
 inline String toString(ObjectData *v) {
-  return v ? v->invokeToString() : String("");
+  return v ? v->invokeToString() : empty_string();
 }
 inline String toString(const Object& v) { return toString(v.get());}
 inline String toString(const Variant& v) { return v.toString();}
@@ -137,7 +138,7 @@ inline Array toArray(const String& v) { return toArray(v.get());}
 inline Array toArray(ArrayData *v) { return v ? Array(v) : Array::Create();}
 inline Array toArray(const Array& v) { return toArray(v.get());}
 inline Array toArray(const ObjectData *v) {
-  return v ? v->o_toArray() : Array::Create();
+  return v ? v->toArray() : Array::Create();
 }
 inline Array toArray(const Object& v) { return toArray(v.get());}
 inline Array toArray(const Variant& v) { return v.toArray();}

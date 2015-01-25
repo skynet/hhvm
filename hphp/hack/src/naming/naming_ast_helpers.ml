@@ -21,14 +21,12 @@ let rec terminal in_try stl = List.iter (terminal_ in_try) stl
 and terminal_ in_try = function
   | Throw _ when not in_try -> raise Exit
   | Throw _ -> ()
-  | Continue
-  | Expr (_, (Call ((_, Id (_, "assert")), [_, False])
-  | Call ((_, Id (_, "invariant")), (_, False) :: _ :: _)
-  | Call ((_, Id (_, "invariant_violation")), _ :: _))) ->
-      raise Exit
-  | Expr (_, Yield (_, Call ((_, Id (_, "result")), _)))
-  | Return _ -> raise Exit
-  | Expr (_, Call ((_, Id (_, "result")), [(_, False)])) -> raise Exit
+  | Continue _
+  | Expr (_, (Call ((_, Id (_, "assert")), [_, False], [])
+                 | Call ((_, Id (_, "invariant")), (_, False) :: _ :: _, [])
+                 | Call ((_, Id (_, "invariant_violation")), _ :: _, [])))
+  | Return _
+  | Expr (_, Call ((_, Id (_, "exit")), _, _)) -> raise Exit
   | If (_, b1, b2) ->
       (try terminal in_try b1; () with Exit ->
         terminal in_try b2)
@@ -47,7 +45,7 @@ and terminal_ in_try = function
   | Expr _
   | Unsafe
   | Fallthrough
-  | Break (* TODO this is terminal sometimes too, except switch, see above. *)
+  | Break _ (* TODO this is terminal sometimes too, except switch, see above. *)
   | Static_var _ -> ()
 
 and terminal_catch in_try (_, _, b) =
@@ -58,7 +56,7 @@ and terminal_cl in_try = function
   | Case (_, b) :: rl ->
       (try
         terminal in_try b;
-        if List.exists (function Break -> true | _ -> false) b
+        if List.exists (function Break _ -> true | _ -> false) b
         then ()
         else raise Exit
       with Exit -> terminal_cl in_try rl)
@@ -66,7 +64,6 @@ and terminal_cl in_try = function
       (try terminal in_try b with Exit -> terminal_cl in_try rl)
 
 let is_terminal stl = try terminal false stl; false with Exit -> true
-
 
 (* Module calculating the locals for a statement
 * This is useful when someone uses $x on both sides
@@ -82,6 +79,8 @@ module GetLocals = struct
   let rec lvalue acc = function
     | (p, Lvar (_, x)) -> SMap.add x p acc
     | _, List lv -> List.fold_left lvalue acc lv
+    (* Ref forms a local inside a foreach *)
+    | (_, Ref (p, Lvar (_, x))) ->  SMap.add x p acc
     | _ -> acc
 
   let rec stmt acc st =
@@ -92,7 +91,7 @@ module GetLocals = struct
         lvalue acc lv
     | Unsafe
     | Fallthrough
-    | Expr _ | Break | Continue | Throw _
+    | Expr _ | Break _ | Continue _ | Throw _
     | Do _ | While _ | For _ | Foreach _
     | Return _ | Static_var _ | Noop -> acc
     | Block b -> block acc b
@@ -153,7 +152,7 @@ module HintCycle = struct
     | Hoption h -> hint stack params h
     | Hfun (hl,_, h) -> hintl stack params hl; hint stack params h
     | Happly ((_, x), []) when SSet.mem x stack ->
-        error p "Cyclic constraint"
+        Errors.cyclic_constraint p
     | Happly ((_, x), []) when SMap.mem x params ->
         let stack = SSet.add x stack in
         (match SMap.get x params with
@@ -165,10 +164,12 @@ module HintCycle = struct
         hintl stack params hl
     | Hshape l ->
         List.iter (fun (_, x) -> hint stack params x) l
+    (* do we need to do anything here? probably when we add type params *)
+    | Haccess (_, _, _) -> ()
 
   and hintl stack params l = List.iter (hint stack params) l
 
-  let check_constraint cstrs (_, hopt) =
+  let check_constraint cstrs (_, _, hopt) =
     match hopt with
     | None -> ()
     | Some h -> hint SSet.empty cstrs h

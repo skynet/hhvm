@@ -22,8 +22,6 @@
 
 namespace HPHP {
 
-const size_t kTrampolinesBlockSize = 8 << 12;
-
 struct CodeCache {
   enum class Selection {
     Default,   // 'main'
@@ -43,11 +41,18 @@ struct CodeCache {
     body("hot", m_hot);
     body("main", m_main);
     body("prof", m_prof);
-    body("stubs", m_stubs);
-    body("trampolines", m_trampolines);
+    body("cold", m_cold);
+    body("frozen", m_frozen);
   }
 
   size_t codeSize() const { return m_codeSize; }
+
+  // Returns the total amount of code emitted to all blocks. Not synchronized,
+  // so the value may be stale by the time this function returns.
+  size_t totalUsed() const;
+
+  size_t mainUsed() const { return m_main.used(); }
+  size_t profUsed() const { return m_prof.used(); }
 
   CodeAddress base() const { return m_base; }
   bool isValidCodeAddress(CodeAddress addr) const;
@@ -60,17 +65,27 @@ struct CodeCache {
     return const_cast<CodeCache&>(*this).main();
   }
 
-  CodeBlock& stubs();
-  const CodeBlock& stubs() const {
-    return const_cast<CodeCache&>(*this).stubs();
+  CodeBlock& cold();
+  const CodeBlock& cold() const {
+    return const_cast<CodeCache&>(*this).cold();
   }
-  CodeBlock& trampolines()             { return m_trampolines; }
-  const CodeBlock& trampolines() const { return m_trampolines; }
+
+  CodeBlock& frozen();
+  const CodeBlock& frozen() const {
+    return const_cast<CodeCache&>(*this).frozen();
+  }
+
+  const CodeBlock& realCold()   const { return m_cold;   }
+  const CodeBlock& realFrozen() const { return m_frozen; }
 
   DataBlock& data() { return m_data; }
 
-  // Read-only access for MCGenerator::dumpTCCode()
+  // Read-only access for MCGenerator::dumpTCCode()/dumpTCData()
   const CodeBlock& prof() const { return m_prof; }
+  const CodeBlock& hot() const { return m_hot; }
+
+  void lock() { m_lock = true; }
+  void unlock() { m_lock = false; }
 
 private:
   CodeAddress m_base;
@@ -79,12 +94,31 @@ private:
   size_t m_totalSize;
   Selection m_selection;
 
+  /*
+   * Code blocks for emitting different kinds of code.
+   *
+   * See comment in runtime/vm/jit/block.h to see the meanings of different
+   * Block Hints.
+   *
+   * Code blocks with either a 'Likely' or 'Neither' Block Hint are emitted
+   * in m_main. Code blocks with an 'Unlikely' Block Hint are emitted in
+   * m_cold (except for profiling translations, see below). Code blocks
+   * with an 'Unused' Block Hint are emitted in m_frozen.
+   *
+   * The m_hot section is used for emitting optimzed translations of
+   * 'Hot' functions (functions marked with AttrHot). The m_prof is used
+   * for emitting profiling translations of Hot functions. Also, for profiling
+   * translations, the m_frozen section is used for 'Unlikely' blocks instead
+   * of m_cold.
+   *
+   */
   CodeBlock m_main;        // used for hot code of non-AttrHot functions
-  CodeBlock m_stubs;       // used for cold or one time use code
+  CodeBlock m_cold;        // used for cold or one time use code
   CodeBlock m_hot;         // used for hot code of AttrHot functions
   CodeBlock m_prof;        // used for hot code of profiling translations
-  CodeBlock m_trampolines; // used to enable static calls to distant code
+  CodeBlock m_frozen;      // used for code that is (almost) never used
   DataBlock m_data;        // data to be used by translated code
+  bool      m_lock;        // don't allow access to main() or cold()
 };
 
 struct CodeCache::Selector {

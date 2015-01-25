@@ -71,6 +71,7 @@ class HHVMDocExtension {
   protected function parseFunction(SimpleXMLElement $sxe,
                                    bool $oop): array {
     $f = [];
+    // UNSAFE: typechecker doesn't understand __get on $sxe
     foreach ($sxe->refsect1 as $sect) {
       $attr = $sect->attributes();
       if ($attr->role == "description") {
@@ -141,6 +142,7 @@ class HHVMDocExtension {
 
   protected function parseClass(string $path): void {
     $sxe = $this->getXml($path);
+    // UNSAFE: typechecker doesn't understand __get on $sxe
     foreach ($sxe->partintro->section as $sect) {
       $xmlattrs = $sect->attributes('xml', true);
       if (substr($xmlattrs->id, -6) == '.intro') {
@@ -189,7 +191,7 @@ class HHVMDocExtension {
     }
   }
 
-  protected function parse(): object {
+  protected function parse(): this {
     if ($this->parsed) return $this;
 
     $url = $this->root.
@@ -215,14 +217,14 @@ class HHVMDocExtension {
     if (!file_exists($this->root.'/en/reference') ||
         !is_dir($this->root.'/en/reference')) {
       throw new Exception("{$this->root} does not appear to be ".
-                          "a phpdoc checkout.  See http://php.net/svn ".
+                          "a phpdoc checkout.  See http://php.net/git.php ".
                           "for instructions on how to checkout phpdoc-en.");
     }
   }
 
   public function getFunctions(): array { return $this->parse()->functions; }
   public function getClasses(): array { return $this->parse()->classes; }
-  public function setVerbose(bool $verbose): object {
+  public function setVerbose(bool $verbose): this {
     $this->verbose = $verbose;
     return $this;
   }

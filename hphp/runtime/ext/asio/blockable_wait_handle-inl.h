@@ -24,18 +24,14 @@ namespace HPHP {
 
 inline void
 c_BlockableWaitHandle::blockOn(c_WaitableWaitHandle* child) {
-  setState(STATE_BLOCKED);
-
   assert(!child->isFinished());
   assert(getChild() == child);
   assert(getContextIdx() <= child->getContextIdx());
   assert(!isDescendantOf(child));
 
   // Extend the linked list of parents.
-  m_nextParent = child->addParent(this);
-
-  // Increment ref count so that we won't disappear before child calls back.
-  incRefCount();
+  auto& parentChain = child->getParentChain();
+  parentChain.addParent(m_blockable, AsioBlockable::Kind::BlockableWaitHandle);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

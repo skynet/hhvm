@@ -17,13 +17,16 @@
 #ifndef incl_HPHP_HTTP_SERVER_TRANSPORT_H_
 #define incl_HPHP_HTTP_SERVER_TRANSPORT_H_
 
+#include <list>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "hphp/util/compression.h"
 #include "hphp/util/functional.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/string-holder.h"
 #include "hphp/runtime/base/debuggable.h"
 #include "hphp/runtime/base/runtime-option.h"
 
@@ -38,7 +41,7 @@ using CaseInsenMap =
   std::unordered_map<std::string, V, string_hashi, string_eqstri>;
 
 using HeaderMap = CaseInsenMap<std::vector<std::string>>;
-using CookieMap = CaseInsenMap<std::string>;
+using CookieList = std::vector<std::pair<std::string, std::string>>;
 
 /**
  * A class defining an interface that request handler can use to query
@@ -121,7 +124,10 @@ public:
   // The transport can override the virtualhosts' docroot
   virtual const std::string getDocumentRoot() { return ""; }
   // The transport can say exactly what script to use
+  virtual const std::string getScriptFilename() { return ""; }
   virtual const std::string getPathTranslated() { return ""; }
+  virtual const std::string getPathInfo() { return ""; }
+  virtual bool isPathInfoSet() {return false; }
 
   /**
    * Server Headers
@@ -130,7 +136,9 @@ public:
     return "";
   };
   virtual const char *getServerAddr() {
-    return RuntimeOption::ServerPrimaryIP.c_str();
+    return  RuntimeOption::ServerPrimaryIPv4.empty() ?
+       RuntimeOption::ServerPrimaryIPv6.c_str() :
+       RuntimeOption::ServerPrimaryIPv4.c_str();
   };
   virtual uint16_t getServerPort() {
     return RuntimeOption::ServerPort;
@@ -241,6 +249,41 @@ public:
   virtual void onSendEndImpl() {}
 
   /**
+   * Returns true if this transport supports server pushed resources
+   */
+  virtual bool supportsServerPush() { return false; }
+
+  /**
+   * Attempt to push the resource identified by host/path on this transport
+   *
+   * @param priority (3 bit priority, 0 = highest, 7 = lowest),
+   * @param headers HTTP headers for this resource
+   * @param body body bytes (optional)
+   * @param size length of @p body or 0
+   * @param eom true if no more body bytes are expected
+   *
+   * @return an ID that can be passed to pushResourceBody if more body
+   *         is being streamed later.  0 indicates that the push failed
+   *         immediately.
+   */
+  virtual int64_t pushResource(const char *host, const char *path,
+                               uint8_t priority, const Array& headers,
+                                const void *data, int size, bool eom) {
+    return 0;
+  };
+
+  /**
+   * Stream body and/or EOM marker for a pushed resource
+   *
+   * @param id ID returned by pushResource
+   * @param data body bytes (optional if eom is true)
+   * @param size length of @p body
+   * @param eom true if no more body bytes are expected
+   */
+  virtual void pushResourceBody(int64_t id, const void *data, int size,
+                                bool eom) {}
+
+  /**
    * Need this implementation to break keep-alive connections.
    */
   virtual bool isServerStopping() { return false;}
@@ -326,29 +369,17 @@ public:
   /**
    * Sending back a response.
    */
-  void setResponse(int code, const char *info) {
-    assert(code != 500 || (info && *info)); // must have a reason for a 500
-    m_responseCode = code;
-    m_responseCodeInfo = info ? info : "";
-  }
+  void setResponse(int code, const char *info = nullptr);
   const std::string &getResponseInfo() const { return m_responseCodeInfo; }
   bool headersSent() { return m_headerSent;}
   bool setHeaderCallback(const Variant& callback);
+  void sendRaw(void *data, int size, int code = 200,
+               bool compressed = false, bool chunked = false,
+               const char *codeInfo = nullptr);
 private:
-  void sendRawLocked(void *data, int size, int code = 200,
-                     bool compressed = false, bool chunked = false,
-                     const char *codeInfo = nullptr);
-public:
-  virtual void sendRaw(void *data, int size, int code = 200,
-                       bool compressed = false, bool chunked = false,
+  void sendRawInternal(const void *data, int size, int code = 200,
+                       bool compressed = false,
                        const char *codeInfo = nullptr);
-private:
-  void sendStringLocked(const char *data, int code = 200,
-                        bool compressed = false, bool chunked = false,
-                        const char * codeInfo = nullptr) {
-    sendRawLocked((void*)data, strlen(data), code, compressed, chunked,
-                  codeInfo);
-  }
 public:
   void sendString(const char *data, int code = 200, bool compressed = false,
                   bool chunked = false,
@@ -361,7 +392,7 @@ public:
     sendRaw((void*)data.c_str(), data.length(), code, compressed, chunked,
             codeInfo);
   }
-  void redirect(const char *location, int code, const char *info );
+  void redirect(const char *location, int code, const char *info = nullptr);
 
   // TODO: support rfc1867
   virtual bool isUploadedFile(const String& filename);
@@ -421,7 +452,7 @@ protected:
   // output
   bool m_chunkedEncoding;
   bool m_headerSent;
-  Variant m_headerCallback;
+  Cell m_headerCallback;
   bool m_headerCallbackDone;  // used to prevent infinite loops
   int m_responseCode;
   std::string m_responseCodeInfo;
@@ -429,11 +460,12 @@ protected:
   bool m_firstHeaderSet;
   std::string m_firstHeaderFile;
   int m_firstHeaderLine;
-  CookieMap m_responseCookies;
+  CookieList m_responseCookiesList;
   int m_responseSize;
   int m_responseTotalSize; // including added headers
   int m_responseSentSize;
   int64_t m_flushTimeUs;
+  bool m_sendEnded;
 
   std::vector<int> m_chunksSentSizes;
 
@@ -460,13 +492,14 @@ protected:
   static void parseQuery(char *query, ParamMap &params);
   static void urlUnescape(char *value);
   bool splitHeader(const String& header, String &name, const char *&value);
+  std::list<std::string> getCookieLines();
 
-  String prepareResponse(const void *data, int size, bool &compressed,
-                         bool last);
+  StringHolder prepareResponse(const void *data, int size, bool &compressed,
+                               bool last);
 
 private:
-  void prepareHeaders(bool compressed, bool chunked, const String &response,
-    const String& orig_response);
+  void prepareHeaders(bool compressed, bool chunked,
+    const StringHolder &response, const StringHolder& orig_response);
 };
 
 ///////////////////////////////////////////////////////////////////////////////

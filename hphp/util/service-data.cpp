@@ -21,9 +21,9 @@
 #include <vector>
 #include <tbb/concurrent_unordered_map.h>
 
-#include "folly/Conv.h"
-#include "folly/MapUtil.h"
-#include "folly/stats/Histogram-defs.h"
+#include <folly/Conv.h>
+#include <folly/MapUtil.h>
+#include <folly/stats/Histogram-defs.h>
 
 #include "hphp/util/portability.h"
 
@@ -80,6 +80,23 @@ void ExportedTimeSeries::exportAll(const std::string& prefix,
       }
     }
   }
+}
+
+int64_t ExportedTimeSeries::getSum() {
+  int64_t sum = 0;
+  SYNCHRONIZED(m_timeseries) {
+    m_timeseries.update(detail::nowAsSeconds());
+
+    for (int i = 0; i < m_timeseries.numLevels(); ++i) {
+      auto& level = m_timeseries.getLevel(i);
+      if (level.isAllTime()) {
+        sum = m_timeseries.sum(i);
+        break;
+      }
+      sum += m_timeseries.sum(i);
+    }
+  }
+  return sum;
 }
 
 ExportedHistogram::ExportedHistogram(

@@ -15,26 +15,28 @@
 */
 #include "hphp/runtime/debugger/debugger_client.h"
 
-#include <boost/lexical_cast.hpp>
 #include <signal.h>
 #include <fstream>
 
 #include "hphp/runtime/debugger/debugger_command.h"
 #include "hphp/runtime/debugger/cmd/all.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/base/preg.h"
-#include "hphp/runtime/ext/ext_socket.h"
+#include "hphp/runtime/ext/sockets/ext_sockets.h"
 #include "hphp/runtime/ext/std/ext_std_network.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/util/text-color.h"
 #include "hphp/util/text-art.h"
 #include "hphp/util/logger.h"
 #include "hphp/util/process.h"
 #include "hphp/util/string-vsnprintf.h"
-#include <boost/format.hpp>
+#include "hphp/runtime/base/config.h"
 #include <boost/scoped_ptr.hpp>
+#include <folly/Conv.h>
 
 #define USE_VARARGS
 #define PREFER_STDARG
@@ -81,7 +83,7 @@ static String wordwrap(const String& str, int width /* = 75 */,
   return vm_call_user_func("wordwrap", args);
 }
 
-class DebuggerExtension : public Extension {
+class DebuggerExtension final : public Extension {
  public:
   DebuggerExtension() : Extension("hhvm.debugger", NO_EXTENSION_VERSION_YET) {}
 } s_debugger_extension;
@@ -276,32 +278,33 @@ const char *DebuggerClient::DefaultCodeColors[] = {
   /* LineNo      */ nullptr, nullptr,
 };
 
-void DebuggerClient::LoadColors(Hdf hdf) {
+void DebuggerClient::LoadColors(const IniSetting::Map& ini, Hdf hdf) {
   TRACE(2, "DebuggerClient::LoadColors\n");
-  HelpColor     = LoadColor(hdf["Help"],     "BROWN");
-  InfoColor     = LoadColor(hdf["Info"],     "GREEN");
-  OutputColor   = LoadColor(hdf["Output"],   "CYAN");
-  ErrorColor    = LoadColor(hdf["Error"],    "RED");
-  ItemNameColor = LoadColor(hdf["ItemName"], "GRAY");
+  HelpColor     = LoadColor(ini, hdf["Help"],     "BROWN");
+  InfoColor     = LoadColor(ini, hdf["Info"],     "GREEN");
+  OutputColor   = LoadColor(ini, hdf["Output"],   "CYAN");
+  ErrorColor    = LoadColor(ini, hdf["Error"],    "RED");
+  ItemNameColor = LoadColor(ini, hdf["ItemName"], "GRAY");
 
-  HighlightForeColor = LoadColor(hdf["HighlightForeground"], "RED");
-  HighlightBgColor = LoadBgColor(hdf["HighlightBackground"], "GRAY");
+  HighlightForeColor = LoadColor(ini, hdf["HighlightForeground"], "RED");
+  HighlightBgColor = LoadBgColor(ini, hdf["HighlightBackground"], "GRAY");
 
   Hdf code = hdf["Code"];
-  LoadCodeColor(CodeColorKeyword,     code["Keyword"],     "CYAN");
-  LoadCodeColor(CodeColorComment,     code["Comment"],     "RED");
-  LoadCodeColor(CodeColorString,      code["String"],      "GREEN");
-  LoadCodeColor(CodeColorVariable,    code["Variable"],    "BROWN");
-  LoadCodeColor(CodeColorHtml,        code["Html"],        "GRAY");
-  LoadCodeColor(CodeColorTag,         code["Tag"],         "MAGENTA");
-  LoadCodeColor(CodeColorDeclaration, code["Declaration"], "BLUE");
-  LoadCodeColor(CodeColorConstant,    code["Constant"],    "MAGENTA");
-  LoadCodeColor(CodeColorLineNo,      code["LineNo"],      "GRAY");
+  LoadCodeColor(CodeColorKeyword,     ini, code["Keyword"],     "CYAN");
+  LoadCodeColor(CodeColorComment,     ini, code["Comment"],     "RED");
+  LoadCodeColor(CodeColorString,      ini, code["String"],      "GREEN");
+  LoadCodeColor(CodeColorVariable,    ini, code["Variable"],    "BROWN");
+  LoadCodeColor(CodeColorHtml,        ini, code["Html"],        "GRAY");
+  LoadCodeColor(CodeColorTag,         ini, code["Tag"],         "MAGENTA");
+  LoadCodeColor(CodeColorDeclaration, ini, code["Declaration"], "BLUE");
+  LoadCodeColor(CodeColorConstant,    ini, code["Constant"],    "MAGENTA");
+  LoadCodeColor(CodeColorLineNo,      ini, code["LineNo"],      "GRAY");
 }
 
-const char *DebuggerClient::LoadColor(Hdf hdf, const char *defaultName) {
+const char *DebuggerClient::LoadColor(const IniSetting::Map& ini, Hdf hdf,
+                                      const char *defaultName) {
   TRACE(2, "DebuggerClient::LoadColor\n");
-  const char *name = hdf.get(defaultName);
+  const char *name = Config::Get(ini, hdf, defaultName);
   hdf = name;  // for starter
   const char *color = get_color_by_name(name);
   if (color == nullptr) {
@@ -311,9 +314,10 @@ const char *DebuggerClient::LoadColor(Hdf hdf, const char *defaultName) {
   return color;
 }
 
-const char *DebuggerClient::LoadBgColor(Hdf hdf, const char *defaultName) {
+const char *DebuggerClient::LoadBgColor(const IniSetting::Map& ini, Hdf hdf,
+                                        const char *defaultName) {
   TRACE(2, "DebuggerClient::LoadBgColor\n");
-  const char *name = hdf.get(defaultName);
+  const char *name = Config::Get(ini, hdf, defaultName);
   hdf = name;  // for starter
   const char *color = get_bgcolor_by_name(name);
   if (color == nullptr) {
@@ -323,17 +327,17 @@ const char *DebuggerClient::LoadBgColor(Hdf hdf, const char *defaultName) {
   return color;
 }
 
-void DebuggerClient::LoadCodeColor(CodeColor index, Hdf hdf,
-                                   const char *defaultName) {
+void DebuggerClient::LoadCodeColor(CodeColor index, const IniSetting::Map& ini,
+                                   Hdf hdf, const char *defaultName) {
   TRACE(2, "DebuggerClient::LoadCodeColor\n");
-  const char *color = LoadColor(hdf, defaultName);
+  const char *color = LoadColor(ini, hdf, defaultName);
   DefaultCodeColors[index * 2] = color;
   DefaultCodeColors[index * 2 + 1] = color ? ANSI_COLOR_END : nullptr;
 }
 
 SmartPtr<Socket> DebuggerClient::Start(const DebuggerClientOptions &options) {
   TRACE(2, "DebuggerClient::Start\n");
-  SmartPtr<Socket> ret = getStaticDebuggerClient().connectLocal();
+  auto ret = getStaticDebuggerClient().connectLocal();
   getStaticDebuggerClient().start(options);
   return ret;
 }
@@ -429,7 +433,7 @@ String DebuggerClient::FormatInfoVec(const IDebuggable::InfoVec &info,
 
 String DebuggerClient::FormatTitle(const char *title) {
   TRACE(2, "DebuggerClient::FormatTitle\n");
-  String dash = f_str_repeat(BOX_H, (LineWidth - strlen(title)) / 2 - 4);
+  String dash = HHVM_FN(str_repeat)(BOX_H, (LineWidth - strlen(title)) / 2 - 4);
 
   StringBuffer sb;
   sb.append("\n");
@@ -544,8 +548,8 @@ SmartPtr<Socket> DebuggerClient::connectLocal() {
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
     throw Exception("unable to create socket pair for local debugging");
   }
-  SmartPtr<Socket> socket1(new Socket(fds[0], AF_UNIX));
-  SmartPtr<Socket> socket2(new Socket(fds[1], AF_UNIX));
+  auto socket1 = makeSmartPtr<Socket>(fds[0], AF_UNIX);
+  auto socket2 = makeSmartPtr<Socket>(fds[1], AF_UNIX);
 
   socket1->unregister();
   socket2->unregister();
@@ -615,11 +619,14 @@ bool DebuggerClient::tryConnect(const std::string &host, int port,
   /* try possible families (v4, v6) until we get a connection */
   struct addrinfo *cur;
   for (cur = ai; cur; cur = ai->ai_next) {
-    Socket *sock = new Socket(socket(cur->ai_family, cur->ai_socktype, 0),
-                              cur->ai_family, cur->ai_addr->sa_data, port);
+    auto sock = makeSmartPtr<Socket>(
+      socket(cur->ai_family, cur->ai_socktype, 0),
+      cur->ai_family,
+      cur->ai_addr->sa_data,
+      port
+    );
     sock->unregister();
-    Resource obj(sock); // Destroy sock if we don't connect.
-    if (f_socket_connect(sock, String(host), port)) {
+    if (HHVM_FN(socket_connect)(Resource(sock), String(host), port)) {
       if (clearmachines) {
         for (unsigned int i = 0; i < m_machines.size(); i++) {
           if (m_machines[i] == m_machine) {
@@ -631,7 +638,7 @@ bool DebuggerClient::tryConnect(const std::string &host, int port,
       auto machine = std::make_shared<DMachineInfo>();
       machine->m_name = host;
       machine->m_port = port;
-      machine->m_thrift.create(SmartPtr<Socket>(sock));
+      machine->m_thrift.create(sock);
       m_machines.push_back(machine);
       switchMachine(machine);
       return true;
@@ -727,11 +734,11 @@ void DebuggerClient::run() {
   }
 
   hphp_session_init();
-  ExecutionContext *context = hphp_context_init();
+  hphp_context_init();
   if (m_options.extension.empty()) {
     hphp_invoke_simple("", true); // warm-up only
   } else {
-    hphp_invoke_simple(m_options.extension);
+    hphp_invoke_simple(m_options.extension, false);
   }
   while (true) {
     bool reconnect = false;
@@ -770,7 +777,7 @@ void DebuggerClient::run() {
   // Closing all proxy connections will force the local proxy to pop out of
   // it's wait, and eventually exit the main thread.
   closeAllConnections();
-  hphp_context_exit(context, false);
+  hphp_context_exit();
   hphp_session_exit();
 }
 
@@ -1089,7 +1096,7 @@ DebuggerCommandPtr DebuggerClient::eventLoop(EventLoopKind loopKind,
           cmd->is((DebuggerCommand::Type)expectedCmd)) {
         // For the nested cases, the caller has sent a cmd to the server and is
         // expecting a specific response. When we get it, return it.
-        usageLogEvent("command done", boost::lexical_cast<string>(expectedCmd));
+        usageLogEvent("command done", folly::to<string>(expectedCmd));
         m_machine->m_interrupting = true; // Machine is stopped
         m_inputState = TakingCommand;
         return cmd;
@@ -1173,7 +1180,18 @@ void DebuggerClient::console() {
         strcasecmp(line, "Q") != 0) {
       // even if line is bad command, we still want to remember it, so
       // people can go back and fix typos
-      add_history(line);
+      HIST_ENTRY *last_entry = nullptr;
+      if (history_length > 0 &&
+          (last_entry = history_get(history_length + history_base - 1))) {
+        // Make sure we aren't duplicating history entries
+        if (strcmp(line, last_entry->line)) {
+          add_history(line);
+        }
+      } else {
+        // Add history regardless, since we know that there are no
+        // duplicate entries.
+        add_history(line);
+      }
     }
 
     AdjustScreenMetrics();
@@ -1463,7 +1481,7 @@ void DebuggerClient::helpCmds(const std::vector<const char *> &cmds) {
       line.append("  ");
       line.append(lines2[n].toString());
 
-      sb.append(f_rtrim(line.detach()));
+      sb.append(HHVM_FN(rtrim)(line.detach()));
       sb.append("\n");
     }
   }
@@ -1493,15 +1511,15 @@ void DebuggerClient::tutorial(const char *text) {
 
   StringBuffer sb;
   String header = "  Tutorial - '[h]elp [t]utorial off|auto' to turn off  ";
-  String hr = f_str_repeat(BOX_H, LineWidth - 2);
+  String hr = HHVM_FN(str_repeat)(BOX_H, LineWidth - 2);
 
   sb.append(BOX_UL); sb.append(hr); sb.append(BOX_UR); sb.append("\n");
 
   int wh = (LineWidth - 2 - header.size()) / 2;
   sb.append(BOX_V);
-  sb.append(f_str_repeat(" ", wh));
+  sb.append(HHVM_FN(str_repeat)(" ", wh));
   sb.append(header);
-  sb.append(f_str_repeat(" ", wh));
+  sb.append(HHVM_FN(str_repeat)(" ", wh));
   sb.append(BOX_V);
   sb.append("\n");
 
@@ -1631,7 +1649,7 @@ do {                                         \
 
 // Parses the current command string. If invalid return false.
 // Otherwise, carry out the command and return true.
-// NB: the command may throw a variety of exceptions derrived from
+// NB: the command may throw a variety of exceptions derived from
 // DebuggerClientException.
 bool DebuggerClient::process() {
   TRACE(2, "DebuggerClient::process\n");
@@ -2301,6 +2319,7 @@ void DebuggerClient::loadConfig() {
   }
 
   Hdf config;
+  IniSetting::Map ini = IniSetting::Map::object;
   try {
     if (usedHomeDirConfig) {
       config.open(Process::GetHomeDirectory() + LegacyConfigFileName);
@@ -2317,25 +2336,25 @@ void DebuggerClient::loadConfig() {
 
   m_neverSaveConfigOverride = true; // Prevent saving config while reading it
 
-  s_use_utf8 = config["UTF8"].getBool(true);
+  Config::Bind(s_use_utf8, ini, config["UTF8"], true);
   config["UTF8"] = s_use_utf8; // for starter
   BIND(utf8, &s_use_utf8);
 
   Hdf color = config["Color"];
-  UseColor = color.getBool(true);
+  Config::Bind(UseColor, ini, color, true);
   color = UseColor; // for starter
   BIND(color, &UseColor);
   if (UseColor && RuntimeOption::EnableDebuggerColor) {
-    LoadColors(color);
+    LoadColors(ini, color);
   }
 
-  m_tutorial = config["Tutorial"].getInt32(0);
+  Config::Bind(m_tutorial, ini, config["Tutorial"], 0);
   BIND(tutorial, &m_tutorial);
 
-  m_scriptMode = config["ScriptMode"].getBool();
+  Config::Bind(m_scriptMode, ini, config["ScriptMode"]);
   BIND(script_mode, &m_scriptMode);
 
-  setDebuggerClientSmallStep(config["SmallStep"].getBool());
+  setDebuggerClientSmallStep(Config::GetBool(ini, config["SmallStep"]));
   BIND(small_step, IniSetting::SetAndGet<bool>(
        [this](const bool& v) {
          setDebuggerClientSmallStep(v);
@@ -2344,7 +2363,7 @@ void DebuggerClient::loadConfig() {
        [this]() { return getDebuggerClientSmallStep(); }
   ));
 
-  setDebuggerClientMaxCodeLines(config["MaxCodeLines"].getInt16(-1));
+  setDebuggerClientMaxCodeLines(Config::GetInt16(ini, config["MaxCodeLines"], -1));
   BIND(max_code_lines, IniSetting::SetAndGet<short>(
        [this](const short& v) {
          setDebuggerClientMaxCodeLines(v);
@@ -2353,13 +2372,13 @@ void DebuggerClient::loadConfig() {
        [this]() { return getDebuggerClientMaxCodeLines(); }
   ));
 
-  setDebuggerClientBypassCheck(config["BypassAccessCheck"].getBool());
+  setDebuggerClientBypassCheck(Config::GetBool(ini, config["BypassAccessCheck"]));
   BIND(bypass_access_check, IniSetting::SetAndGet<bool>(
        [this](const bool& v) { setDebuggerClientBypassCheck(v); return true; },
        [this]() { return getDebuggerClientBypassCheck(); }
   ));
 
-  int printLevel = config["PrintLevel"].getInt16(5);
+  int printLevel = Config::GetInt16(ini, config["PrintLevel"], 5);
   if (printLevel > 0 && printLevel < MinPrintLevel) {
     printLevel = MinPrintLevel;
   }
@@ -2378,14 +2397,14 @@ void DebuggerClient::loadConfig() {
        [this]() { return getDebuggerClientPrintLevel(); }
   ));
 
-  setDebuggerClientStackArgs(config["StackArgs"].getBool(true));
+  setDebuggerClientStackArgs(Config::GetBool(ini, config["StackArgs"], true));
   BIND(stack_args, IniSetting::SetAndGet<bool>(
        [this](const bool& v) { setDebuggerClientStackArgs(v); return true; },
        [this]() { return getDebuggerClientStackArgs(); }
   ));
 
   setDebuggerClientShortPrintCharCount(
-    config["ShortPrintCharCount"].getInt16(200));
+    Config::GetInt16(ini, config["ShortPrintCharCount"], 200));
   BIND(short_print_char_count, IniSetting::SetAndGet<short>(
        [this](const short& v) {
          setDebuggerClientShortPrintCharCount(v); return true;
@@ -2393,13 +2412,13 @@ void DebuggerClient::loadConfig() {
        [this]() { return getDebuggerClientShortPrintCharCount(); }
   ));
 
-  config["Tutorial"]["Visited"].get(m_tutorialVisited);
+  Config::Get(ini, config["Tutorial"]["Visited"], m_tutorialVisited);
   BIND(tutorial.visited, &m_tutorialVisited);
 
   for (Hdf node = config["Macros"].firstChild(); node.exists();
        node = node.next()) {
     auto macro = std::make_shared<Macro>();
-    macro->load(node);
+    macro->load(ini, node);
     m_macros.push_back(macro);
   }
   BIND(macros, IniSetting::SetAndGet<Array>(
@@ -2425,24 +2444,26 @@ void DebuggerClient::loadConfig() {
           ret_cmds.append(cmd);
         }
         ret_macro.set(s_cmds, ret_cmds.toArray());
-        ret.set(ret_macro.toArray());
+        ret.append(ret_macro.toArray());
       }
       return ret.toArray();
     }
   ));
 
-  m_sourceRoot = config["SourceRoot"].getString();
+  Config::Bind(m_sourceRoot, ini, config["SourceRoot"]);
   BIND(source_root, &m_sourceRoot);
 
-  m_zendExe = config["ZendExecutable"].getString("php");
+  Config::Bind(m_zendExe, ini, config["ZendExecutable"], "php");
   BIND(zend_executable, &m_zendExe);
 
-  m_neverSaveConfig = config["NeverSaveConfig"].getBool(false);
+  Config::Bind(m_neverSaveConfig, ini, config["NeverSaveConfig"], false);
   BIND(never_save_config, &m_neverSaveConfig);
 
   IniSetting::s_pretendExtensionsHaveNotBeenLoaded = false;
 
-  process_ini_settings(m_configFileName);
+  // We are guaranteed to have an ini file given how m_configFileName is set
+  // above
+  Config::ParseIniFile(m_configFileName);
 
   // Do this after the ini processing so we don't accidentally save the config
   // when we change one of the options

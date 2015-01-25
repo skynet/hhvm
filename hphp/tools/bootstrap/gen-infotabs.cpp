@@ -20,8 +20,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "folly/FBString.h"
-#include "folly/FBVector.h"
+#include <folly/FBString.h>
+#include <folly/FBVector.h>
 
 #include "hphp/tools/bootstrap/idl.h"
 
@@ -30,15 +30,21 @@ using folly::fbvector;
 using namespace HPHP::IDL;
 
 int main(int argc, const char* argv[]) {
-  if (argc < 3) {
-    std::cout << "Usage: " << argv[0] << " <output file> <*.idl.json>...\n";
+  if (argc < 4) {
+    std::cout << "Usage: " << argv[0]
+              << " <output file>"
+              << " <header file>"
+              << " <*.idl.json>...\n";
     return 0;
   }
 
   fbvector<PhpFunc> funcs;
   fbvector<PhpClass> classes;
 
-  for (auto i = 2; i < argc; ++i) {
+  fbstring invocation_trace;
+  makeInvocationTrace(invocation_trace, argc, argv);
+
+  for (auto i = 3; i < argc; ++i) {
     try {
       parseIDL(argv[i], funcs, classes);
     } catch (const std::exception& exc) {
@@ -49,10 +55,13 @@ int main(int argc, const char* argv[]) {
 
   std::ofstream cpp(argv[1]);
 
+  brandOutputFile(cpp, "gen-infotabs.cpp", invocation_trace);
+
   cpp << "#include \"hphp/runtime/ext_hhvm/ext_hhvm.h\"\n"
       << "#include \"hphp/runtime/ext/ext.h\"\n"
       << "#include \"hphp/runtime/vm/runtime.h\"\n"
-      << "#include \"ext_hhvm_infotabs.h\"\n"
+      << "#include \"" << argv[2] << "\"\n"
+      << "#include \"hphp/util/abi-cxx.h\"\n"
       << "namespace HPHP {\n"
       << "  struct TypedValue;\n"
       << "  struct ActRec;\n"
@@ -100,17 +109,18 @@ int main(int argc, const char* argv[]) {
     }
     first = false;
 
-    auto prefix = "fh_";
     fbstring name = func.lowerCppName();
-    cpp << "{ \"" << escapeCpp(func.getPhpName()) << "\", " << "fg_" << name
-        << ", (void *)&" << prefix << name << " }";
+    cpp << "{ \"" << escapeCpp(func.getPhpName()) << "\", "
+        << "fg_" << name << ", (void*)(&"
+        << func.getPrefixedCppName() << ") }";
   }
   cpp << "\n};\n\n";
 
   for (auto const& klass : classes) {
-    cpp << "static const long long hhbc_ext_method_count_" << klass.getCppName()
-        << " = " << klass.numMethods() << ";\n";
-    cpp << "static const HhbcExtMethodInfo hhbc_ext_methods_"
+    cpp << "static const long long hhbc_ext_method_count_"
+        << klass.getCppName() << " = " << klass.numMethods()
+        << ";\n"
+        << "static const HhbcExtMethodInfo hhbc_ext_methods_"
         << klass.getCppName() << "[] = {\n  ";
     first = true;
     for (auto const& method : klass.methods()) {
@@ -120,7 +130,9 @@ int main(int argc, const char* argv[]) {
       first = false;
 
       auto name = method.getUniqueName();
-      cpp << "{ \"" << method.getCppName() << "\", tg_" << name << " }";
+      cpp << "{ \"" << method.getCppName() << "\", "
+          << "tg_" << name << ", getMethodPtr(&"
+          << method.getPrefixedCppName() << ") }";
     }
     cpp << "\n};\n\n";
   }

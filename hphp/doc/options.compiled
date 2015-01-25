@@ -9,23 +9,26 @@ node's purpose. Listed values are defaults, unless examples.
   Log {
     Level = None (default) | Error | Warning | Info | Verbose
     NoSilencer = false
-    AlwaysLogUnhandledExceptions = true
+    AlwaysLogUnhandledExceptions = false
     RuntimeErrorReportingLevel = 8191
+    ForceErrorReportingLevel = 0
     Header = false
     HeaderMangle = 0
-    InjectedStackTrace = true
     NativeStackTrace = true
     MaxMessagesPerRequest = -1
 
-- Level, NoSilencer, AlwaysLogUnhandledExceptions, RuntimeErrorReportingLevel
+- Level, NoSilencer, AlwaysLogUnhandledExceptions, RuntimeErrorReportingLevel,
+  ForceErrorReportingLevel
 
 These settings control different logging levels. NoSilencer means even when
 silencer operator @ is used, still output errors. Unhandled exceptions are
 PHP fatal errors, and AlwaysLogUnhandledExceptions will make sure they get
 logged even if a user's error handler is installed for them. We also provided
-RuntimeErrorReportingLevel for compatibility with PHP.
+RuntimeErrorReportingLevel for compatibility with PHP. ForceErrorReportingLevel
+is a bitmask that will be ORed with RuntimeErrorReportingLevel to determine the
+actual error reporting level.
 
-- Header, InjectedStackTrace, NativeStackTrace
+- Header, NativeStackTrace
 
 These settings control log line formats. Header includes timestamp, process id,
 thread id, request id (counted from 1 since server starts), message id
@@ -37,8 +40,6 @@ and printed on every line of logging right after header. These stacktraces can
 be translated into human readable frames by running "-m translate" with the
 compiled program. (2) PHP stacktrace from code injection. Generated C++ code
 injects stacktrace preparation code into every frame of functions and methods.
-InjectedStackTrace can turn on this PHP stacktrace, which sometimes is cleaner
-than the C++ stacktrace, which can be turned on and off by NativeStackTrace.
 
 - HeaderMangle
 
@@ -81,14 +82,13 @@ flood error logs.
 = Error Handling
 
   ErrorHandling {
-    CallUserHandlerOnFatals = true
+    # Bitmask of error constants to upgrade to E_USER_ERROR. Only E_WARNING,
+    # E_USER_WARNING, E_NOTICE, and E_USER_NOTICE are supported.
+    UpgradeLevel = 0 (default)
+    CallUserHandlerOnFatals = false
     MaxLoopCount = 0
     NoInfiniteRecursionDetection = false
-    ThrowBadTypeExceptions = false
-    ThrowTooManyArguments = false
     WarnTooManyArguments = false
-    ThrowMissingArguments = false
-    ThrowInvalidArguments = false
     EnableHipHopErrors = true
     NoticeFrequency = 1    # 1 out of these many notices to log
     WarningFrequency = 1   # 1 out of these many warnings to log
@@ -99,12 +99,12 @@ flood error logs.
 = Resource Limits
 
   ResourceLimit {
-    CoreFileSize = 0          # in bytes
+    CoreFileSize = 0           # in bytes
     MaxSocket = 0
-    SocketDefaultTimeout = 5  # in seconds
+    SocketDefaultTimeout = 60  # in seconds
     MaxRSS = 0
-    MaxRSSPollingCycle = 0    # in seconds, how often to check max memory
-    DropCacheCycle = 0        # in seconds, how often to drop disk cache
+    MaxRSSPollingCycle = 0     # in seconds, how often to check max memory
+    DropCacheCycle = 0         # in seconds, how often to drop disk cache
     MaxSQLRowCount = 0
     SerializationSizeLimit = 0
     StringOffsetLimit = 10 * 1024 * 1024
@@ -159,7 +159,7 @@ flood error logs.
 
     # Forcing $_SERVER['SERVER_NAME'] to come from request header
     ForceServerNameToHeader = false
-    
+
     # Print file paths traversed onto the 404 page
     PathDebug = false
 
@@ -169,14 +169,6 @@ flood error logs.
     StartupDocument = filename
     RequestInitFunction = function_name
     RequestInitDocument = filename
-    ThreadDocuments {
-      * = somedoc.php
-      * = another.php
-    }
-    ThreadLoopDocuments {
-      * = somedoc.php
-      * = another.php
-    }
     ErrorDocument404 = 404.php
     ErrorDocument500 = 500.php
     FatalErrorMessage = some string
@@ -212,7 +204,6 @@ How long to wait for dangling server to respond.
       Cookie =      # if this cookie is present: "name" or "name=value"
       Param =       # if this parameter in query string is present
     }
-    EnableMagicQuotesGpc = false
     EnableKeepAlive = true
     EnableOutputBuffering = false
     OutputHandler =
@@ -327,9 +318,6 @@ These are experimental LFU settings.
     DnsCache {
       Enable = false
       TTL = 600   # in seconds
-      KeyMaturityThreshold = 20
-      MaximumCapacity = 0
-      KeyFrequencyUpdatePeriod = 1000
     }
 
     # Light process has very little forking cost, because they are pre-forked
@@ -502,16 +490,6 @@ A pagelet server is essentially the same as local CURL, except it's more
 efficient. This allows parallel execution of a web page, preparing two panels
 or iframes at the same time.
 
-  Fiber {
-    ThreadCount = 0
-  }
-
-- Fiber Asynchronous Functions
-
-A "fiber" is a sub-thread of a request thread, mainly for implementing
-call_user_func_async(). This thread count specifies totally number of physical
-threads allocated for executing fiber asynchronous function calls.
-
 = Proxy Server
 
   Proxy {
@@ -577,7 +555,6 @@ next requests.
     Memory = false
     Malloc = false
     APC = false
-    APCKey = false
     SQL = false
     SQLTable = false
     NetworkIO = false
@@ -607,7 +584,6 @@ next requests.
 
   Debug {
     FullBacktrace = false
-    ServerStackTrace = false
     ServerErrorMessage = false
     TranslateSource = false
 
@@ -621,7 +597,7 @@ next requests.
     CoreDumpReportDirectory = /tmp
   }
 
-- FullBacktrace, ServerStackTrace, ServerErrorMessage, TranslateSource
+- FullBacktrace, ServerErrorMessage, TranslateSource
 
 These settings turn on error messages in HTTP responses with detailed
 stacktrace information. TranslateSource will translate C++ file and line
@@ -807,6 +783,27 @@ disabled by setting TypedResults to false.
    BacktraceLimit = 100000
    RecursionLimit = 100000
   }
+
+- Eval.PCRETableSize
+
+The number of patterns which can be stored in the PCRE cache.
+
+- Eval.PCRECacheType
+
+May be "static", for a very fast cache which never evicts, "lru", for a cache
+which evicts the least-recently used item when full, or "scalable" for a cache
+which is slightly slower than "lru" at low concurrency but much faster for a
+high-concurrency tight-loop workload.
+
+Default: scalable.
+
+- Eval.PCREExpireInterval
+
+If Eval.PCRECacheType is set to "static", then setting this to an integer
+number of seconds will cause the cache to be regularly cleared after the
+specified number of seconds.
+
+For "lru" and "scalable" type caches, this is not necessary and not supported.
 
 =  Tier overwrites
 

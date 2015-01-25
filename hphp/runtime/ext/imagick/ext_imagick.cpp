@@ -19,7 +19,8 @@
 
 #include <vector>
 
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/base/file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 
 using std::pair;
 using std::string;
@@ -97,12 +98,12 @@ void imagickReadOp(MagickWand* wand,
   if (isMagickPseudoFormat(path, 'R')) {
     realpath = path;
   } else {
-    auto var = f_realpath(path);
-    realpath = var.isString() ? var.toString() : null_string;
+    auto var = HHVM_FN(realpath)(path);
+    realpath = var.isString() ? var.toString() : String();
     if (realpath.empty() ||
-        !f_is_file(realpath) ||
-        !f_is_readable(realpath)) {
-      realpath = null_string;
+        !HHVM_FN(is_file)(realpath) ||
+        !HHVM_FN(is_readable)(realpath)) {
+      realpath.reset();
     }
   }
   if (realpath.empty()) {
@@ -133,17 +134,17 @@ void imagickWriteOp(MagickWand* wand,
     realpath = path;
   } else {
     static const int PHP_PATHINFO_DIRNAME = 1;
-    String dirname = f_pathinfo(path, PHP_PATHINFO_DIRNAME).toString();
-    if (!f_is_dir(dirname)) {
-      realpath = null_string;
-    } else if (!f_is_file(path)) {
-      realpath = f_is_writable(dirname)
-               ? path
-               : null_string;
+    String dirname = HHVM_FN(pathinfo)(path, PHP_PATHINFO_DIRNAME).toString();
+    if (!HHVM_FN(is_dir)(dirname)) {
+      // nothing to do here
+    } else if (!HHVM_FN(is_file)(path)) {
+      if (HHVM_FN(is_writable)(dirname)) {
+        realpath = path;
+      }
     } else {
-      realpath = f_is_writable(path)
-               ? f_realpath(path).toString()
-               : null_string;
+      if (HHVM_FN(is_writable)(path)) {
+        realpath = HHVM_FN(realpath)(path).toString();
+      }
     }
   }
   if (realpath.empty()) {
@@ -221,23 +222,21 @@ void imagickWriteOp(MagickWand* wand,
 //////////////////////////////////////////////////////////////////////////////
 // Common Helper
 void raiseDeprecated(const char* className, const char* methodName) {
-  raise_message(ErrorConstants::ErrorModes::PHP_DEPRECATED,
-                "%s::%s method is deprecated and it's use should be avoided",
-                className, methodName);
+  raise_deprecated("%s::%s method is deprecated and it's use should be avoided",
+                   className, methodName);
 }
 
 void raiseDeprecated(const char* className,
                      const char* methodName,
                      const char* newClass,
                      const char* newMethod) {
-  raise_message(ErrorConstants::ErrorModes::PHP_DEPRECATED,
-                "%s::%s is deprecated. %s::%s should be used instead",
-                className, methodName, newClass, newMethod);
+  raise_deprecated("%s::%s is deprecated. %s::%s should be used instead",
+                   className, methodName, newClass, newMethod);
 }
 
 String convertMagickString(char* &&str) {
   if (str == nullptr) {
-    return null_string;
+    return String();
   } else {
     String ret(str);
     freeMagickMemory(str);
@@ -247,7 +246,7 @@ String convertMagickString(char* &&str) {
 
 String convertMagickData(size_t size, unsigned char* &data) {
   if (data == nullptr) {
-    return null_string;
+    return String();
   } else {
     String ret((char*)data, size, CopyString);
     freeMagickMemory(data);
@@ -319,7 +318,7 @@ std::vector<PointInfo> toPointInfoArray(const Array& coordinates) {
 //////////////////////////////////////////////////////////////////////////////
 // ImagickExtension
 ImagickExtension::ImagickExtension() :
-  Extension("imagick") {
+  Extension("imagick", "3.2.0b2") {
 }
 
 void ImagickExtension::moduleInit() {

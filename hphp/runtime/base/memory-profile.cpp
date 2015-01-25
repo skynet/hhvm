@@ -31,17 +31,17 @@ static ProfileStackTrace getStackTrace() {
   ProfileStackTrace trace;
 
   if (g_context.isNull()) return trace;
-  JIT::VMRegAnchor _;
-  ActRec *fp = g_context->getFP();
+  VMRegAnchor _;
+  ActRec *fp = vmfp();
   if (!fp) return trace;
-  PC pc = g_context->getPC();
+  PC pc = vmpc();
 
   const Func *f = fp->m_func;
   Unit *u = f->unit();
   Offset off = pc - u->entry();
   for (;;) {
     trace.push_back({ f, off, fp->resumed() });
-    fp = g_context->getPrevVMState(fp, &off);
+    fp = g_context->getPrevVMStateUNSAFE(fp, &off);
     if (!fp) break;
     f = fp->m_func;
   }
@@ -126,17 +126,20 @@ size_t MemoryProfile::getSizeOfTV(const TypedValue* tv) {
   if (!RuntimeOption::HHProfServerEnabled) return 0;
 
   switch (tv->m_type) {
-  case KindOfString:
-    return getSizeOfPtr(tv->m_data.pstr);
-  case KindOfArray:
-    return getSizeOfArray(tv->m_data.parr);
-  case KindOfObject:
-    return getSizeOfObject(tv->m_data.pobj);
-  case KindOfRef:
-    return getSizeOfPtr(tv->m_data.pref);
-  default:
-    return 0;
+    DT_UNCOUNTED_CASE:
+    case KindOfResource:
+    case KindOfClass:
+      return 0;
+    case KindOfString:
+      return getSizeOfPtr(tv->m_data.pstr);
+    case KindOfArray:
+      return getSizeOfArray(tv->m_data.parr);
+    case KindOfObject:
+      return getSizeOfObject(tv->m_data.pobj);
+    case KindOfRef:
+      return getSizeOfPtr(tv->m_data.pref);
   }
+  not_reached();
 }
 
 // static

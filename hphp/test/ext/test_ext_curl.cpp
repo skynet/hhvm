@@ -15,8 +15,13 @@
 */
 
 #include "hphp/test/ext/test_ext_curl.h"
+
+#include <folly/Conv.h>
+
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/ext/curl/ext_curl.h"
-#include "hphp/runtime/ext/ext_output.h"
+#include "hphp/runtime/ext/std/ext_std_output.h"
 #include "hphp/runtime/ext/zlib/ext_zlib.h"
 #include "hphp/runtime/server/libevent-server.h"
 
@@ -50,8 +55,7 @@ public:
 static int s_server_port = 0;
 
 static std::string get_request_uri() {
-  return "http://localhost:" + boost::lexical_cast<string>(s_server_port) +
-    "/request";
+  return "http://localhost:" + folly::to<string>(s_server_port) + "/request";
 }
 
 static ServerPtr runServer() {
@@ -162,7 +166,7 @@ bool TestExtCurl::test_curl_setopt_array() {
   HHVM_FN(curl_setopt_array)
     (c.toResource(),
      make_map_array(k_CURLOPT_URL, String(get_request_uri()),
-                 k_CURLOPT_RETURNTRANSFER, true));
+                    k_CURLOPT_RETURNTRANSFER, true));
   Variant res = HHVM_FN(curl_exec)(c.toResource());
   VS(res, "OK");
   return Count(true);
@@ -179,11 +183,11 @@ bool TestExtCurl::test_curl_exec() {
     Variant c = HHVM_FN(curl_init)(String(get_request_uri()));
     HHVM_FN(curl_setopt)(c.toResource(), k_CURLOPT_WRITEFUNCTION,
                          "curl_write_func");
-    f_ob_start();
+    HHVM_FN(ob_start)();
     HHVM_FN(curl_exec)(c.toResource());
-    String res = f_ob_get_contents();
+    String res = HHVM_FN(ob_get_contents)();
     VS(res, "curl_write_func called with OK");
-    f_ob_end_clean();
+    HHVM_FN(ob_end_clean)();
   }
   return Count(true);
 }
@@ -215,6 +219,8 @@ bool TestExtCurl::test_curl_error() {
   Variant err = HHVM_FN(curl_error)(c.toResource());
   VERIFY(equal(err, String("Couldn't resolve host 'www.thereisnosuchanurl'")) ||
          equal(err, String("Could not resolve host: www.thereisnosuchanurl"
+                " (Domain name not found)")) ||
+         equal(err, String("Could not resolve: www.thereisnosuchanurl"
                 " (Domain name not found)")));
   return Count(true);
 }
@@ -335,4 +341,3 @@ bool TestExtCurl::test_curl_multi_close() {
   HHVM_FN(curl_multi_close)(mh);
   return Count(true);
 }
-

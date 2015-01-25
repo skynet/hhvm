@@ -10,10 +10,11 @@
 
 open Utils
 open Typing_defs
-open Autocomplete
 
+module N = Nast
 module Reason = Typing_reason
 module Env = Typing_env
+module ShapeMap = Nast.ShapeMap
 
 (*****************************************************************************)
 (* Importing what is necessary *)
@@ -21,8 +22,8 @@ module Env = Typing_env
 
 let not_implemented _ = failwith "Function not implemented"
 
-type expand_typedef = 
-    SSet.t -> Env.env -> Reason.t -> string -> ty list -> Env.env * ty
+type expand_typedef =
+    Env.env -> Reason.t -> string -> ty list -> Env.env * ty
 
 let (expand_typedef_ref : expand_typedef ref) = ref not_implemented
 let expand_typedef x = !expand_typedef_ref x
@@ -45,7 +46,9 @@ let rec is_option env ty =
   | _, Toption _ -> true
   | _, Tunresolved tyl ->
       List.exists (is_option env) tyl
-  | _ -> false
+  | _, (Tany | Tmixed | Tarray (_, _) | Tprim _ | Tgeneric (_, _) | Tvar _
+    | Tabstract (_, _, _) | Tapply (_, _) | Ttuple _ | Tanon (_, _) | Tfun _
+    | Tobject | Tshape _ | Taccess (_, _, _)) -> false
 
 (*****************************************************************************)
 (* Unification error *)
@@ -53,85 +56,15 @@ let rec is_option env ty =
 let uerror r1 ty1 r2 ty2 =
   let ty1 = Typing_print.error ty1 in
   let ty2 = Typing_print.error ty2 in
-  error_l (
-    (Reason.to_string ("This is " ^ ty1) r1) @
+  Errors.unify_error
+    (Reason.to_string ("This is " ^ ty1) r1)
     (Reason.to_string ("It is incompatible with " ^ ty2) r2)
-  )
 
-(*****************************************************************************)
-(* Adding results to auto-completion  *)
-(*****************************************************************************)
-
-let add_auto_result env class_members =
-  Autocomplete.auto_complete_result :=
-    SMap.fold begin fun x class_elt acc ->
-      let ty = class_elt.ce_type in
-      let type_ = Typing_print.full env ty in
-      let pos = Reason.to_pos (fst ty) in
-      let sig_ = x^" "^type_ in
-      SMap.add sig_ (Autocomplete.make_result x pos type_) acc
-    end class_members SMap.empty
-
-let handle_class_type completion_type c =
-  match completion_type, c.Typing_defs.tc_kind with
-  | Some Autocomplete.Acid, Ast.Cnormal
-  | Some Autocomplete.Acid, Ast.Cabstract
-  | Some Autocomplete.Acnew, Ast.Cnormal
-  | Some Autocomplete.Actype, _ -> true
-  | _ -> false
-
-let should_complete_fun completion_type name =
-  match (Typing_env.Funs.get name) with
-  | Some _ when completion_type = (Some Autocomplete.Acid) -> true
-  | _ -> false
-
-let should_complete_class completion_type name =
-  match (Typing_env.Classes.get name) with
-  | Some c when handle_class_type completion_type c -> true
-  | _ -> false
-
-let is_argument_info_target p =
-  match !argument_info_target with
-  | None -> false
-  | Some (line, char_pos) ->
-      let start_line, start_col, end_col = Pos.info_pos p in
-      start_line = line && start_col <= char_pos && char_pos - 1 <= end_col
-
-let process_arg_info fun_args used_args env =
-  if !argument_info_target <> None && !argument_info_expected = None then
-    let _, result = List.fold_left begin fun (index, result) arg ->
-      let result =
-        if is_argument_info_target (fst arg) then Some index else result in
-      index + 1, result
-    end (0, None) used_args in
-    if result <> None then (
-      argument_info_expected := Some (List.map begin
-          fun (x,y) -> x, Typing_print.full env y end fun_args);
-      argument_info_position := result
-    );
-  ()
-  
 let process_static_find_ref cid mid =
   match cid with
-  | Nast.CI c -> Find_refs.process_class_ref (fst c) (snd c) (Some (snd mid))
+  | Nast.CI c ->
+    Typing_hooks.dispatch_class_id_hook c (Some mid);
   | _ -> ()
-
-(*****************************************************************************)
-(* Adding an infered type *)
-(*****************************************************************************)
-
-(* Remember (when we care) the type found at a position *)
-let save_infer env pos ty =
-  match !infer_target with
-  | None -> ()
-  | Some (line, char_pos) ->
-      let l, start, end_ = Pos.info_pos pos in
-      if l = line && start <= char_pos && char_pos <= end_ && !infer_type = None
-      then begin
-        infer_type := Some (Typing_print.full env ty);
-        infer_pos := Some (Reason.to_pos (fst ty));
-      end
-      else ()
 
 (* Find the first defined position in a list of types *)
 let rec find_pos p_default tyl =
@@ -149,15 +82,17 @@ let rec find_pos p_default tyl =
  *)
 (*****************************************************************************)
 
+let get_shape_field_name = Env.get_shape_field_name
+
 let apply_shape ~f env (r1, fdm1) (r2, fdm2) =
-  SMap.fold begin fun name ty1 env ->
-    match SMap.get name fdm2 with
+  ShapeMap.fold begin fun name ty1 env ->
+    match ShapeMap.get name fdm2 with
     | None when is_option env ty1 -> env
     | None ->
         let pos1 = Reason.to_pos r1 in
         let pos2 = Reason.to_pos r2 in
-        error_l [pos2, "The field '"^name^"' is missing";
-                 pos1, "The field '"^name^"' is defined"]
+        Errors.missing_field pos2 pos1 (get_shape_field_name name);
+        env
     | Some ty2 ->
         f env ty1 ty2
   end fdm1 env
@@ -170,11 +105,14 @@ let rec member_inter env ty tyl acc =
   match tyl with
   | [] -> env, ty :: acc
   | x :: rl ->
-      try
-        let env, ty = unify env x ty in
-        env, List.rev_append acc (ty :: rl)
-      with Error _ ->
-        member_inter env ty rl (x :: acc)
+      Errors.try_
+        begin fun () ->
+          let env, ty = unify env x ty in
+          env, List.rev_append acc (ty :: rl)
+        end
+        begin fun _ ->
+          member_inter env ty rl (x :: acc)
+        end
 
 and normalize_inter env tyl1 tyl2 =
   match tyl1 with
@@ -205,9 +143,7 @@ let fold_unresolved env ty =
       (try
         let env, acc =
           List.fold_left begin fun (env, acc) ty ->
-            try unify env acc ty
-            with Error _ ->
-              raise Exit
+            Errors.try_ (fun () -> unify env acc ty) (fun _ -> raise Exit)
           end (env, x) rl in
         env, acc
       with Exit ->
@@ -236,31 +172,18 @@ let unresolved env ty =
 
 let is_array_as_tuple env ty =
   let env, ety = Env.expand_type env ty in
-  let env, ty = fold_unresolved env ty in
+  let env, ety = fold_unresolved env ety in
   match ety with
-  | r, Tunresolved [_, Tarray (_, Some elt_type, None)]
-  | r, Tarray (_, Some elt_type, None) ->
+  | _, Tarray (Some elt_type, None) ->
       let env, normalized_elt_ty = Env.expand_type env elt_type in
-      let env, normalized_elt_ty = fold_unresolved env normalized_elt_ty in
+      let _env, normalized_elt_ty = fold_unresolved env normalized_elt_ty in
       (match normalized_elt_ty with
       | _, Tunresolved _ -> true
       | _ -> false
       )
-  | _ -> false
-
-(*****************************************************************************)
-(* Retrieves the type of "self" *)
-(*****************************************************************************)
-
-let get_self_class env error =
-  let self = Env.get_self env in
-  match self with
-  | _, Tapply ((_, self), _) ->
-      (match snd (Env.get_class env self) with
-      | None -> assert false
-      | Some tc -> tc)
-  | _ ->
-      error()
+  | _, (Tany | Tmixed | Tarray (_, _) | Tprim _ | Tgeneric (_, _) | Toption _
+    | Tvar _ | Tabstract (_, _, _) | Tapply (_, _) | Ttuple _ | Tanon (_, _)
+    | Tfun _ | Tunresolved _ | Tobject | Tshape _ | Taccess (_, _, _)) -> false
 
 (*****************************************************************************)
 (* Adds a new field to all the shapes found in a given type.
@@ -272,7 +195,7 @@ let rec grow_shape pos lvalue field_name ty env shape =
   let _, shape = Env.expand_type env shape in
   match shape with
   | _, Tshape fields ->
-      let fields = SMap.add field_name ty fields in
+      let fields = ShapeMap.add field_name ty fields in
       let result = Reason.Rwitness pos, Tshape fields in
       env, result
   | _, Tunresolved tyl ->
@@ -302,3 +225,24 @@ let min_vis_opt vis_opt1 vis_opt2 =
   | Some (pos1, x), Some (pos2, y) ->
       let pos = if pos1 = Pos.none then pos2 else pos1 in
       Some (pos, min_vis x y)
+
+(*****************************************************************************)
+(* Check if a type is not fully constrained *)
+(*****************************************************************************)
+
+module HasTany : sig
+  val check: ty -> bool
+end = struct
+  let visitor =
+    object(this)
+      inherit [bool] TypeVisitor.type_visitor
+      method! on_tany _ = true
+      method! on_tarray acc ty1_opt ty2_opt =
+        (* Check for array without its value type parameter specified *)
+        (match ty2_opt with
+        | None -> true
+        | Some ty -> this#on_type acc ty) ||
+        (opt_fold_left this#on_type acc ty1_opt)
+    end
+  let check ty = visitor#on_type false ty
+end

@@ -19,7 +19,7 @@
 
 #include "hphp/runtime/base/type-variant.h"
 
-#include "folly/dynamic.h"
+#include <folly/dynamic.h>
 
 #include <cstdint>
 #include <functional>
@@ -35,9 +35,11 @@ class String;
 
 bool ini_on_update(const folly::dynamic& value, bool& p);
 bool ini_on_update(const folly::dynamic& value, double& p);
+bool ini_on_update(const folly::dynamic& value, char& p);
 bool ini_on_update(const folly::dynamic& value, int16_t& p);
 bool ini_on_update(const folly::dynamic& value, int32_t& p);
 bool ini_on_update(const folly::dynamic& value, int64_t& p);
+bool ini_on_update(const folly::dynamic& value, unsigned char& p);
 bool ini_on_update(const folly::dynamic& value, uint16_t& p);
 bool ini_on_update(const folly::dynamic& value, uint32_t& p);
 bool ini_on_update(const folly::dynamic& value, uint64_t& p);
@@ -45,11 +47,16 @@ bool ini_on_update(const folly::dynamic& value, std::string& p);
 bool ini_on_update(const folly::dynamic& value, String& p);
 bool ini_on_update(const folly::dynamic& value, Array& p);
 bool ini_on_update(const folly::dynamic& value, std::set<std::string>& p);
+bool ini_on_update(const folly::dynamic& value, std::vector<std::string>& p);
+bool ini_on_update(const folly::dynamic& value,
+                   std::map<std::string, std::string>& p);
 folly::dynamic ini_get(bool& p);
 folly::dynamic ini_get(double& p);
+folly::dynamic ini_get(char& p);
 folly::dynamic ini_get(int16_t& p);
 folly::dynamic ini_get(int32_t& p);
 folly::dynamic ini_get(int64_t& p);
+folly::dynamic ini_get(unsigned char& p);
 folly::dynamic ini_get(uint16_t& p);
 folly::dynamic ini_get(uint32_t& p);
 folly::dynamic ini_get(uint64_t& p);
@@ -57,6 +64,8 @@ folly::dynamic ini_get(std::string& p);
 folly::dynamic ini_get(String& p);
 folly::dynamic ini_get(Array& p);
 folly::dynamic ini_get(std::set<std::string>& p);
+folly::dynamic ini_get(std::vector<std::string>& p);
+folly::dynamic ini_get(std::map<std::string, std::string>& p);
 
 class IniSetting {
   struct CallbackData {
@@ -156,6 +165,17 @@ public:
   static bool SetUser(const std::string& name, const folly::dynamic& value,
                       FollyDynamic);
   static bool SetUser(const String& name, const Variant& value);
+  /**
+   * Fill in constant that may not have been bound when an
+   * ini file was initially parsed
+   */
+   static bool FillInConstant(const std::string& name,
+                              const folly::dynamic& value,
+                              FollyDynamic);
+  /**
+   * Get the mode for a setting
+   */
+  static bool GetMode(const std::string& name, Mode& mode);
 
   template<class T>
   struct SetAndGet {
@@ -225,7 +245,10 @@ public:
   }
   /**
    * Prefer to use this method whenever possible (the non-default one is ok
-   * too).
+   * too). Use Config::Bind if immediate access to the ini setting is
+   * necessary. For performance reasons, Config::Bind should only be used
+   * when access to the ini setting is needed prior to loading the rest of
+   * the ini settings.
    */
   template<class T>
   static void Bind(const Extension* extension, const Mode mode,
@@ -250,6 +273,12 @@ public:
   // have been initialized. This should only be used in rare cases that can't
   // be refactored into registration before extensions are done.
   static bool s_pretendExtensionsHaveNotBeenLoaded;
+
+  // Used to help us late bind extension constants (e.g. E_ALL) that
+  // were incorrectly bound initially, and needed to be bound again after
+  // all was loaded.
+  static bool s_config_is_a_constant;
+  static std::set<std::string> config_names_that_use_constants;
 
 private:
   static void Bind(const Extension* extension, const Mode mode,

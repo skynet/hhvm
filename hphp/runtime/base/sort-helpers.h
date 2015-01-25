@@ -19,6 +19,7 @@
 
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/type-string.h"
 #include "hphp/runtime/base/type-variant.h"
 #include "hphp/runtime/base/zend-functions.h"
@@ -30,6 +31,11 @@
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
+/**
+ * These comparators below are used together with safesort(), and safesort
+ * requires that comparators return true iff left is GREATER than right.
+ */
+
 template <typename AccessorT, int sort_flags, bool ascending>
 struct IntElmCompare {
   typedef typename AccessorT::ElmT ElmT;
@@ -38,7 +44,7 @@ struct IntElmCompare {
     int64_t iLeft = acc.getInt(left);
     int64_t iRight = acc.getInt(right);
     if (sort_flags == SORT_REGULAR || sort_flags == SORT_NUMERIC) {
-      return ascending ? (iLeft < iRight) : (iLeft > iRight);
+      return ascending ? (iLeft > iRight) : (iLeft < iRight);
     }
     char bufLeft[21];
     char bufRight[21];
@@ -69,27 +75,27 @@ struct IntElmCompare {
     }
     if (sort_flags == SORT_STRING) {
       return ascending ?
-               (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-               (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0);
+               (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+               (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0);
     }
     if (sort_flags == SORT_STRING_CASE) {
       return ascending ?
-               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0);
+               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0);
     }
     if (sort_flags == SORT_LOCALE_STRING) {
-      return ascending ? (strcoll(sLeft, sRight) < 0) :
-                         (strcoll(sLeft, sRight) > 0);
+      return ascending ? (strcoll(sLeft, sRight) > 0) :
+                         (strcoll(sLeft, sRight) < 0);
     }
     if (sort_flags == SORT_NATURAL) {
       return ascending ?
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0) :
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0);
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0) :
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0);
     }
     if (sort_flags == SORT_NATURAL_CASE) {
       return ascending ?
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0) :
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0);
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0) :
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0);
     }
     assert(false);
     return true;
@@ -104,13 +110,13 @@ struct StrElmCompare {
     StringData* sdLeft = acc.getStr(left);
     StringData* sdRight = acc.getStr(right);
     if (sort_flags == SORT_REGULAR) {
-      return ascending ? (sdLeft->compare(sdRight) < 0) :
-                         (sdLeft->compare(sdRight) > 0);
+      return ascending ? (sdLeft->compare(sdRight) > 0) :
+                         (sdLeft->compare(sdRight) < 0);
     }
     if (sort_flags == SORT_NUMERIC) {
       double dLeft = sdLeft->toDouble();
       double dRight = sdRight->toDouble();
-      return ascending ? (dLeft < dRight) : (dLeft > dRight);
+      return ascending ? (dLeft > dRight) : (dLeft < dRight);
     }
     const char* sLeft = sdLeft->data();
     int lenLeft = sdLeft->size();
@@ -118,27 +124,27 @@ struct StrElmCompare {
     int lenRight = sdRight->size();
     if (sort_flags == SORT_STRING) {
       return ascending ?
-               (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-               (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0);
+               (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+               (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0);
     }
     if (sort_flags == SORT_STRING_CASE) {
       return ascending ?
-               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0);
+               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0);
     }
     if (sort_flags == SORT_LOCALE_STRING) {
-      return ascending ? (strcoll(sLeft, sRight) < 0) :
-                         (strcoll(sLeft, sRight) > 0);
+      return ascending ? (strcoll(sLeft, sRight) > 0) :
+                         (strcoll(sLeft, sRight) < 0);
     }
     if (sort_flags == SORT_NATURAL) {
       return ascending ?
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0) :
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0);
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0) :
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0);
     }
     if (sort_flags == SORT_NATURAL_CASE) {
       return ascending ?
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0) :
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0);
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0) :
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0);
     }
     assert(false);
     return true;
@@ -156,14 +162,14 @@ struct ElmCompare {
         if (LIKELY(acc.isStr(right))) {
           StringData* sLeft = acc.getStr(left);
           StringData* sRight = acc.getStr(right);
-          return ascending ? (sLeft->compare(sRight) < 0) :
-                             (sLeft->compare(sRight) > 0);
+          return ascending ? (sLeft->compare(sRight) > 0) :
+                             (sLeft->compare(sRight) < 0);
         }
       } else if (acc.isInt(left)) {
         if (LIKELY(acc.isInt(right))) {
           int64_t iLeft = acc.getInt(left);
           int64_t iRight = acc.getInt(right);
-          return ascending ? (iLeft < iRight) : (iLeft > iRight);
+          return ascending ? (iLeft > iRight) : (iLeft < iRight);
         }
       }
     }
@@ -172,7 +178,7 @@ struct ElmCompare {
         if (LIKELY(acc.isInt(right))) {
           int64_t iLeft = acc.getInt(left);
           int64_t iRight = acc.getInt(right);
-          return ascending ? (iLeft < iRight) : (iLeft > iRight);
+          return ascending ? (iLeft > iRight) : (iLeft < iRight);
         }
       }
     }
@@ -188,27 +194,27 @@ struct ElmCompare {
           int lenRight = sdRight->size();
           if (sort_flags == SORT_STRING) {
             return ascending ?
-                     (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-                     (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0);
+                     (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+                     (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0);
           }
           if (sort_flags == SORT_STRING_CASE) {
             return ascending ?
-                     (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-                     (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0);
+                     (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+                     (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0);
           }
           if (sort_flags == SORT_LOCALE_STRING) {
-            return ascending ? (strcoll(sLeft, sRight) < 0) :
-                               (strcoll(sLeft, sRight) > 0);
+            return ascending ? (strcoll(sLeft, sRight) > 0) :
+                               (strcoll(sLeft, sRight) < 0);
           }
           if (sort_flags == SORT_NATURAL) {
             return ascending ?
-              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0) :
-              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0);
+              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0) :
+              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0);
           }
           if (sort_flags == SORT_NATURAL_CASE) {
             return ascending ?
-              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0) :
-              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0);
+              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0) :
+              (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0);
           }
         }
       }
@@ -217,12 +223,12 @@ struct ElmCompare {
     Variant vLeft = acc.getValue(left);
     Variant vRight = acc.getValue(right);
     if (sort_flags == SORT_REGULAR) {
-      return ascending ? HPHP::less(vLeft, vRight) : HPHP::more(vLeft, vRight);
+      return ascending ? HPHP::more(vLeft, vRight) : HPHP::less(vLeft, vRight);
     }
     if (sort_flags == SORT_NUMERIC) {
       double dLeft = vLeft.toDouble();
       double dRight = vRight.toDouble();
-      return ascending ? dLeft < dRight : dLeft > dRight;
+      return ascending ? dLeft > dRight : dLeft < dRight;
     }
     String strLeft = vLeft.toString();
     String strRight = vRight.toString();
@@ -232,28 +238,28 @@ struct ElmCompare {
     int lenRight = strRight.size();
     if (sort_flags == SORT_STRING) {
       return ascending ?
-               (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-               (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0);
+               (string_strcmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+               (string_strcmp(sLeft, lenLeft, sRight, lenRight) < 0);
     }
     if (sort_flags == SORT_STRING_CASE) {
       return ascending ?
-               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0) :
-               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0);
+               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) > 0) :
+               (bstrcasecmp(sLeft, lenLeft, sRight, lenRight) < 0);
     }
     if (sort_flags == SORT_LOCALE_STRING) {
       return ascending ?
-               (strcoll(sLeft, sRight) < 0) :
-               (strcoll(sLeft, sRight) > 0);
+               (strcoll(sLeft, sRight) > 0) :
+               (strcoll(sLeft, sRight) < 0);
     }
     if (sort_flags == SORT_NATURAL) {
       return ascending ?
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0) :
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0);
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) > 0) :
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 0) < 0);
     }
     if (sort_flags == SORT_NATURAL_CASE) {
       return ascending ?
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0) :
-               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0);
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) > 0) :
+               (string_natural_cmp(sLeft, lenLeft, sRight, lenRight, 1) < 0);
     }
     assert(false);
     return true;
@@ -278,48 +284,35 @@ struct ElmUCompare {
       };
       g_context->invokeFuncFew(ret.asTypedValue(), *ctx, 2, args);
     }
-    if (ret.isInteger()) {
-      return ret.toInt64() < 0;
+    if (LIKELY(ret.isInteger())) {
+      return ret.toInt64() > 0;
     }
     if (ret.isDouble()) {
-      return ret.toDouble() < 0.0;
+      return ret.toDouble() > 0.0;
     }
     if (ret.isString()) {
       int64_t lval; double dval;
-      switch (ret.getStringData()->isNumericWithVal(lval, dval, 0)) {
-        case KindOfInt64: return lval < 0;
-        case KindOfDouble: return dval < 0;
-        default: /* fall through */ break;
+      auto dt = ret.getStringData()->isNumericWithVal(lval, dval, 0);
+
+      if (IS_INT_TYPE(dt)) {
+        return lval > 0;
+      } else if (IS_DOUBLE_TYPE(dt)) {
+        return dval > 0;
       }
-    }
-    if (!warned) {
-      raise_warning("Sort comparators should not return a boolean since it "
-                    "may result in a different sort order than expected. The "
-                    "comparator should return an integer or double (negative "
-                    "if left is less than right, positive if left is greater "
-                    "than right, zero otherwise).");
-      warned = true;
     }
     if (ret.isBoolean()) {
-      // Match the behavior of Zend PHP for comparators that return
-      // boolean values
-      bool b = ret.toBoolean();
-      if (b) {
-        return false;
+      if (!warned) {
+        raise_warning("Sort comparators should not return a boolean because "
+                      "it may result in a different sort order than expected. "
+                      "The comparator should return an integer (negative if "
+                      "left is less than right, positive if left is greater "
+                      "than right, zero if they are equal).");
+        warned = true;
       }
-      Variant ret2;
-      TypedValue args[2] = {
-        *acc.getValue(right).asCell(),
-        *acc.getValue(left).asCell()
-      };
-      g_context->invokeFuncFew(ret2.asTypedValue(), *ctx, 2, args);
-      if (ret2.isBoolean()) {
-        return ret2.toBoolean();
-      }
-      // We have a wild comparator that returns boolean and non-boolean
-      // values; give up and fall through to the logic below
     }
-    return ret.toInt64() < 0;
+    // If the comparator returned something other than int, double, or a
+    // numeric string, we fall back to casting it to an integer.
+    return ret.toInt64() > 0;
   }
 private:
   mutable bool warned;

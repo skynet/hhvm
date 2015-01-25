@@ -16,12 +16,13 @@
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/base/file-repository.h"
+#include "hphp/runtime/server/source-root-info.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/ext_continuation.h"
+#include "hphp/runtime/ext/ext_generator.h"
 #include "hphp/runtime/ext/ext_collections.h"
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/vm/repo.h"
@@ -29,7 +30,7 @@
 #include "hphp/util/text-util.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/base/zend-functions.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 
 namespace HPHP {
 
@@ -53,50 +54,21 @@ void print_string(StringData* s) {
 void print_int(int64_t i) {
   char buf[256];
   snprintf(buf, 256, "%" PRId64, i);
-  echo(buf);
+  g_context->write(buf);
   TRACE(1, "t-x64 output(int): %" PRId64 "\n", i);
 }
 
 void print_boolean(bool val) {
   if (val) {
-    echo("1");
+    g_context->write("1");
   }
 }
-
-#define NEW_COLLECTION_HELPER(name) \
-  ObjectData* \
-  new##name##Helper(int nElms) { \
-    ObjectData *obj = NEWOBJ(c_##name)(); \
-    obj->incRefCount(); \
-    if (nElms) { \
-      collectionReserve(obj, nElms); \
-    } \
-    TRACE(2, "new" #name "Helper: capacity %d\n", nElms); \
-    return obj; \
-  }
-
-NEW_COLLECTION_HELPER(Vector)
-NEW_COLLECTION_HELPER(Map)
-NEW_COLLECTION_HELPER(Set)
-NEW_COLLECTION_HELPER(ImmMap)
-NEW_COLLECTION_HELPER(ImmVector)
-NEW_COLLECTION_HELPER(ImmSet)
-
-ObjectData* newPairHelper() {
-  ObjectData *obj = NEWOBJ(c_Pair)();
-  obj->incRefCount();
-  TRACE(2, "newPairHelper: capacity 2\n");
-  return obj;
-}
-
-#undef NEW_COLLECTION_HELPER
 
 /**
  * concat_ss will will incRef the output string
  * and decref its first argument
  */
-StringData*
-concat_ss(StringData* v1, StringData* v2) {
+StringData* concat_ss(StringData* v1, StringData* v2) {
   if (v1->hasMultipleRefs()) {
     StringData* ret = StringData::Make(v1, v2);
     ret->setRefCount(1);
@@ -106,21 +78,19 @@ concat_ss(StringData* v1, StringData* v2) {
     return ret;
   }
 
-  auto const newV1 = v1->append(v2->slice());
-  if (UNLIKELY(newV1 != v1)) {
+  auto const ret = v1->append(v2->slice());
+  if (UNLIKELY(ret != v1)) {
     assert(v1->hasExactlyOneRef());
     v1->release();
-    newV1->incRefCount();
-    return newV1;
+    ret->incRefCount();
   }
-  return v1;
+  return ret;
 }
 
 /**
  * concat_is will incRef the output string
  */
-StringData*
-concat_is(int64_t v1, StringData* v2) {
+StringData* concat_is(int64_t v1, StringData* v2) {
   char intbuf[21];
   // Convert the int to a string
   auto const s1 = conv_10(v1, intbuf + sizeof(intbuf));
@@ -147,14 +117,56 @@ StringData* concat_si(StringData* v1, int64_t v2) {
     return ret;
   }
 
-  auto const newV1 = v1->append(s2);
-  if (UNLIKELY(newV1 != v1)) {
+  auto const ret = v1->append(s2);
+  if (UNLIKELY(ret != v1)) {
     assert(v1->hasExactlyOneRef());
     v1->release();
-    newV1->incRefCount();
-    return newV1;
+    ret->incRefCount();
   }
-  return v1;
+  return ret;
+}
+
+StringData* concat_s3(StringData* v1, StringData* v2, StringData* v3) {
+  if (v1->hasMultipleRefs()) {
+    StringData* ret = StringData::Make(
+        v1->slice(), v2->slice(), v3->slice());
+    ret->setRefCount(1);
+    // Because v1->getCount() is greater than 1, we know we will never
+    // have to release the string here
+    v1->decRefCount();
+    return ret;
+  }
+
+  auto const ret = v1->append(v2->slice(), v3->slice());
+
+  if (UNLIKELY(ret != v1)) {
+    assert(v1->hasExactlyOneRef());
+    v1->release();
+    ret->incRefCount();
+  }
+  return ret;
+}
+
+StringData* concat_s4(StringData* v1, StringData* v2,
+                      StringData* v3, StringData* v4) {
+  if (v1->hasMultipleRefs()) {
+    StringData* ret = StringData::Make(
+        v1->slice(), v2->slice(), v3->slice(), v4->slice());
+    ret->setRefCount(1);
+    // Because v1->getCount() is greater than 1, we know we will never
+    // have to release the string here
+    v1->decRefCount();
+    return ret;
+  }
+
+  auto const ret = v1->append(v2->slice(), v3->slice(), v4->slice());
+
+  if (UNLIKELY(ret != v1)) {
+    assert(v1->hasExactlyOneRef());
+    v1->release();
+    ret->incRefCount();
+  }
+  return ret;
 }
 
 Unit* compile_file(const char* s, size_t sz, const MD5& md5,
@@ -177,7 +189,7 @@ Unit* compile_string(const char* s,
                      const char* fname /* = nullptr */) {
   auto md5string = string_md5(s, sz);
   MD5 md5(md5string.c_str());
-  Unit* u = Repo::get().loadUnit(fname ? fname : "", md5);
+  Unit* u = Repo::get().loadUnit(fname ? fname : "", md5).release();
   if (u != nullptr) {
     return u;
   }
@@ -190,12 +202,13 @@ Unit* compile_string(const char* s,
 Unit* compile_systemlib_string(const char* s, size_t sz,
                                const char* fname) {
   if (RuntimeOption::RepoAuthoritative) {
-    Eval::FileRepository::FileInfo fi;
     String systemName = String("/:") + String(fname);
-    if (Eval::FileRepository::readRepoMd5(systemName.get(), fi)) {
-      MD5 md5(fi.m_unitMd5.c_str());
-      if (Unit* u = Repo::get().loadUnit(fname, md5)) {
-        return u;
+    MD5 md5;
+    if (Repo::get().findFile(systemName.data(),
+                             SourceRootInfo::GetCurrentSourceRoot(),
+                             md5)) {
+      if (auto u = Repo::get().loadUnit(fname, md5)) {
+        return u.release();
       }
     }
   }
@@ -210,7 +223,7 @@ int init_closure(ActRec* ar, TypedValue* sp) {
   c_Closure* closure = static_cast<c_Closure*>(ar->getThis());
 
   // Swap in the $this or late bound class or null if it is ony from a plain
-  // function or psuedomain
+  // function or pseudomain
   ar->setThisOrClassAllowNull(closure->getThisOrClass());
 
   if (ar->hasThis()) {
@@ -249,20 +262,8 @@ void raiseArrayIndexNotice(const int64_t index) {
   raise_notice("Undefined index: %" PRId64, index);
 }
 
-void defClsHelper(PreClass* preClass) {
-  using namespace JIT;
-
-  assert(tl_regState == VMRegState::DIRTY);
-  tl_regState = VMRegState::CLEAN;
-  Unit::defClass(preClass);
-
-  /*
-   * UniqueStubs::defClsHelper sync'd the registers for us already.
-   * This means if an exception propagates we want to leave things as
-   * VMRegState::CLEAN, since we're still in sync.  Only set it to
-   * dirty if we are actually returning to run in the TC again.
-   */
-  tl_regState = VMRegState::DIRTY;
+void raiseArrayKeyNotice(const StringData* key) {
+  raise_notice("Undefined key: %s", key->data());
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -270,21 +271,27 @@ void defClsHelper(PreClass* preClass) {
 const StaticString
   s_HH_Traversable("HH\\Traversable"),
   s_HH_KeyedTraversable("HH\\KeyedTraversable"),
+  s_HH_Container("HH\\Container"),
+  s_HH_KeyedContainer("HH\\KeyedContainer"),
   s_Indexish("Indexish"),
   s_XHPChild("XHPChild"),
   s_Stringish("Stringish");
 
 bool interface_supports_non_objects(const StringData* s) {
-  return s->isame(s_HH_Traversable.get()) ||
-         s->isame(s_HH_KeyedTraversable.get()) ||
-         s->isame(s_Indexish.get()) ||
-         s->isame(s_XHPChild.get()) ||
-         s->isame(s_Stringish.get());
+  return (s->isame(s_HH_Traversable.get()) ||
+          s->isame(s_HH_KeyedTraversable.get()) ||
+          s->isame(s_HH_Container.get()) ||
+          s->isame(s_HH_KeyedContainer.get()) ||
+          s->isame(s_Indexish.get()) ||
+          s->isame(s_XHPChild.get()) ||
+          s->isame(s_Stringish.get()));
 }
 
 bool interface_supports_array(const StringData* s) {
   return (s->isame(s_HH_Traversable.get()) ||
           s->isame(s_HH_KeyedTraversable.get()) ||
+          s->isame(s_HH_Container.get()) ||
+          s->isame(s_HH_KeyedContainer.get()) ||
           s->isame(s_Indexish.get()) ||
           s->isame(s_XHPChild.get()));
 }
@@ -293,6 +300,8 @@ bool interface_supports_array(const std::string& n) {
   const char* s = n.c_str();
   return ((n.size() == 14 && !strcasecmp(s, "HH\\Traversable")) ||
           (n.size() == 19 && !strcasecmp(s, "HH\\KeyedTraversable")) ||
+          (n.size() == 12 && !strcasecmp(s, "HH\\Container")) ||
+          (n.size() == 17 && !strcasecmp(s, "HH\\KeyedContainer")) ||
           (n.size() == 8 && !strcasecmp(s, "Indexish")) ||
           (n.size() == 8 && !strcasecmp(s, "XHPChild")));
 }
@@ -324,6 +333,22 @@ bool interface_supports_double(const StringData* s) {
 bool interface_supports_double(const std::string& n) {
   const char *s = n.c_str();
   return (n.size() == 8 && !strcasecmp(s, "XHPChild"));
+}
+
+//////////////////////////////////////////////////////////////////////
+
+int64_t zero_error_level() {
+  auto& id = ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData;
+  auto level = id.getErrorReportingLevel();
+  id.setErrorReportingLevel(0);
+  return level;
+}
+
+void restore_error_level(int64_t oldLevel) {
+  auto& id = ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData;
+  if (id.getErrorReportingLevel() == 0) {
+    id.setErrorReportingLevel(oldLevel);
+  }
 }
 
 //////////////////////////////////////////////////////////////////////

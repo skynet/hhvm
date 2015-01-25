@@ -19,7 +19,7 @@
 #include "hphp/runtime/vm/jit/types.h"
 #include "hphp/runtime/base/datatype.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 //////////////////////////////////////////////////////////////////////
 
@@ -63,11 +63,6 @@ struct UniqueStubs {
    */
   TCA resumeHelperRet;
   TCA resumeHelper;
-
-  /*
-   * A helper routine for implementing the DefCls opcode.
-   */
-  TCA defClsHelper;
 
   /*
    * Helper stubs for doing generic decrefs on a function return.  The
@@ -115,6 +110,12 @@ struct UniqueStubs {
    * that we skip the function.
    */
   TCA functionEnterHelper;
+
+  /*
+   * BindCall stubs for immutable/non-immutable calls
+   */
+  TCA bindCallStub;
+  TCA immutableBindCallStub;
 
   /*
    * Utility for logging stubs addresses during startup and registering the gdb

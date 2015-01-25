@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <vector>
 #include "hphp/zend/zend-html.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/bstring.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/zend-url.h"
 #include "hphp/runtime/base/runtime-error.h"
@@ -33,19 +35,15 @@ String StringUtil::Pad(const String& input, int final_length,
                        const String& pad_string /* = " " */,
                        PadType type /* = PadType::Right */) {
   int len = input.size();
-  char *ret = string_pad(input.data(), len, final_length, pad_string.data(),
-                         pad_string.size(), static_cast<int>(type));
-  if (ret) return String(ret, len, AttachString);
-  return String();
+  return string_pad(input.data(), len, final_length, pad_string.data(),
+                    pad_string.size(), static_cast<int>(type));
 }
 
 String StringUtil::StripHTMLTags(const String& input,
                                  const String& allowable_tags /* = "" */) {
   if (input.empty()) return input;
-  int len = input.size();
-  char *ret = string_strip_tags(input.data(), len, allowable_tags.data(),
-                                allowable_tags.size(), false);
-  return String(ret, len, AttachString);
+  return string_strip_tags(input.data(), input.size(),
+                           allowable_tags.data(), allowable_tags.size(), false);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -121,7 +119,7 @@ String StringUtil::Implode(const Variant& items, const String& delim) {
     throw_param_is_not_container();
   }
   int size = getContainerSize(items);
-  if (size == 0) return "";
+  if (size == 0) return empty_string();
 
   String* sitems = (String*)smart_malloc(size * sizeof(String));
   int len = 0;
@@ -154,10 +152,11 @@ String StringUtil::Implode(const Variant& items, const String& delim) {
   }
   smart_free(sitems);
   assert(p - buffer == len);
-  return s.setSize(len);
+  s.setSize(len);
+  return s;
 }
 
-Variant StringUtil::Split(const String& str, int split_length /* = 1 */) {
+Variant StringUtil::Split(const String& str, int64_t split_length /* = 1 */) {
   if (split_length <= 0) {
     throw_invalid_argument(
       "The length of each segment must be greater than zero"
@@ -165,8 +164,8 @@ Variant StringUtil::Split(const String& str, int split_length /* = 1 */) {
     return false;
   }
 
-  Array ret;
   int len = str.size();
+  PackedArrayInit ret(len / split_length + 1, CheckAllocation{});
   if (split_length >= len) {
     ret.append(str);
   } else {
@@ -174,7 +173,7 @@ Variant StringUtil::Split(const String& str, int split_length /* = 1 */) {
       ret.append(str.substr(i, split_length));
     }
   }
-  return ret;
+  return ret.toArray();
 }
 
 Variant StringUtil::ChunkSplit(const String& body, int chunklen /* = 76 */,
@@ -190,9 +189,8 @@ Variant StringUtil::ChunkSplit(const String& body, int chunklen /* = 76 */,
     ret = body;
     ret += end;
   } else {
-    char *chunked = string_chunk_split(body.data(), len, end.c_str(),
-                                       end.size(), chunklen);
-    return String(chunked, len, AttachString);
+    return string_chunk_split(body.data(), len, end.c_str(),
+                              end.size(), chunklen);
   }
   return ret;
 }
@@ -215,14 +213,14 @@ String StringUtil::HtmlEncode(const String& input, const int64_t qsBitmask,
   if (strcasecmp(charset, "ISO-8859-1") == 0) {
     utf8 = false;
   } else if (strcasecmp(charset, "UTF-8")) {
-    throw NotImplementedException(charset);
+    throw_not_implemented(charset);
   }
 
   int len = input.size();
   char *ret = string_html_encode(input.data(), len,
                                  qsBitmask, utf8, dEncode, htmlEnt);
   if (!ret) {
-    return empty_string;
+    return empty_string();
   }
   return String(ret, len, AttachString);
 }
@@ -264,7 +262,7 @@ String StringUtil::HtmlEncodeExtra(const String& input, QuoteStyle quoteStyle,
   } else if (strcasecmp(charset, "ISO-8859-1") == 0) {
     flags &= ~STRING_HTML_ENCODE_UTF8;
   } else {
-    throw NotImplementedException(charset);
+    throw_not_implemented(charset);
   }
 
   const AsciiMap *am;
@@ -325,7 +323,7 @@ String StringUtil::HtmlDecode(const String& input, QuoteStyle quoteStyle,
                                  charset, all);
   if (!ret) {
     // null iff charset was not recognized
-    throw NotImplementedException(charset);
+    throw_not_implemented(charset);
     // (charset is not null, see assertion above)
   }
 
@@ -335,71 +333,76 @@ String StringUtil::HtmlDecode(const String& input, QuoteStyle quoteStyle,
 String StringUtil::QuotedPrintableEncode(const String& input) {
   if (input.empty()) return input;
   int len = input.size();
-  char *ret = string_quoted_printable_encode(input.data(), len);
-  return String(ret, len, AttachString);
+  return string_quoted_printable_encode(input.data(), len);
 }
 
 String StringUtil::QuotedPrintableDecode(const String& input) {
   if (input.empty()) return input;
   int len = input.size();
-  char *ret = string_quoted_printable_decode(input.data(), len, false);
-  return String(ret, len, AttachString);
+  return string_quoted_printable_decode(input.data(), len, false);
 }
 
 String StringUtil::UUEncode(const String& input) {
   if (input.empty()) return input;
-
-  int len;
-  char *encoded = string_uuencode(input.data(), input.size(), len);
-  return String(encoded, len, AttachString);
+  return string_uuencode(input.data(), input.size());
 }
 
 String StringUtil::UUDecode(const String& input) {
   if (!input.empty()) {
-    int len;
-    char *decoded = string_uudecode(input.data(), input.size(), len);
-    if (decoded) {
-      return String(decoded, len, AttachString);
-    }
+    return string_uudecode(input.data(), input.size());
   }
   return String();
 }
 
 String StringUtil::Base64Encode(const String& input) {
   int len = input.size();
-  char *ret = string_base64_encode(input.data(), len);
-  return String(ret, len, AttachString);
+  return string_base64_encode(input.data(), len);
 }
 
 String StringUtil::Base64Decode(const String& input,
                                 bool strict /* = false */) {
   int len = input.size();
-  char *ret = string_base64_decode(input.data(), len, strict);
-  return String(ret, len, AttachString);
+  return string_base64_decode(input.data(), len, strict);
 }
 
 String StringUtil::UrlEncode(const String& input,
                              bool encodePlus /* = true */) {
-  int len = input.size();
-  char *ret;
-  if (encodePlus) {
-    ret = url_encode(input.data(), len);
-  } else {
-    ret = url_raw_encode(input.data(), len);
-  }
-  return String(ret, len, AttachString);
+  return encodePlus ?
+    url_encode(input.data(), input.size()) :
+    url_raw_encode(input.data(), input.size());
 }
 
 String StringUtil::UrlDecode(const String& input,
                              bool decodePlus /* = true */) {
-  int len = input.size();
-  char *ret;
-  if (decodePlus) {
-    ret = url_decode(input.data(), len);
-  } else {
-    ret = url_raw_decode(input.data(), len);
+  return decodePlus ?
+    url_decode(input.data(), input.size()) :
+    url_raw_decode(input.data(), input.size());
+}
+
+bool StringUtil::IsFileUrl(const String& input) {
+  return string_strncasecmp(
+    input.data(), input.size(),
+    "file://", sizeof("file://") - 1,
+    sizeof("file://") - 1) == 0;
+}
+
+String StringUtil::DecodeFileUrl(const String& input) {
+  Url url;
+  if (!url_parse(url, input.data(), input.size())) {
+    return null_string;
   }
-  return String(ret, len, AttachString);
+  if (bstrcasecmp(url.scheme.data(), url.scheme.size(),
+        "file", sizeof("file")-1) != 0) {
+    // Not file scheme
+    return null_string;
+  }
+  if (url.host.size() > 0
+      && bstrcasecmp(url.host.data(), url.host.size(),
+        "localhost", sizeof("localhost")-1) != 0) {
+    // Not localhost or empty host
+    return null_string;
+  }
+  return url_raw_decode(url.path.data(), url.path.size());
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -407,8 +410,7 @@ String StringUtil::UrlDecode(const String& input,
 
 String StringUtil::MoneyFormat(const char *format, double value) {
   assert(format);
-  char *formatted = string_money_format(format, value);
-  return formatted ? String(formatted, AttachString) : String();
+  return string_money_format(format, value);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -424,7 +426,8 @@ String StringUtil::Translate(const String& input, const String& from,
   memcpy(ret, input.data(), len);
   auto trlen = std::min(from.size(), to.size());
   string_translate(ret, len, from.data(), to.data(), trlen);
-  return retstr.setSize(len);
+  retstr.setSize(len);
+  return retstr;
 }
 
 String StringUtil::ROT13(const String& input) {
@@ -438,17 +441,28 @@ int64_t StringUtil::CRC32(const String& input) {
 }
 
 String StringUtil::Crypt(const String& input, const char *salt /* = "" */) {
+  if (salt && salt[0] == '\0') {
+    raise_notice("crypt(): No salt parameter was specified."
+      " You must use a randomly generated salt and a strong"
+      " hash function to produce a secure hash.");
+  }
   return String(string_crypt(input.c_str(), salt), AttachString);
 }
 
-String StringUtil::MD5(const String& input, bool raw /* = false */) {
-  Md5Digest md5(input.data(), input.size());
+String StringUtil::MD5(const char *data, uint32_t size,
+                       bool raw /* = false */) {
+  Md5Digest md5(data, size);
   auto const rawLen = sizeof(md5.digest);
   if (raw) return String((char*)md5.digest, rawLen, CopyString);
   auto const hexLen = rawLen * 2;
   String hex(hexLen, ReserveString);
   string_bin2hex((char*)md5.digest, rawLen, hex.bufferSlice().ptr);
-  return hex.setSize(hexLen);
+  hex.setSize(hexLen);
+  return hex;
+}
+
+String StringUtil::MD5(const String& input, bool raw /* = false */) {
+  return MD5(input.data(), input.length(), raw);
 }
 
 String StringUtil::SHA1(const String& input, bool raw /* = false */) {

@@ -18,11 +18,12 @@
 #include "hphp/runtime/ext/asio/gen_array_wait_handle.h"
 
 #include "hphp/runtime/ext/ext_closure.h"
+#include "hphp/runtime/ext/asio/asio_blockable.h"
 #include "hphp/runtime/ext/asio/asio_context.h"
 #include "hphp/runtime/ext/asio/asio_session.h"
-#include <hphp/runtime/ext/asio/static_exception_wait_handle.h>
-#include <hphp/runtime/ext/asio/static_result_wait_handle.h>
+#include <hphp/runtime/ext/asio/static_wait_handle.h>
 #include "hphp/system/systemlib.h"
+#include "hphp/runtime/base/smart-ptr.h"
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
 
@@ -42,24 +43,11 @@ namespace {
   }
 }
 
-void c_GenArrayWaitHandle::t___construct() {
-  Object e(SystemLib::AllocInvalidOperationExceptionObject(
-        "Use GenArrayWaitHandle::create() instead of constructor"));
-  throw e;
-}
-
 void c_GenArrayWaitHandle::ti_setoncreatecallback(const Variant& callback) {
-  if (!callback.isNull() &&
-      (!callback.isObject() ||
-       !callback.getObjectData()->instanceof(c_Closure::classof()))) {
-    Object e(SystemLib::AllocInvalidArgumentExceptionObject(
-      "Unable to set GenArrayWaitHandle::onCreate: on_create_cb not a closure"));
-    throw e;
-  }
-  AsioSession::Get()->setOnGenArrayCreateCallback(callback.getObjectDataOrNull());
+  AsioSession::Get()->setOnGenArrayCreateCallback(callback);
 }
 
-NEVER_INLINE __attribute__((noreturn))
+NEVER_INLINE __attribute__((__noreturn__))
 static void fail() {
   Object e(SystemLib::AllocInvalidArgumentExceptionObject(
     "Expected dependencies to be an array of WaitHandle instances"));
@@ -68,15 +56,20 @@ static void fail() {
 
 Object c_GenArrayWaitHandle::ti_create(const Array& inputDependencies) {
   Array depCopy(inputDependencies->copy());
-  if (UNLIKELY(depCopy->kind() > ArrayData::kMixedKind)) {
-    // The only array kind that can return a non-kPackedKind or
-    // non-kMixedKind from ->copy() is NameValueTableWrapper, which
-    // returns itself.  This is only for $GLOBALS, which is about to
-    // throw anyway since it will fail the WaitHandle checks below.
+  if (UNLIKELY(depCopy->kind() > ArrayData::kEmptyKind)) {
+    // The only array kind that can return a non-k{Packed,Mixed,Empty}Kind
+    // from ->copy() is GlobalsArray, which returns itself.
+    // This is only for $GLOBALS, which is about to throw anyway since it
+    // will fail the WaitHandle checks below.
     fail();
   }
-  assert(depCopy->kind() == ArrayData::kPackedKind ||
-         depCopy->kind() == ArrayData::kMixedKind);
+  assert(depCopy->isPacked() || depCopy->isMixed() || depCopy->isStruct() ||
+         depCopy->kind() == ArrayData::kEmptyKind);
+
+  if (depCopy->kind() == ArrayData::kEmptyKind) {
+    auto const empty = make_tv<KindOfArray>(depCopy.detach());
+    return Object::attach(c_StaticWaitHandle::CreateSucceeded(empty));
+  }
 
   Object exception;
 
@@ -119,7 +112,7 @@ Object c_GenArrayWaitHandle::ti_create(const Array& inputDependencies) {
 
     assert(child->instanceof(c_WaitableWaitHandle::classof()));
     auto const child_wh = static_cast<c_WaitableWaitHandle*>(child);
-    p_GenArrayWaitHandle my_wh = NEWOBJ(c_GenArrayWaitHandle)();
+    auto my_wh = makeSmartPtr<c_GenArrayWaitHandle>();
     my_wh->initialize(exception, depCopy, current_pos, child_wh);
 
     auto const session = AsioSession::Get();
@@ -127,21 +120,22 @@ Object c_GenArrayWaitHandle::ti_create(const Array& inputDependencies) {
       session->onGenArrayCreate(my_wh.get(), inputDependencies);
     }
 
-    return my_wh;
+    return Object(std::move(my_wh));
   }
 
   // Down here, everything was finished.  If there's an exception,
   // that's all we give back.  Otherwise give back the array of
   // results.
   if (exception.isNull()) {
-    return c_StaticResultWaitHandle::Create(
-      make_tv<KindOfArray>(depCopy.get()));
+    return Object::attach(c_StaticWaitHandle::CreateSucceeded(
+      make_tv<KindOfArray>(depCopy.detach())));
   } else {
-    return c_StaticExceptionWaitHandle::Create(exception.get());
+    return Object::attach(c_StaticWaitHandle::CreateFailed(exception.detach()));
   }
 }
 
 void c_GenArrayWaitHandle::initialize(const Object& exception, const Array& deps, ssize_t iter_pos, c_WaitableWaitHandle* child) {
+  setState(STATE_BLOCKED);
   m_exception = exception;
   m_deps = deps;
   m_iterPos = iter_pos;
@@ -152,15 +146,18 @@ void c_GenArrayWaitHandle::initialize(const Object& exception, const Array& deps
     } catch (const Object& cycle_exception) {
       putException(m_exception, cycle_exception.get());
       m_iterPos = m_deps->iter_advance(m_iterPos);
+      incRefCount();
       onUnblocked();
       return;
     }
   }
 
   blockOn(child);
+  incRefCount();
 }
 
 void c_GenArrayWaitHandle::onUnblocked() {
+  assert(getState() == STATE_BLOCKED);
   MixedArray::ValIter arrIter(m_deps.get(), m_iterPos);
 
   for (; !arrIter.empty(); arrIter.advance()) {
@@ -196,14 +193,19 @@ void c_GenArrayWaitHandle::onUnblocked() {
 
   m_iterPos = arrIter.currentPos();
 
+  auto parentChain = getParentChain();
   if (m_exception.isNull()) {
-    setResult(make_tv<KindOfArray>(m_deps.get()));
-    m_deps = nullptr;
+    setState(STATE_SUCCEEDED);
+    cellDup(make_tv<KindOfArray>(m_deps.get()), m_resultOrException);
   } else {
-    setException(m_exception.get());
+    setState(STATE_FAILED);
+    tvWriteObject(m_exception.get(), &m_resultOrException);
     m_exception = nullptr;
-    m_deps = nullptr;
   }
+
+  m_deps = nullptr;
+  parentChain.unblock();
+  decRefObj(this);
 }
 
 String c_GenArrayWaitHandle::getName() {
@@ -221,7 +223,7 @@ void c_GenArrayWaitHandle::enterContextImpl(context_idx_t ctx_idx) {
 
   // recursively import current child
   {
-    assert(m_iterPos != ArrayData::invalid_index);
+    assert(m_iterPos != m_deps->iter_end());
     auto const current = tvAssertCell(
       m_deps->getValueRef(m_iterPos).asTypedValue());
 
@@ -236,8 +238,9 @@ void c_GenArrayWaitHandle::enterContextImpl(context_idx_t ctx_idx) {
 
   // try to import other children
   try {
-    for (ssize_t iter_pos = m_deps->iter_advance(m_iterPos);
-         iter_pos != ArrayData::invalid_index;
+    auto iter_limit = m_deps->iter_end();
+    for (size_t iter_pos = m_deps->iter_advance(m_iterPos);
+         iter_pos != iter_limit;
          iter_pos = m_deps->iter_advance(iter_pos)) {
 
       auto const current = tvAssertCell(

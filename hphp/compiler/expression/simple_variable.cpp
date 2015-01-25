@@ -85,6 +85,7 @@ void SimpleVariable::updateSymbol(SimpleVariablePtr src) {
 bool SimpleVariable::couldBeAliased() const {
   if (m_globals || m_superGlobal) return true;
   if (m_name == "http_response_header") return true;
+  if (m_name == "php_errormsg") return true;
   always_assert(m_sym);
   if (m_sym->isGlobal() || m_sym->isStatic()) return true;
   if (getScope()->inPseudoMain() && !m_sym->isHidden()) return true;
@@ -136,7 +137,7 @@ void SimpleVariable::analyzeProgram(AnalysisResultPtr ar) {
     m_sym = variables->addDeclaredSymbol(m_name, shared_from_this());
   }
 
-  if (m_name == "http_response_header") {
+  if (m_name == "http_response_header" || m_name == "php_errormsg") {
     setInited();
   }
 
@@ -170,8 +171,8 @@ void SimpleVariable::analyzeProgram(AnalysisResultPtr ar) {
       if (!m_sym->isSystem() &&
           !(getContext() &
             (LValue|RefValue|RefParameter|UnsetContext|ExistContext)) &&
-          m_sym->getDeclaration().get() == this) {
-        assert(!m_sym->isParameter());
+          m_sym->getDeclaration().get() == this &&
+          !m_sym->isParameter()) {
 
         if (!variables->getAttribute(VariableTable::ContainsLDynamicVariable) &&
             !getScope()->is(BlockScope::ClassScope)) {
@@ -200,116 +201,9 @@ bool SimpleVariable::canonCompare(ExpressionPtr e) const {
     getName() == static_cast<SimpleVariable*>(e.get())->getName();
 }
 
-TypePtr SimpleVariable::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                   bool coerce) {
-  assert(false);
-  return TypePtr();
-}
-
 bool SimpleVariable::checkUnused() const {
   return !m_superGlobal && !m_globals &&
     getScope()->getVariables()->checkUnused(m_sym);
-}
-
-static inline TypePtr GetAssertedInType(AnalysisResultPtr ar,
-                                        TypePtr assertedType,
-                                        TypePtr ret) {
-  assert(assertedType);
-  if (!ret) return assertedType;
-  TypePtr res = Type::Inferred(ar, ret, assertedType);
-  // if the asserted type and the symbol table type are compatible, then use
-  // the result of Inferred() (which is at least as strict as assertedType).
-  // otherwise, go with the asserted type
-  return res ? res : assertedType;
-}
-
-TypePtr SimpleVariable::inferAndCheck(AnalysisResultPtr ar, TypePtr type,
-                                      bool coerce) {
-  IMPLEMENT_INFER_AND_CHECK_ASSERT(getScope());
-
-  resetTypes();
-  TypePtr ret;
-  ConstructPtr construct = shared_from_this();
-  BlockScopePtr scope = getScope();
-  VariableTablePtr variables = scope->getVariables();
-
-  // check function parameter that can occur in lval context
-  if (m_sym && m_sym->isParameter() &&
-      m_context & (LValue | RefValue | DeepReference |
-                   UnsetContext | InvokeArgument | OprLValue | DeepOprLValue)) {
-    m_sym->setLvalParam();
-  }
-
-  if (coerce && m_sym && type && type->is(Type::KindOfAutoSequence)) {
-    TypePtr t = m_sym->getType();
-    if (!t || t->is(Type::KindOfVoid) ||
-        t->is(Type::KindOfSome) || t->is(Type::KindOfArray)) {
-      type = Type::Array;
-    }
-  }
-
-  if (m_this) {
-    ret = Type::Object;
-    ClassScopePtr cls = getOriginalClass();
-    if (cls && (hasContext(ObjectContext) || !cls->derivedByDynamic())) {
-      ret = Type::CreateObjectType(cls->getName());
-    }
-    if (!hasContext(ObjectContext) &&
-        variables->getAttribute(VariableTable::ContainsDynamicVariable)) {
-      if (variables->getAttribute(VariableTable::ContainsLDynamicVariable)) {
-        ret = Type::Variant;
-      }
-      ret = variables->add(m_sym, ret, true, ar,
-                           construct, scope->getModifiers());
-    }
-  } else if ((m_context & (LValue|Declaration)) &&
-             !(m_context & (ObjectContext|RefValue))) {
-    if (m_globals) {
-      ret = Type::Array;
-    } else if (m_superGlobal) {
-      ret = m_superGlobalType;
-    } else if (m_superGlobalType) { // For system
-      ret = variables->add(m_sym, m_superGlobalType,
-                           ((m_context & Declaration) != Declaration), ar,
-                           construct, scope->getModifiers());
-    } else {
-      ret = variables->add(m_sym, type,
-                           ((m_context & Declaration) != Declaration), ar,
-                           construct, scope->getModifiers());
-    }
-  } else {
-    if (m_superGlobalType) {
-      ret = m_superGlobalType;
-    } else if (m_globals) {
-      ret = Type::Array;
-    } else if (scope->is(BlockScope::ClassScope)) {
-      assert(getClassScope().get() == scope.get());
-      // ClassVariable expression will come to this block of code
-      ret = getClassScope()->checkProperty(getScope(), m_sym, type, true, ar);
-    } else {
-      TypePtr tmpType = type;
-      if (m_context & RefValue) {
-        tmpType = Type::Variant;
-        coerce = true;
-      }
-      ret = variables->checkVariable(m_sym, tmpType, coerce, ar, construct);
-      if (ret && (ret->is(Type::KindOfSome) || ret->is(Type::KindOfAny))) {
-        ret = Type::Variant;
-      }
-    }
-  }
-
-  // if m_assertedType is set, then this is a type assertion node
-  TypePtr inType = m_assertedType ?
-    GetAssertedInType(ar, m_assertedType, ret) : ret;
-  TypePtr actual = propagateTypes(ar, inType);
-  setTypes(ar, actual, type);
-  if (Type::SameType(actual, ret)) {
-    m_implementedType.reset();
-  } else {
-    m_implementedType = ret;
-  }
-  return actual;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

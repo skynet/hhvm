@@ -28,6 +28,8 @@ namespace HPHP {
 
 class ArrayInit;
 struct MemoryProfile;
+class Shape;
+struct StructArray;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -57,12 +59,12 @@ public:
      * read or write the _count field! */
     union {
       int64_t ikey;
-      StringData* key;
+      StringData* skey;
     };
     // We store values here, but also some information local to this array:
     // data.m_aux.u_hash contains either 0 (for an int key) or a string
     // hashcode; the high bit is the int/string key descriminator.
-    // data.m_type == KindOfInvalid if this is an empty slot in the
+    // data.m_type == kInvalidDataType if this is an empty slot in the
     // array (e.g. after a key is deleted).
     TypedValueAux data;
 
@@ -78,14 +80,18 @@ public:
       return data.hash();
     }
 
+    int32_t probe() const {
+      return hasIntKey() ? ikey : hash();
+    }
+
     void setStaticKey(StringData* k, strhash_t h) {
       assert(k->isStatic());
-      key = k;
+      skey = k;
       data.hash() = h | STRHASH_MSB;
     }
 
     void setStrKey(StringData* k, strhash_t h) {
-      key = k;
+      skey = k;
       data.hash() = h | STRHASH_MSB;
       k->incRefCount();
     }
@@ -111,6 +117,9 @@ public:
    * The returned array is already incref'd.
    */
   static ArrayData* MakeReserve(uint32_t capacity);
+  static ArrayData* MakeReserveSlow(uint32_t capacity);
+  static ArrayData* MakeReserveVArray(uint32_t capacity);
+  static ArrayData* MakeReserveVArraySlow(uint32_t capacity);
 
   /*
    * Allocate a new, empty, request-local array in mixed mode, with
@@ -119,6 +128,15 @@ public:
    * The returned array is already incref'd.
    */
   static ArrayData* MakeReserveMixed(uint32_t capacity);
+
+  /*
+   * Allocate a new, empty, request-local array with the same mode as
+   * `other' and with enough space reserved for `capacity' members, or
+   * if `capacity' is zero, with the same capacity as `other'.
+   *
+   * The returned array is already incref'd.
+   */
+  static ArrayData* MakeReserveLike(const ArrayData* other, uint32_t capacity);
 
   /*
    * Allocate a packed MixedArray.  This is an array in packed
@@ -132,6 +150,17 @@ public:
    * Pre: size > 0
    */
   static ArrayData* MakePacked(uint32_t size, const TypedValue* values);
+  static ArrayData* MakePackedHelper(uint32_t size, const TypedValue* values);
+  static ArrayData* MakePackedUninitialized(uint32_t size);
+
+  /*
+   * Allocate a new, empty, request-local array in int map/string map mode, with
+   * enough space reserved for `capacity' members.
+   *
+   * The returned array is already incref'd.
+   */
+  static ArrayData* MakeReserveIntMap(uint32_t capacity);
+  static ArrayData* MakeReserveStrMap(uint32_t capacity);
 
   /*
    * Like MakePacked, but given static strings, make a struct-like array.
@@ -139,6 +168,8 @@ public:
    */
   static MixedArray* MakeStruct(uint32_t size, StringData** keys,
                                const TypedValue* values);
+  static StructArray* MakeStructArray(uint32_t size, const TypedValue* values,
+                                      Shape*);
 
   /*
    * Allocate an uncounted MixedArray and copy the values from the
@@ -150,6 +181,7 @@ public:
    */
   static ArrayData* MakeUncounted(ArrayData* array);
   static ArrayData* MakeUncountedPacked(ArrayData* array);
+  static ArrayData* MakeUncountedPackedHelper(ArrayData* array);
 
   // This behaves the same as iter_begin except that it assumes
   // this array is not empty and its not virtual.
@@ -193,14 +225,18 @@ private:
   using ArrayData::nvGet;
   using ArrayData::release;
 public:
+  static Variant CreateVarForUncountedArray(const Variant& source);
+  static void ReleaseUncountedTypedValue(TypedValue& tv);
 
   static size_t Vsize(const ArrayData*);
   static const Variant& GetValueRef(const ArrayData*, ssize_t pos);
   static bool IsVectorData(const ArrayData*);
   static const TypedValue* NvGetInt(const ArrayData*, int64_t ki);
+  static const TypedValue* NvGetIntConverted(const ArrayData*, int64_t ki);
   static const TypedValue* NvGetStr(const ArrayData*, const StringData* k);
   static void NvGetKey(const ArrayData*, TypedValue* out, ssize_t pos);
   static ssize_t IterBegin(const ArrayData*);
+  static ssize_t IterLast(const ArrayData*);
   static ssize_t IterEnd(const ArrayData*);
   static ssize_t IterAdvance(const ArrayData*, ssize_t pos);
   static ssize_t IterRewind(const ArrayData*, ssize_t pos);
@@ -211,17 +247,18 @@ public:
   static ArrayData* LvalStr(ArrayData* ad, StringData* k, Variant*& ret,
                             bool copy);
   static ArrayData* LvalNew(ArrayData*, Variant*& ret, bool copy);
-  static ArrayData* SetInt(ArrayData*, int64_t k, const Variant& v, bool copy);
-  static ArrayData* SetStr(ArrayData*, StringData* k, const Variant& v, bool copy);
-
+  static ArrayData* SetInt(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* SetIntConverted(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* SetStr(ArrayData*, StringData* k, Cell v, bool copy);
+  // TODO(t4466630) Do we want to raise warnings in zend compatibility mode?
   static ArrayData* ZSetInt(ArrayData*, int64_t k, RefData* v);
   static ArrayData* ZSetStr(ArrayData*, StringData* k, RefData* v);
-  static ArrayData* ZAppend(ArrayData* ad, RefData* v);
+  static ArrayData* ZAppend(ArrayData* ad, RefData* v, int64_t* key_ptr);
   static ArrayData* SetRefInt(ArrayData* ad, int64_t k, Variant& v, bool copy);
   static ArrayData* SetRefStr(ArrayData* ad, StringData* k, Variant& v,
                               bool copy);
-  static ArrayData* AddInt(ArrayData*, int64_t k, const Variant& v, bool copy);
-  static ArrayData* AddStr(ArrayData*, StringData* k, const Variant& v, bool copy);
+  static ArrayData* AddInt(ArrayData*, int64_t k, Cell v, bool copy);
+  static ArrayData* AddStr(ArrayData*, StringData* k, Cell v, bool copy);
   static ArrayData* RemoveInt(ArrayData*, int64_t k, bool copy);
   static ArrayData* RemoveStr(ArrayData*, const StringData* k, bool copy);
   static ArrayData* Copy(const ArrayData*);
@@ -242,14 +279,9 @@ public:
   static void ReleaseUncountedPacked(ArrayData*);
   static constexpr auto ValidMArrayIter = &ArrayCommon::ValidMArrayIter;
   static bool AdvanceMArrayIter(ArrayData*, MArrayIter& fp);
-  static constexpr auto Escalate =
-    reinterpret_cast<ArrayData* (*)(const ArrayData*)>(
-      ArrayCommon::ReturnFirstArg
-    );
-  static constexpr auto GetAPCHandle =
-    reinterpret_cast<APCHandle* (*)(const ArrayData*)>(
-      ArrayCommon::ReturnNull
-    );
+  static ArrayData* Escalate(const ArrayData* ad) {
+    return const_cast<ArrayData*>(ad);
+  }
 
   static ArrayData* EscalateForSort(ArrayData* ad);
   static void Ksort(ArrayData*, int sort_flags, bool ascending);
@@ -258,27 +290,67 @@ public:
   static bool Uksort(ArrayData*, const Variant& cmp_function);
   static bool Usort(ArrayData*, const Variant& cmp_function);
   static bool Uasort(ArrayData*, const Variant& cmp_function);
+  static void WarnAndSort(ArrayData*, int sort_flags, bool ascending);
+  static bool WarnAndUsort(ArrayData*, const Variant& cmp_function);
+
+
+  template <ArrayKind aKind>
+  static const TypedValue* NvGetStrImpl(const ArrayData*, const StringData* k);
+  template <ArrayKind aKind>
+  static const TypedValue* NvGetIntImpl(const ArrayData*, int64_t ki);
+  template <ArrayKind aKind>
+  static bool ExistsIntImpl(const ArrayData*, int64_t k);
+  template <ArrayKind aKind>
+  static bool ExistsStrImpl(const ArrayData*, const StringData* k);
+  template <ArrayKind aKind>
+  static ArrayData* LvalIntImpl(ArrayData* ad, int64_t k, Variant*& ret,
+                                bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* LvalStrImpl(ArrayData* ad, StringData* k, Variant*& ret,
+                                bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* LvalNewImpl(ArrayData*, Variant*& ret, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* SetStrImpl(ArrayData*, StringData* k, Cell v, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* SetIntImpl(ArrayData*, int64_t k, Cell v, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* SetRefIntImpl(ArrayData* ad, int64_t k, Variant& v,
+                                  bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* SetRefStrImpl(ArrayData* ad, StringData* k, Variant& v,
+                              bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* AddStrImpl(ArrayData*, StringData* k, Cell v, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* RemoveIntImpl(ArrayData*, int64_t k, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* RemoveStrImpl(ArrayData*, const StringData* k, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* AppendImpl(ArrayData*, const Variant& v, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* AppendRefImpl(ArrayData*, Variant& v, bool copy);
+  template <ArrayKind aKind>
+  static ArrayData* AppendWithRefImpl(ArrayData*, const Variant& v, bool copy);
+  template <ArrayData::ArrayKind aKind>
+  static ArrayData* PopImpl(ArrayData* ad, Variant& value);
+  template <ArrayData::ArrayKind aKind>
+  static ArrayData* DequeueImpl(ArrayData* adInput, Variant& value);
+
+  template <ArrayKind aKind>
+  static bool AdvanceMArrayIterImpl(ArrayData*, MArrayIter& fp);
 
 private:
   MixedArray* copyMixed() const;
   MixedArray* copyMixedAndResizeIfNeeded() const;
   MixedArray* copyMixedAndResizeIfNeededSlow() const;
+
 public:
-
-  /**
-   * Main helper for AddNewElemC.  The semantics are slightly different from
-   * other helpers, but tuned for the opcode.  The value to set is passed by
-   * value; the caller has incref'd it if necessary, and this call *moves* it
-   * to its location in the array (caller must not decref).  If the value cannot
-   * be stored in the array, this helper decref's it.
-   */
-  static ArrayData* AddNewElemC(ArrayData* a, TypedValue value);
-
-  // Elm's data.m_type == KindOfInvalid for deleted slots.
+  // Elm's data.m_type == kInvalidDataType for deleted slots.
   static bool isTombstone(DataType t) {
-    assert(IS_REAL_TYPE(t) || t == KindOfInvalid);
+    assert(IS_REAL_TYPE(t) || t == kInvalidDataType);
     return t < KindOfUninit;
-    static_assert(KindOfUninit == 0 && KindOfInvalid < 0, "");
+    static_assert(KindOfUninit == 0 && kInvalidDataType < 0, "");
   }
 
   // Element index, with special values < 0 used for hash tables.
@@ -286,7 +358,7 @@ public:
   // 32-bit ints than it does for 64-bit ints. As such, we have deliberately
   // chosen to use ssize_t in some places where ideally we *should* have used
   // int32_t.
-  static const int32_t Empty      = -1; // == ArrayData::invalid_index
+  static const int32_t Empty      = -1;
   static const int32_t Tombstone  = -2;
 
   // Use a minimum of an 4-element hash table.  Valid range: [2..32]
@@ -294,6 +366,11 @@ public:
   static const uint32_t SmallHashSize = 1 << MinLgTableSize;
   static const uint32_t SmallMask = SmallHashSize - 1;
   static const uint32_t SmallSize = SmallHashSize - SmallHashSize / LoadScale;
+
+  static const uint32_t MaxLgTableSize = 32;
+  static const uint64_t MaxHashSize = uint64_t(1) << 32;
+  static const uint32_t MaxMask = MaxHashSize - 1;
+  static const uint32_t MaxSize = MaxMask - MaxMask / LoadScale;
   static const uint32_t MaxMakeSize = 4 * SmallSize;
 
   uint32_t iterLimit() const { return m_used; }
@@ -310,22 +387,60 @@ public:
   bool isTombstone(ssize_t pos) const;
 
   size_t hashSize() const;
+  size_t heapSize() const;
   static size_t computeMaxElms(uint32_t tableMask);
   static size_t computeDataSize(uint32_t tableMask);
+  static size_t computeAllocBytesFromMaxElms(uint32_t maxElms);
 
 private:
   friend struct ArrayInit;
   friend struct MemoryProfile;
   friend struct EmptyArray;
   friend struct PackedArray;
+  friend struct StructArray;
+  friend class HashCollection;
+  friend class BaseMap;
+  friend class c_Map;
+  friend class c_ImmMap;
+  friend class BaseSet;
+  friend class c_Set;
+  friend class c_ImmSet;
+  friend class c_AwaitAllWaitHandle;
   enum class ClonePacked {};
   enum class CloneMixed {};
   enum SortFlavor { IntegerSort, StringSort, GenericSort };
+
+  friend size_t getMemSize(const ArrayData*);
 
 public:
   // Safe downcast helpers
   static MixedArray* asMixed(ArrayData* ad);
   static const MixedArray* asMixed(const ArrayData* ad);
+
+  enum class Reason : uint8_t {
+    kForeachByRef,
+    kPrepend,
+    kPop,
+    kSetRef,
+    kAppendRef,
+    kAppend,
+    kNvGetInt,
+    kNvGetStr,
+    kExistsInt,
+    kExistsStr,
+    kSetInt,
+    kSetStr,
+    kRemoveInt,
+    kRemoveStr,
+    kDequeue,
+    kSort,
+    kUsort,
+    kNumericString,
+    kArraySplice,
+    kShuffle,
+  };
+  static void downgradeAndWarn(ArrayData* ad, const Reason r);
+  static void warnUsage(const Reason r, const ArrayKind kind);
 
 private:
   static void getElmKey(const Elm& e, TypedValue* out);
@@ -335,8 +450,8 @@ private:
 
   template<class CopyKeyValue>
   static MixedArray* CopyMixed(const MixedArray& other,
-                              AllocMode,
-                              CopyKeyValue);
+                               AllocMode,
+                               CopyKeyValue);
   static MixedArray* CopyReserve(const MixedArray* src, size_t expectedSize);
 
   MixedArray() = delete;
@@ -366,8 +481,9 @@ private:
         return ei;
       }
     }
-    return invalid_index;
+    return m_used;
   }
+
   ssize_t prevElm(Elm* elms, ssize_t ei) const;
 
   // Assert a bunch of invariants about this array then return true.
@@ -404,26 +520,40 @@ private:
   /**
    * findForNewInsert() CANNOT be used unless the caller can guarantee that
    * the relevant key is not already present in the array. Otherwise this can
-   * put the array into a bad state; use with caution.
+   * put the array into a bad state; use with caution. The *CheckUnbalanced
+   * version checks for the array becoming too unbalanced because of hash
+   * collisions, and is only called when an array Grow()s.
    */
   int32_t* findForNewInsert(size_t h0) const;
   int32_t* findForNewInsert(int32_t* table, size_t mask, size_t h0) const;
+  int32_t* findForNewInsertCheckUnbalanced(int32_t* table,
+                                           size_t mask, size_t h0) const;
 
   bool nextInsert(const Variant& data);
   ArrayData* nextInsertRef(Variant& data);
   ArrayData* nextInsertWithRef(const Variant& data);
-  ArrayData* addVal(int64_t ki, const Variant& data);
-  ArrayData* addVal(StringData* key, const Variant& data);
+  ArrayData* addVal(int64_t ki, Cell data);
+  ArrayData* addVal(StringData* key, Cell data);
+  ArrayData* addValNoAsserts(StringData* key, Cell data);
+
+  Elm& addKeyAndGetElem(StringData* key);
 
   template <class K> ArrayData* addLvalImpl(K k, Variant*& ret);
-  template <class K> ArrayData* update(K k, const Variant& data);
+  template <class K> ArrayData* update(K k, Cell data);
   template <class K> ArrayData* updateRef(K k, Variant& data);
 
   template <class K> ArrayData* zSetImpl(K k, RefData* data);
-  ArrayData* zAppendImpl(RefData* data);
+  ArrayData* zAppendImpl(RefData* data, int64_t* key_ptr);
 
   void adjustMArrayIter(ssize_t pos);
-  void erase(ssize_t pos);
+  void eraseNoCompact(ssize_t pos);
+  void erase(ssize_t pos) {
+    eraseNoCompact(pos);
+    if (m_size < m_used / 2) {
+      // Compact in order to keep elms from being overly sparse.
+      compact(false);
+    }
+  }
 
   MixedArray* copyImpl(MixedArray* target) const;
 
@@ -435,9 +565,9 @@ private:
 
   Elm& allocElm(int32_t* ei);
 
-  MixedArray* setVal(TypedValue& tv, const Variant& v);
+  MixedArray* setVal(TypedValue& tv, Cell v);
   MixedArray* getLval(TypedValue& tv, Variant*& ret);
-  MixedArray* initVal(TypedValue& tv, const Variant& v);
+  MixedArray* initVal(TypedValue& tv, Cell v);
   MixedArray* initRef(TypedValue& tv, Variant& v);
   MixedArray* initLval(TypedValue& tv, Variant*& ret);
   MixedArray* initWithRef(TypedValue& tv, const Variant& v);
@@ -447,11 +577,19 @@ private:
   ArrayData* zSetVal(TypedValue& tv, RefData* v);
 
   /*
+   * Helper routine for inserting elements into a new array
+   * when Grow()ing the array, that also checks for potentially
+   * unbalanced entries because of hash collision.
+   */
+  static void InsertCheckUnbalanced(MixedArray* ad, int32_t* table,
+                                    uint32_t mask,
+                                    Elm* iter, Elm* stop);
+  /*
    * grow() increases the hash table size and the number of slots for
    * elements by a factor of 2. grow() rebuilds the hash table, but it
    * does not compact the elements.
    */
-  static MixedArray* Grow(MixedArray* old);
+  static MixedArray* Grow(MixedArray* old, uint32_t newCap, uint32_t newMask);
   static MixedArray* GrowPacked(MixedArray* old);
 
   /**
@@ -492,6 +630,7 @@ private:
   }
 
   bool isZombie() const { return m_used + 1 == 0; }
+  void setZombie() { m_used = -uint32_t{1}; }
 
 private:
   // Some of these are packed into qword-sized unions so we can
@@ -504,13 +643,8 @@ private:
     };
     uint64_t m_capAndUsed;
   };
-  union {
-    struct {
-      uint32_t m_tableMask; // Bitmask used when indexing into the hash table.
-      uint32_t m_hLoad;     // Hash table load (# of non-empty slots).
-    };
-    uint64_t m_maskAndLoad;
-  };
+  uint32_t m_tableMask;     // Bitmask used when indexing into the hash table.
+  UNUSED uint32_t m_unused2;
   int64_t  m_nextKI;        // Next integer key to use for append.
 };
 

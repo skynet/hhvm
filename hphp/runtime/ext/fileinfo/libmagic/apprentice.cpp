@@ -48,9 +48,9 @@ FILE_RCSID("@(#)$File: apprentice.c,v 1.191 2013/02/26 21:02:48 christos Exp $")
 #endif
 
 #ifdef PHP_WIN32
-#include "win32/unistd.h"
+#include "win32/unistd.h" // @nolint
 #if _MSC_VER <= 1300
-# include "win32/php_strtoi64.h"
+# include "win32/php_strtoi64.h" // @nolint
 #endif
 #define strtoull _strtoui64
 #else
@@ -941,13 +941,12 @@ load_1(struct magic_set *ms, int action, const char *fn, int *errs,
   size_t lineno = 0;
   struct magic_entry me;
 
-  php_stream *stream;
-
   ms->file = fn;
   auto wrapper = HPHP::Stream::getWrapperFromURI(fn);
-  stream = wrapper->open(fn, "rb", 0, HPHP::Variant());
+  auto file = wrapper ? wrapper->open(fn, "rb", 0, HPHP::Variant())
+                      : HPHP::SmartPtr<HPHP::File>();
 
-  if (stream == NULL) {
+  if (!file) {
     if (errno != ENOENT)
       file_error(ms, errno, "cannot read magic file `%s'",
            fn);
@@ -958,7 +957,7 @@ load_1(struct magic_set *ms, int action, const char *fn, int *errs,
   memset(&me, 0, sizeof(me));
   /* read and parse this file */
   HPHP::String strline;
-  for (ms->line = 1; (strline = stream->readLine()); ms->line++) {
+  for (ms->line = 1; (strline = file->readLine()); ms->line++) {
     line = strline.data();
     len = strline.size();
     if (len == 0) /* null line, garbage, etc */
@@ -1020,7 +1019,6 @@ load_1(struct magic_set *ms, int action, const char *fn, int *errs,
   }
   if (me.mp)
     (void)addentry(ms, &me, mentry, mentrycount);
-  stream->close();
 }
 
 /*
@@ -1136,7 +1134,7 @@ apprentice_load(struct magic_set *ms, const char *fn, int action)
   char **filearr = NULL;
   struct stat st;
   struct magic_map *map;
-  HPHP::Directory *dir;
+  HPHP::SmartPtr<HPHP::Directory> dir;
 
   ms->flags |= MAGIC_CHECK;  /* Enable checks for parsed files */
 
@@ -1163,13 +1161,16 @@ apprentice_load(struct magic_set *ms, const char *fn, int action)
   /* FIXME: Read file names and sort them to prevent
      non-determinism. See Debian bug #488562. */
   auto w = HPHP::Stream::getWrapperFromURI(fn);
+  if (!w) {
+    errs++;
+    goto out;
+  }
   if (w->stat(fn, &st) == 0 && S_ISDIR(st.st_mode)) {
     int mflen;
     char mfn[MAXPATHLEN];
 
     HPHP::Stream::Wrapper* w = HPHP::Stream::getWrapperFromURI(fn);
-    dir = w->opendir(fn);
-    if (!dir) {
+    if (!w || !(dir = w->opendir(fn))) {
       errs++;
       goto out;
     }
@@ -1184,7 +1185,6 @@ apprentice_load(struct magic_set *ms, const char *fn, int action)
         file_oomem(ms,
         strlen(fn) + s.size() + 2);
         errs++;
-        dir->close();
         goto out;
       }
       if (stat(mfn, &st) == -1 || !S_ISREG(st.st_mode)) {
@@ -1197,7 +1197,6 @@ apprentice_load(struct magic_set *ms, const char *fn, int action)
         if ((filearr = CAST(char **,
             erealloc(filearr, mlen))) == NULL) {
           file_oomem(ms, mlen);
-          dir->close();
           errs++;
           goto out;
         }
@@ -1208,7 +1207,6 @@ apprentice_load(struct magic_set *ms, const char *fn, int action)
       tmp[tmplen] = '\0';
       filearr[files++] = tmp;
     }
-    dir->close();
     qsort(filearr, files, sizeof(*filearr), cmpstrp);
     for (i = 0; i < files; i++) {
       load_1(ms, action, filearr[i], &errs, mentry,
@@ -1818,7 +1816,7 @@ parse(struct magic_set *ms, struct magic_entry *me, const char *line,
           m->str_flags |= STRING_TEXTTEST;
           break;
         case CHAR_TRIM:
-          m->str_flags |= STRING_TRIM;
+          m->str_flags |= HHVM_FN(trim);
           break;
         case CHAR_PSTRING_1_LE:
           if (m->type != FILE_PSTRING)
@@ -2605,8 +2603,8 @@ apprentice_map(struct magic_set *ms, const char *fn)
   char *dbname = NULL;
   struct magic_map *map;
   size_t i;
-  php_stream *stream = NULL;
   HPHP::Stream::Wrapper* wrapper;
+  HPHP::SmartPtr<HPHP::File> file;
   struct stat sb;
 
   if ((map = CAST(struct magic_map *, ecalloc(1, sizeof(*map)))) == NULL) {
@@ -2625,9 +2623,12 @@ apprentice_map(struct magic_set *ms, const char *fn)
     goto error;
 
   wrapper = HPHP::Stream::getWrapperFromURI(fn);
-  stream = wrapper->open(fn, "rb", 0, HPHP::Variant());
+  if (!wrapper) {
+    goto error;
+  }
+  file = wrapper->open(fn, "rb", 0, HPHP::Variant());
 
-  if (!stream) {
+  if (!file) {
     goto error;
   }
 
@@ -2646,15 +2647,12 @@ apprentice_map(struct magic_set *ms, const char *fn)
     file_oomem(ms, map->len);
     goto error;
   }
-  if (stream->readImpl((char*)map->p, (size_t)sb.st_size) != (size_t)sb.st_size) {
+  if (file->readImpl((char*)map->p, (size_t)sb.st_size) != (size_t)sb.st_size) {
     file_badread(ms);
     goto error;
   }
   map->len = 0;
 #define RET  1
-
-  stream->close();
-  stream = NULL;
 
 internal_loaded:
   ptr = (uint32_t *)(void *)map->p;
@@ -2722,9 +2720,6 @@ internal_loaded:
   return map;
 
 error:
-  if (stream) {
-    stream->close();
-  }
   apprentice_unmap(map);
   if (dbname) {
     efree(dbname);
@@ -2749,8 +2744,8 @@ apprentice_compile(struct magic_set *ms, struct magic_map *map, const char *fn)
   char *dbname;
   int rv = -1;
   uint32_t i;
-  php_stream *stream;
   HPHP::Stream::Wrapper *wrapper;
+  HPHP::SmartPtr<HPHP::File> file;
 
   dbname = mkdbname(ms, fn, 0);
 
@@ -2759,9 +2754,9 @@ apprentice_compile(struct magic_set *ms, struct magic_map *map, const char *fn)
 
 /* wb+ == O_WRONLY|O_CREAT|O_TRUNC|O_BINARY */
   wrapper = HPHP::Stream::getWrapperFromURI(fn);
-  stream = wrapper->open(fn, "wb+", 0, HPHP::Variant());
+  if (wrapper) file = wrapper->open(fn, "wb+", 0, HPHP::Variant());
 
-  if (!stream) {
+  if (!file) {
     file_error(ms, errno, "cannot open `%s'", dbname);
     goto out;
   }
@@ -2771,28 +2766,24 @@ apprentice_compile(struct magic_set *ms, struct magic_map *map, const char *fn)
     goto out;
   }
 
-  if (stream->writeImpl((const char *)map->nmagic, nm) != (ssize_t)nm) {
+  if (file->writeImpl((const char *)map->nmagic, nm) != (ssize_t)nm) {
     file_error(ms, errno, "error writing `%s'", dbname);
     goto out;
   }
 
   assert(nm + sizeof(ar) < m);
 
-  if (!stream->seek((off_t)sizeof(struct magic), SEEK_SET)) {
+  if (!file->seek((off_t)sizeof(struct magic), SEEK_SET)) {
     file_error(ms, errno, "error seeking `%s'", dbname);
     goto out;
   }
 
   for (i = 0; i < MAGIC_SETS; i++) {
     len = m * map->nmagic[i];
-    if (stream->writeImpl((const char *)map->magic[i], len) != (ssize_t)len) {
+    if (file->writeImpl((const char *)map->magic[i], len) != (ssize_t)len) {
       file_error(ms, errno, "error writing `%s'", dbname);
       goto out;
     }
-  }
-
-  if (stream) {
-    stream->close();
   }
 
   rv = 0;

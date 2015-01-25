@@ -19,12 +19,12 @@
 #define incl_HPHP_EXT_ZLIB_H_
 
 #include "hphp/runtime/base/base-includes.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 
 namespace HPHP {
 
-extern const long k_FORCE_GZIP;
-extern const long k_FORCE_DEFLATE;
+extern const int64_t k_FORCE_GZIP;
+extern const int64_t k_FORCE_DEFLATE;
 
 ///////////////////////////////////////////////////////////////////////////////
 // zlib functions
@@ -33,6 +33,11 @@ Variant HHVM_FUNCTION(readgzfile, const String& filename,
                                   int64_t use_include_path = 0);
 Variant HHVM_FUNCTION(gzfile, const String& filename,
                               int64_t use_include_path = 0);
+Variant HHVM_FUNCTION(zlib_encode, const String& data,
+                                   int64_t encoding,
+                                   int64_t level = -1);
+Variant HHVM_FUNCTION(zlib_decode, const String& data,
+                                   int64_t maxlen);
 Variant HHVM_FUNCTION(gzcompress, const String& data,
                                   int64_t level = -1);
 Variant HHVM_FUNCTION(gzuncompress, const String& data,
@@ -48,14 +53,15 @@ Variant HHVM_FUNCTION(qlzcompress, const String& data, int level = 1);
 Variant HHVM_FUNCTION(qlzuncompress, const String& data, int level = 1);
 #endif
 #ifdef HAVE_SNAPPY
-Variant HHVM_FUNCTION(sncompress, const String& data);
-Variant HHVM_FUNCTION(snuncompress, const String& data);
+Variant HHVM_FUNCTION(snappy_compress, const String& data);
+Variant HHVM_FUNCTION(snappy_uncompress, const String& data);
 #endif
 Variant HHVM_FUNCTION(nzcompress, const String& uncompressed);
 Variant HHVM_FUNCTION(nzuncompress, const String& compressed);
-Variant HHVM_FUNCTION(lz4compress, const String& uncompressed);
-Variant HHVM_FUNCTION(lz4hccompress, const String& uncompressed);
-Variant HHVM_FUNCTION(lz4uncompress, const String& compressed);
+Variant HHVM_FUNCTION(lz4_compress, const String& uncompressed,
+                                    bool high = false);
+Variant HHVM_FUNCTION(lz4_hccompress, const String& uncompressed);
+Variant HHVM_FUNCTION(lz4_uncompress, const String& compressed);
 
 ///////////////////////////////////////////////////////////////////////////////
 // stream functions

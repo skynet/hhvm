@@ -18,6 +18,7 @@
 #ifndef incl_HPHP_EXT_IMAGE_H_
 #define incl_HPHP_EXT_IMAGE_H_
 
+
 #include "hphp/runtime/base/base-includes.h"
 #include "hphp/runtime/base/zend-php-config.h"
 #include "hphp/runtime/ext/gd/libgd/gd.h"
@@ -37,7 +38,6 @@ public:
   Image() : m_gdImage(nullptr) {}
   explicit Image(gdImagePtr gdImage) : m_gdImage(gdImage) {}
   ~Image();
-  void sweep() FOLLY_OVERRIDE;
   gdImagePtr get() { return m_gdImage;}
   void reset() { m_gdImage = nullptr;}
 
@@ -46,6 +46,7 @@ public:
   virtual const String& o_getClassNameHook() const { return classnameof(); }
   virtual bool isInvalid() const { return m_gdImage == nullptr; }
 
+  DECLARE_RESOURCE_ALLOCATION(Image)
 private:
   gdImagePtr m_gdImage;
 };
@@ -132,6 +133,9 @@ Variant HHVM_FUNCTION(imagecreatefromjpeg, const String& filename);
 #ifdef HAVE_GD_PNG
 Variant HHVM_FUNCTION(imagecreatefrompng, const String& filename);
 #endif
+#ifdef HAVE_LIBVPX
+Variant HHVM_FUNCTION(imagecreatefromwebp, const String& filename);
+#endif
 #ifdef HAVE_LIBGD15
 Variant HHVM_FUNCTION(imagecreatefromstring, const String& data);
 #endif
@@ -200,6 +204,10 @@ bool HHVM_FUNCTION(imagepng,  const Resource& image,
   const String& filename = null_string, int64_t quality = -1,
   int64_t filters = -1);
 #endif
+#ifdef HAVE_LIBVPX
+bool HHVM_FUNCTION(imagewebp,  const Resource& image,
+  const String& filename = null_string, int64_t quality = 80);
+#endif
 bool HHVM_FUNCTION(imagepolygon, const Resource& image,
   const Array& points, int64_t num_points, int64_t color);
 bool HHVM_FUNCTION(imagerectangle, const Resource& image,
@@ -245,7 +253,7 @@ bool HHVM_FUNCTION(png2wbmp,
   int64_t dest_width, int64_t threshold);
 Variant HHVM_FUNCTION(exif_imagetype, const String& filename);
 Variant HHVM_FUNCTION(exif_read_data,
-  const String& filename, const String& sections = empty_string,
+  const String& filename, const String& sections = empty_string_ref,
   bool arrays = false, bool thumbnail = false);
 Variant HHVM_FUNCTION(read_exif_data,
   const String& filename, const String& sections = null_string,
@@ -254,7 +262,8 @@ Variant HHVM_FUNCTION(exif_tagname, int64_t index);
 Variant HHVM_FUNCTION(exif_thumbnail,
   const String& filename, VRefParam width = uninit_null(),
   VRefParam height = uninit_null(), VRefParam imagetype = uninit_null());
-
+Variant HHVM_FUNCTION(imagepalettecopy,
+  const Resource& dest, const Resource& src);
 ///////////////////////////////////////////////////////////////////////////////
 }
 

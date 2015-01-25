@@ -17,12 +17,13 @@
 
 #include "hphp/runtime/ext/asio/gen_vector_wait_handle.h"
 
+#include "hphp/runtime/base/smart-ptr.h"
 #include "hphp/runtime/ext/ext_collections.h"
 #include "hphp/runtime/ext/ext_closure.h"
+#include "hphp/runtime/ext/asio/asio_blockable.h"
 #include "hphp/runtime/ext/asio/asio_context.h"
 #include "hphp/runtime/ext/asio/asio_session.h"
-#include <hphp/runtime/ext/asio/static_exception_wait_handle.h>
-#include <hphp/runtime/ext/asio/static_result_wait_handle.h>
+#include <hphp/runtime/ext/asio/static_wait_handle.h>
 #include "hphp/system/systemlib.h"
 
 namespace HPHP {
@@ -41,21 +42,8 @@ namespace {
   }
 }
 
-void c_GenVectorWaitHandle::t___construct() {
-  Object e(SystemLib::AllocInvalidOperationExceptionObject(
-        "Use GenVectorWaitHandle::create() instead of constructor"));
-  throw e;
-}
-
 void c_GenVectorWaitHandle::ti_setoncreatecallback(const Variant& callback) {
-  if (!callback.isNull() &&
-      (!callback.isObject() ||
-       !callback.getObjectData()->instanceof(c_Closure::classof()))) {
-    Object e(SystemLib::AllocInvalidArgumentExceptionObject(
-      "Unable to set GenVectorWaitHandle::onCreate: on_create_cb not a closure"));
-    throw e;
-  }
-  AsioSession::Get()->setOnGenVectorCreateCallback(callback.getObjectDataOrNull());
+  AsioSession::Get()->setOnGenVectorCreateCallback(callback);
 }
 
 Object c_GenVectorWaitHandle::ti_create(const Variant& dependencies) {
@@ -67,7 +55,8 @@ Object c_GenVectorWaitHandle::ti_create(const Variant& dependencies) {
     throw e;
   }
   assert(dependencies.getObjectData()->instanceof(c_Vector::classof()));
-  auto deps = p_Vector::attach(c_Vector::Clone(dependencies.getObjectData()));
+  auto deps = SmartPtr<c_Vector>::attach(
+    c_Vector::Clone(dependencies.getObjectData()));
   for (int64_t iter_pos = 0; iter_pos < deps->size(); ++iter_pos) {
     Cell* current = deps->at(iter_pos);
 
@@ -81,37 +70,40 @@ Object c_GenVectorWaitHandle::ti_create(const Variant& dependencies) {
   Object exception;
   for (int64_t iter_pos = 0; iter_pos < deps->size(); ++iter_pos) {
 
-    Cell* current = tvAssertCell(deps->at(iter_pos));
+    auto current = tvAssertCell(deps->at(iter_pos));
     assert(current->m_type == KindOfObject);
     assert(current->m_data.pobj->instanceof(c_WaitHandle::classof()));
     auto child = static_cast<c_WaitHandle*>(current->m_data.pobj);
 
     if (child->isSucceeded()) {
-      cellSet(child->getResult(), *current);
+      auto result = child->getResult();
+      deps->set(iter_pos, &result);
     } else if (child->isFailed()) {
       putException(exception, child->getException());
     } else {
       assert(child->instanceof(c_WaitableWaitHandle::classof()));
       auto child_wh = static_cast<c_WaitableWaitHandle*>(child);
 
-      p_GenVectorWaitHandle my_wh = NEWOBJ(c_GenVectorWaitHandle)();
+      auto my_wh = makeSmartPtr<c_GenVectorWaitHandle>();
       my_wh->initialize(exception, deps.get(), iter_pos, child_wh);
       AsioSession* session = AsioSession::Get();
       if (UNLIKELY(session->hasOnGenVectorCreateCallback())) {
         session->onGenVectorCreate(my_wh.get(), dependencies);
       }
-      return my_wh;
+      return Object(std::move(my_wh));
     }
   }
 
   if (exception.isNull()) {
-    return c_StaticResultWaitHandle::Create(make_tv<KindOfObject>(deps.get()));
+    return Object::attach(c_StaticWaitHandle::CreateSucceeded(
+      make_tv<KindOfObject>(deps.detach())));
   } else {
-    return c_StaticExceptionWaitHandle::Create(exception.get());
+    return Object::attach(c_StaticWaitHandle::CreateFailed(exception.detach()));
   }
 }
 
 void c_GenVectorWaitHandle::initialize(const Object& exception, c_Vector* deps, int64_t iter_pos, c_WaitableWaitHandle* child) {
+  setState(STATE_BLOCKED);
   m_exception = exception;
   m_deps = deps;
   m_iterPos = iter_pos;
@@ -122,15 +114,19 @@ void c_GenVectorWaitHandle::initialize(const Object& exception, c_Vector* deps, 
     } catch (const Object& cycle_exception) {
       putException(m_exception, cycle_exception.get());
       ++m_iterPos;
+      incRefCount();
       onUnblocked();
       return;
     }
   }
 
   blockOn(child);
+  incRefCount();
 }
 
 void c_GenVectorWaitHandle::onUnblocked() {
+  assert(getState() == STATE_BLOCKED);
+
   for (; m_iterPos < m_deps->size(); ++m_iterPos) {
 
     Cell* current = tvAssertCell(m_deps->at(m_iterPos));
@@ -139,7 +135,8 @@ void c_GenVectorWaitHandle::onUnblocked() {
     auto child = static_cast<c_WaitHandle*>(current->m_data.pobj);
 
     if (child->isSucceeded()) {
-      cellSet(child->getResult(), *current);
+      auto result = child->getResult();
+      m_deps->set(m_iterPos, &result);
     } else if (child->isFailed()) {
       putException(m_exception, child->getException());
     } else {
@@ -159,14 +156,19 @@ void c_GenVectorWaitHandle::onUnblocked() {
     }
   }
 
+  auto parentChain = getParentChain();
   if (m_exception.isNull()) {
-    setResult(make_tv<KindOfObject>(m_deps.get()));
-    m_deps = nullptr;
+    setState(STATE_SUCCEEDED);
+    tvWriteObject(m_deps.get(), &m_resultOrException);
   } else {
-    setException(m_exception.get());
+    setState(STATE_FAILED);
+    tvWriteObject(m_exception.get(), &m_resultOrException);
     m_exception = nullptr;
-    m_deps = nullptr;
   }
+
+  m_deps = nullptr;
+  parentChain.unblock();
+  decRefObj(this);
 }
 
 String c_GenVectorWaitHandle::getName() {

@@ -18,11 +18,10 @@
 #include "hphp/runtime/server/upload.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/hphp-system.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/zend-printf.h"
 #include "hphp/runtime/base/php-globals.h"
-#include "hphp/runtime/ext/ext_apc.h"
+#include "hphp/runtime/ext/apc/ext_apc.h"
 #include "hphp/util/logger.h"
 #include "hphp/runtime/base/string-util.h"
 #include "hphp/util/text-util.h"
@@ -73,7 +72,7 @@ static void safe_php_register_variable(char *var, const Variant& val,
 #define MAX_SIZE_ANONNAME 33
 
 /* Errors */
-#define UPLOAD_ERROR_OK   0  /* File upload succesful */
+#define UPLOAD_ERROR_OK   0  /* File upload successful */
 #define UPLOAD_ERROR_A    1  /* Uploaded file exceeded upload_max_filesize */
 #define UPLOAD_ERROR_B    2  /* Uploaded file exceeded MAX_FILE_SIZE */
 #define UPLOAD_ERROR_C    3  /* Partially uploaded */
@@ -232,7 +231,8 @@ static uint32_t read_post(multipart_buffer *self, char *buf,
   uint32_t bytes_read = bytes_remaining;
   memcpy(buf, self->cursor, bytes_remaining);
   bytes_to_read -= bytes_remaining;
-  always_assert(self->cursor = (char *)self->post_data +
+  self->cursor += bytes_remaining;
+  always_assert(self->cursor == (char *)self->post_data +
                         (self->post_size - self->throw_size));
   while (bytes_to_read > 0 && self->transport->hasMorePostData()) {
     int extra_byte_read = 0;
@@ -702,7 +702,7 @@ void rfc1867PostHandler(Transport* transport,
                         const std::string boundary) {
   char *s=nullptr, *start_arr=nullptr;
   std::string array_index, abuf;
-  char *temp_filename=nullptr, *lbuf=nullptr;
+  char *lbuf=nullptr;
   int total_bytes=0, cancel_upload=0, is_arr_upload=0, array_len=0;
   int max_file_size=0, skip_upload=0, anonindex=0, is_anonymous;
   std::set<std::string> &uploaded_files = s_rfc1867_data->rfc1867UploadedFiles;
@@ -710,6 +710,7 @@ void rfc1867PostHandler(Transport* transport,
   int fd=-1;
   void *event_extra_data = nullptr;
   unsigned int llen = 0;
+  int upload_count = RuntimeOption::MaxFileUploads;
 
   /* Initialize the buffer */
   if (!(mbuff = multipart_buffer_new(transport,
@@ -739,6 +740,7 @@ void rfc1867PostHandler(Transport* transport,
   }
 
   while (!multipart_buffer_eof(mbuff)) {
+    std::string temp_filename;
     char buff[FILLUNIT];
     char *cd=nullptr,*param=nullptr,*filename=nullptr, *tmp=nullptr;
     size_t blen=0, wlen=0;
@@ -797,7 +799,7 @@ void rfc1867PostHandler(Transport* transport,
         new_val_len = value_len;
         if (php_rfc1867_callback != nullptr) {
           multipart_event_formdata event_formdata;
-          size_t newlength = 0;
+          size_t newlength = new_val_len;
 
           event_formdata.post_bytes_processed = mbuff->read_post_bytes;
           event_formdata.name = param;
@@ -828,6 +830,11 @@ void rfc1867PostHandler(Transport* transport,
 
       /* If file_uploads=off, skip the file part */
       if (!RuntimeOption::EnableFileUploads) {
+        skip_upload = 1;
+      } else if (upload_count <= 0) {
+        Logger::Warning(
+          "Maximum number of allowable file uploads has been exceeded"
+        );
         skip_upload = 1;
       }
 
@@ -878,13 +885,14 @@ void rfc1867PostHandler(Transport* transport,
         snprintf(path, sizeof(path), "%s/XXXXXX",
                  RuntimeOption::UploadTmpDir.c_str());
         fd = mkstemp(path);
+        upload_count--;
         if (fd == -1) {
           Logger::Warning("Unable to open temporary file");
           Logger::Warning("File upload error - unable to create a "
                           "temporary file");
           cancel_upload = UPLOAD_ERROR_E;
         }
-        temp_filename = strdup(path);
+        temp_filename = path;
       }
 
       if (!skip_upload && php_rfc1867_callback != nullptr) {
@@ -897,12 +905,11 @@ void rfc1867PostHandler(Transport* transport,
                                  MULTIPART_EVENT_FILE_START,
                                  &event_file_start,
                                  &event_extra_data) == FAILURE) {
-          if (temp_filename) {
+          if (!temp_filename.empty()) {
             if (cancel_upload != UPLOAD_ERROR_E) { /* file creation failed */
               close(fd);
-              unlink(temp_filename);
+              unlink(temp_filename.c_str());
             }
-            free(temp_filename);
           }
           temp_filename="";
           free(param);
@@ -991,7 +998,7 @@ void rfc1867PostHandler(Transport* transport,
         multipart_event_file_end event_file_end;
 
         event_file_end.post_bytes_processed = mbuff->read_post_bytes;
-        event_file_end.temp_filename = temp_filename;
+        event_file_end.temp_filename = temp_filename.c_str();
         event_file_end.cancel_upload = cancel_upload;
         if (php_rfc1867_callback(&s_rfc1867_data->rfc1867ApcData,
                                  MULTIPART_EVENT_FILE_END,
@@ -1002,11 +1009,10 @@ void rfc1867PostHandler(Transport* transport,
       }
 
       if (cancel_upload && cancel_upload != UPLOAD_ERROR_C) {
-        if (temp_filename) {
+        if (!temp_filename.empty()) {
           if (cancel_upload != UPLOAD_ERROR_E) { /* file creation failed */
-            unlink(temp_filename);
+            unlink(temp_filename.c_str());
           }
-          free(temp_filename);
         }
         temp_filename="";
       } else {
@@ -1054,7 +1060,7 @@ void rfc1867PostHandler(Transport* transport,
 
       Array globals = php_globals_as_array();
       if (!is_anonymous) {
-        if (s && s > filename) {
+        if (s) {
           String val(s+1, strlen(s+1), CopyString);
           safe_php_register_variable(lbuf, val, globals, 0);
         } else {
@@ -1070,7 +1076,7 @@ void rfc1867PostHandler(Transport* transport,
       } else {
         snprintf(lbuf, llen, "%s[name]", param);
       }
-      if (s && s > filename) {
+      if (s) {
         String val(s+1, strlen(s+1), CopyString);
         safe_php_register_variable(lbuf, val, files, 0);
       } else {
@@ -1123,10 +1129,11 @@ void rfc1867PostHandler(Transport* transport,
       /* Initialize variables */
       add_protected_variable(param);
 
+      Variant tempFileName(temp_filename);
+
       /* if param is of form xxx[.*] this will cut it to xxx */
       if (!is_anonymous) {
-        String val(temp_filename, strlen(temp_filename), CopyString);
-        safe_php_register_variable(param, val, globals, 1);
+        safe_php_register_variable(param, tempFileName, globals, 1);
       }
 
       /* Add $foo[tmp_name] */
@@ -1137,7 +1144,6 @@ void rfc1867PostHandler(Transport* transport,
         snprintf(lbuf, llen, "%s[tmp_name]", param);
       }
       add_protected_variable(lbuf);
-      String tempFileName(temp_filename, strlen(temp_filename), CopyString);
       safe_php_register_variable(lbuf, tempFileName, files, 1);
 
       Variant file_size, error_type;
@@ -1180,8 +1186,6 @@ void rfc1867PostHandler(Transport* transport,
       safe_php_register_variable(lbuf, file_size, files, 0);
       free(param);
     }
-    if (temp_filename) free(temp_filename);
-    temp_filename = nullptr;
   }
 fileupload_done:
   data = mbuff->post_data;
@@ -1199,7 +1203,6 @@ fileupload_done:
   if (mbuff->boundary) free(mbuff->boundary);
   if (mbuff->buffer) free(mbuff->buffer);
   if (mbuff) free(mbuff);
-  if (temp_filename) free(temp_filename);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

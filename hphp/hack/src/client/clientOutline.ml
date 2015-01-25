@@ -8,7 +8,7 @@
  *
  *)
 
-open Utils
+module Json = Hh_json
 
 let to_json input =
   let entries = List.map begin fun (pos, name, type_) ->

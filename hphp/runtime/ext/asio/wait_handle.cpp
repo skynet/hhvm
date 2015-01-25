@@ -28,22 +28,24 @@ const StaticString s_result("<result>");
 const StaticString s_exception("<exception>");
 
 void c_WaitHandle::t___construct() {
-  throw NotSupportedException(__func__, "WTF? This is an abstract class");
+  throw_not_supported(
+      __func__, "WaitHandles cannot be constructed directly");
+}
+
+void c_WaitHandle::ti_setoniowaitentercallback(const Variant& callback) {
+  AsioSession::Get()->setOnIOWaitEnterCallback(callback);
+}
+
+void c_WaitHandle::ti_setoniowaitexitcallback(const Variant& callback) {
+  AsioSession::Get()->setOnIOWaitExitCallback(callback);
 }
 
 void c_WaitHandle::ti_setonjoincallback(const Variant& callback) {
-  if (!callback.isNull() &&
-      (!callback.isObject() ||
-       !callback.getObjectData()->instanceof(c_Closure::classof()))) {
-    Object e(SystemLib::AllocInvalidArgumentExceptionObject(
-      "Unable to set WaitHandle::onJoin: on_join_cb not a closure"));
-    throw e;
-  }
-  AsioSession::Get()->setOnJoinCallback(callback.getObjectDataOrNull());
+  AsioSession::Get()->setOnJoinCallback(callback);
 }
 
 Object c_WaitHandle::t_getwaithandle() {
-  return this;
+  always_assert(false);
 }
 
 // throws if cross-context cycle found
@@ -65,7 +67,19 @@ Variant c_WaitHandle::t_join() {
     assert(instanceof(c_WaitableWaitHandle::classof()));
     static_cast<c_WaitableWaitHandle*>(this)->join();
   }
+  return result();
+}
 
+Variant c_WaitHandle::t_result() {
+  if (!isFinished()) {
+    throw Object(SystemLib::AllocInvalidOperationExceptionObject(
+      "Request for result on pending wait handle, "
+      "must await or join() before calling result()"));
+  }
+  return result();
+}
+
+Variant c_WaitHandle::result() {
   assert(isFinished());
 
   if (LIKELY(isSucceeded())) {

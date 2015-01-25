@@ -27,7 +27,7 @@
 namespace HPHP {
 namespace Debug {
 
-using JIT::TCA;
+using jit::TCA;
 
 typedef enum {
   RAX,
@@ -52,7 +52,7 @@ typedef enum {
 const int DWARF_CODE_ALIGN = 1;
 const int DWARF_DATA_ALIGN = 8;
 
-#ifdef HAVE_LIBDWARF_20130729
+#ifdef LIBDWARF_CONST_NAME
 #define LIBDWARF_CALLBACK_NAME_TYPE const char*
 #else
 #define LIBDWARF_CALLBACK_NAME_TYPE char*
@@ -65,19 +65,19 @@ extern int g_dwarfCallback(
 
 class TCRange {
   TCA m_start, m_end;
-  bool m_isAstubs;
+  bool m_isAcold;
   void V() const { assert(isValid()); }
  public:
-  TCRange() : m_start(nullptr), m_end(nullptr), m_isAstubs(false) {
+  TCRange() : m_start(nullptr), m_end(nullptr), m_isAcold(false) {
     assert(!isValid());
   }
-  TCRange(const TCA start, const TCA end, bool isAstubs) :
-    m_start(start), m_end(end), m_isAstubs(isAstubs) { V(); }
+  TCRange(const TCA start, const TCA end, bool isAcold) :
+    m_start(start), m_end(end), m_isAcold(isAcold) { V(); }
 
   TCRange& operator=(const TCRange& r) {
     m_start = r.m_start;
     m_end = r.m_end;
-    m_isAstubs = r.m_isAstubs;
+    m_isAcold = r.m_isAcold;
     V();
     return *this;
   }
@@ -88,7 +88,7 @@ class TCRange {
     assert(!m_start || (m_end - m_start) < (1ll << 32));
     return bool(m_start);
   }
-  bool isAstubs() const { return m_isAstubs; }
+  bool isAcold() const { return m_isAcold; }
   TCA begin() const { V(); return m_start; }
   TCA end() const   { V(); return m_end; };
   uint32_t size() const   { V(); return m_end - m_start; }
@@ -167,7 +167,7 @@ typedef std::map<TCA, FunctionInfo* > FuncDB;
 typedef std::vector<FunctionInfo* > FuncPtrDB;
 
 struct DwarfInfo {
-  typedef std::map<TCA, JIT::TransRec> TransDB;
+  typedef std::map<TCA, jit::TransRec> TransDB;
 
   std::vector<DwarfChunk*> m_dwarfChunks;
   /* Array of chunks indexed by lg(#functions in chunk) + 1.

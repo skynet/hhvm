@@ -20,9 +20,13 @@
 
 #include <vector>
 
+#define MAGICKCORE_QUANTUM_DEPTH 16
+#define MAGICKCORE_HDRI_ENABLE 0
 #include <wand/MagickWand.h>
 
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/ext/imagick/constants.h"
 #include "hphp/util/string-vsnprintf.h"
 
@@ -30,11 +34,11 @@ namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////////////
 // ImagickExtension
-class ImagickExtension : public Extension {
+class ImagickExtension final : public Extension {
  public:
   ImagickExtension();
-  virtual void moduleInit();
-  virtual void threadInit();
+  void moduleInit() override;
+  void threadInit() override;
 
   static bool hasLocaleFix();
   static bool hasProgressMonitor();
@@ -111,13 +115,8 @@ class WandResource : public SweepableResourceData {
   DECLARE_RESOURCE_ALLOCATION(WandResource<Wand>);
 
  public:
-  explicit WandResource(Wand* wand, bool owner) :
+  explicit WandResource(Wand* wand, bool owner = true) :
       m_wand(wand), m_owner(owner) {
-  }
-
-  WandResource(WandResource<Wand> &&res) :
-      m_wand(res.m_wand), m_owner(res.m_owner) {
-    res.releaseWand();
   }
 
   ~WandResource() {
@@ -127,24 +126,25 @@ class WandResource : public SweepableResourceData {
   void clear() {
     if (m_wand != nullptr) {
       if (m_owner) {
-        destoryWand();
+        destroyWand();
       }
       m_wand = nullptr;
     }
   }
-
-  void destoryWand();
 
   Wand* getWand() {
     return m_wand;
   }
 
   Wand* releaseWand() {
+    auto w = m_wand;
     m_owner = false;
-    return m_wand;
+    m_wand = nullptr;
+    return w;
   }
 
  private:
+  void destroyWand();
   Wand* m_wand;
   bool m_owner;
 };
@@ -157,43 +157,43 @@ void WandResource<Wand>::sweep() {
 
 template<>
 ALWAYS_INLINE
-void WandResource<MagickWand>::destoryWand() {
+void WandResource<MagickWand>::destroyWand() {
   DestroyMagickWand(m_wand);
 }
 
 template<>
 ALWAYS_INLINE
-void WandResource<DrawingWand>::destoryWand() {
+void WandResource<DrawingWand>::destroyWand() {
   DestroyDrawingWand(m_wand);
 }
 
 template<>
 ALWAYS_INLINE
-void WandResource<PixelWand>::destoryWand() {
+void WandResource<PixelWand>::destroyWand() {
   DestroyPixelWand(m_wand);
 }
 
 template<>
 ALWAYS_INLINE
-void WandResource<PixelIterator>::destoryWand() {
+void WandResource<PixelIterator>::destroyWand() {
   DestroyPixelIterator(m_wand);
 }
 
 template<typename Wand>
 ALWAYS_INLINE
 void setWandResource(const StaticString& className,
-                     const Object& obj,
+                     ObjectData* obj,
                      Wand* wand,
-                     bool destroy = true) {
-  auto res = Resource(NEWOBJ(WandResource<Wand>(wand, destroy)));
-  obj->o_set("wand", res, className.get());
+                     bool owner = true) {
+  auto res = makeSmartPtr<WandResource<Wand>>(wand, owner);
+  obj->o_set("wand", Variant(std::move(res)), className.get());
 }
 
 template<typename Wand>
 ALWAYS_INLINE
 WandResource<Wand>* getWandResource(const StaticString& className,
-                                    const Object& obj) {
-  if (!obj.instanceof(className)) {
+                                    ObjectData* obj) {
+  if (!ObjNR(obj).asObject().instanceof(className)) {
     return nullptr;
   }
   auto var = obj->o_get("wand", true, className.get());
@@ -207,7 +207,7 @@ WandResource<Wand>* getWandResource(const StaticString& className,
 template<typename Wand, typename T>
 ALWAYS_INLINE
 WandResource<Wand>* getWandResource(const StaticString& className,
-                                    const Object& obj,
+                                    ObjectData* obj,
                                     const std::string& msg) {
   auto ret = getWandResource<Wand>(className, obj);
   if (ret == nullptr || ret->getWand() == nullptr) {
@@ -218,28 +218,28 @@ WandResource<Wand>* getWandResource(const StaticString& className,
 }
 
 ALWAYS_INLINE
-WandResource<MagickWand>* getMagickWandResource(const Object& obj) {
+WandResource<MagickWand>* getMagickWandResource(ObjectData* obj) {
   return getWandResource<MagickWand, ImagickException>(
     s_Imagick, obj,
     "Can not process invalid Imagick object");
 }
 
 ALWAYS_INLINE
-WandResource<DrawingWand>* getDrawingWandResource(const Object& obj) {
+WandResource<DrawingWand>* getDrawingWandResource(ObjectData* obj) {
   return getWandResource<DrawingWand, ImagickDrawException>(
     s_ImagickDraw, obj,
     "Can not process invalid ImagickDraw object");
 }
 
 ALWAYS_INLINE
-WandResource<PixelWand>* getPixelWandResource(const Object& obj) {
+WandResource<PixelWand>* getPixelWandResource(ObjectData* obj) {
   auto ret = getWandResource<PixelWand>(s_ImagickPixel, obj);
   assert(ret != nullptr && ret->getWand() != nullptr);
   return ret;
 }
 
 ALWAYS_INLINE
-WandResource<PixelIterator>* getPixelIteratorResource(const Object& obj) {
+WandResource<PixelIterator>* getPixelIteratorResource(ObjectData* obj) {
   return getWandResource<PixelIterator, ImagickPixelIteratorException>(
     s_ImagickPixelIterator, obj,
     "ImagickPixelIterator is not initialized correctly");
@@ -307,7 +307,7 @@ template<typename T>
 ALWAYS_INLINE
 Array convertMagickArray(size_t num, T* &arr) {
   if (arr == nullptr) {
-    return null_array;
+    return Array();
   } else {
     Array ret = convertArray(num, arr);
     freeMagickMemory(arr);
@@ -329,7 +329,7 @@ std::vector<PointInfo> toPointInfoArray(const Array& coordinates);
 
 //////////////////////////////////////////////////////////////////////////////
 // Imagick Helper
-Object createImagick(MagickWand* wand, bool owner);
+Object createImagick(MagickWand* wand);
 
 Array magickQueryFonts(const char* pattern = "*");
 
@@ -339,15 +339,16 @@ String magickResolveFont(const String& fontName);
 
 //////////////////////////////////////////////////////////////////////////////
 // ImagickPixel Helper
-Object createImagickPixel(PixelWand* wand, bool owner);
+Object createImagickPixel(PixelWand* wand, bool owner = true);
 
-Array createImagickPixelArray(size_t num, PixelWand* wands[], bool owner);
+Array createImagickPixelArray(
+  size_t num, PixelWand* wands[], bool owner = true);
 
-WandResource<PixelWand> newPixelWand();
+SmartPtr<WandResource<PixelWand>> newPixelWand();
 
-WandResource<PixelWand> buildColorWand(const Variant& color);
+SmartPtr<WandResource<PixelWand>> buildColorWand(const Variant& color);
 
-WandResource<PixelWand> buildOpacityWand(const Variant& opacity);
+SmartPtr<WandResource<PixelWand>> buildOpacityWand(const Variant& opacity);
 
 //////////////////////////////////////////////////////////////////////////////
 // ImagickPixel Helper

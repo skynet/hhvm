@@ -19,47 +19,35 @@
 #include "hphp/runtime/base/type-variant.h"
 #include "hphp/runtime/base/packed-array.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
+#include "hphp/runtime/base/struct-array.h"
+#include "hphp/runtime/base/struct-array-defs.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
-void* ArrayCommon::ReturnNull(...) {
-  return nullptr;
-}
-
-bool ArrayCommon::ReturnFalse(...) {
-  return false;
-}
-
-bool ArrayCommon::ReturnTrue(...) {
-  return true;
-}
-
-ArrayData* ArrayCommon::ReturnFirstArg(ArrayData* a, ...) {
-  return a;
-}
-
 ssize_t ArrayCommon::ReturnInvalidIndex(const ArrayData*) {
-  return ArrayData::invalid_index;
+  return 0;
 }
-
-void ArrayCommon::NoOp(...) {}
 
 bool ArrayCommon::ValidMArrayIter(const ArrayData* ad, const MArrayIter& fp) {
-  if (ad->isPacked()) {
-    assert(PackedArray::checkInvariants(ad));
-  } else {
-    assert(MixedArray::asMixed(ad));
-  }
   assert(fp.getContainer() == ad);
   if (fp.getResetFlag()) return false;
-  return fp.m_pos != ArrayData::invalid_index;
+  if (ad->isPacked()) {
+    assert(PackedArray::checkInvariants(ad));
+    return fp.m_pos != ad->getSize();
+  } else if (ad->isStruct()) {
+    assert(StructArray::asStructArray(ad));
+    return fp.m_pos != StructArray::asStructArray(ad)->size();
+  } else {
+    assert(MixedArray::asMixed(ad));
+    return fp.m_pos != MixedArray::asMixed(ad)->iterLimit();
+  }
 }
 
 ArrayData* ArrayCommon::Pop(ArrayData* a, Variant &value) {
   if (!a->empty()) {
-    auto const pos = a->iter_end();
+    auto const pos = a->iter_last();
     value = a->getValue(pos);
     return a->remove(a->getKey(pos), a->hasMultipleRefs());
   }

@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include "folly/Lazy.h"
+#include <folly/Lazy.h>
 
 #include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/array-init.h"
@@ -34,7 +34,7 @@
 #include "hphp/hhbbc/parse.h"
 #include "hphp/hhbbc/index.h"
 #include "hphp/runtime/vm/as.h"
-#include "hphp/runtime/vm/unit.h"
+#include "hphp/runtime/vm/unit-emitter.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -58,7 +58,7 @@ const StaticString s_IAA("IAA");
 const StaticString s_IB("IB");
 const StaticString s_NonUnique("NonUnique");
 const StaticString s_NonUniqueA("NonUniqueA");
-const StaticString s_WaitHandle("WaitHandle");
+const StaticString s_WaitHandle("HH\\WaitHandle");
 
 // A test program so we can actually test things involving object or
 // class types.
@@ -74,7 +74,7 @@ std::unique_ptr<php::Unit> make_test_unit() {
     # only one we have to make sure the type system can see for unit
     # test purposes, so we can just define it here.  We don't need to
     # give it any of its functions currently.
-    .class [abstract unique builtin] WaitHandle {
+    .class [abstract unique builtin] HH\WaitHandle {
     }
 
     .class [interface unique] IBase {
@@ -121,7 +121,17 @@ std::unique_ptr<php::Unit> make_test_unit() {
       .default_ctor;
     }
 
+    # Make sure BAA doesn't get AttrNoOverride:
+    .class [unique] BAADeriver extends BAA {
+      .default_ctor;
+    }
+
     .class [unique] TestClass {
+      .default_ctor;
+    }
+
+    # Make sure TestClass doesn't get AttrNoOverride:
+    .class [unique] TestClassDeriver extends TestClass {
       .default_ctor;
     }
 
@@ -156,11 +166,11 @@ std::unique_ptr<php::Program> make_program() {
 
 //////////////////////////////////////////////////////////////////////
 
-auto const test_empty_array = folly::lazy([&] {
+auto const test_empty_array = folly::lazy([] {
   return staticEmptyArray();
 });
 
-auto const test_array_map_value = folly::lazy([&] {
+auto const test_array_map_value = folly::lazy([] {
   auto ar = make_map_array(
     s_A.get(), s_B.get(),
     s_test.get(), 12
@@ -168,7 +178,7 @@ auto const test_array_map_value = folly::lazy([&] {
   return ArrayData::GetScalarArray(ar.get());
 });
 
-auto const test_array_packed_value = folly::lazy([&] {
+auto const test_array_packed_value = folly::lazy([] {
   auto ar = make_packed_array(
     42,
     23,
@@ -177,7 +187,7 @@ auto const test_array_packed_value = folly::lazy([&] {
   return ArrayData::GetScalarArray(ar.get());
 });
 
-auto const test_array_packed_value2 = folly::lazy([&] {
+auto const test_array_packed_value2 = folly::lazy([] {
   auto ar = make_packed_array(
     42,
     23.0,
@@ -186,7 +196,7 @@ auto const test_array_packed_value2 = folly::lazy([&] {
   return ArrayData::GetScalarArray(ar.get());
 });
 
-auto const test_array_packed_value3 = folly::lazy([&] {
+auto const test_array_packed_value3 = folly::lazy([] {
   auto ar = make_packed_array(
     1,
     2,
@@ -197,7 +207,7 @@ auto const test_array_packed_value3 = folly::lazy([&] {
   return ArrayData::GetScalarArray(ar.get());
 });
 
-auto const with_data = folly::lazy([&] {
+auto const with_data = folly::lazy([] {
   return std::vector<Type> {
     ival(2),
     dval(2.0),
@@ -271,7 +281,7 @@ auto const non_opt_unions = {
 
 auto const all_unions = boost::join(optionals, non_opt_unions);
 
-auto const all = folly::lazy([&] {
+auto const all = folly::lazy([] {
   std::vector<Type> ret;
   auto const wdata = with_data();
   ret.insert(end(ret), begin(primitives), end(primitives));
@@ -293,7 +303,7 @@ std::vector<Type> all_with_waithandles(const Index& index) {
   return ret;
 }
 
-auto const specialized_array_examples = folly::lazy([&] {
+auto const specialized_array_examples = folly::lazy([] {
   auto ret = std::vector<Type>{};
 
   auto test_map_a          = StructMap{};
@@ -647,8 +657,19 @@ TEST(Type, OptUnionOf) {
   EXPECT_EQ(TInitUnc, union_of(TOptSArr, TSStr));
   EXPECT_EQ(TInitUnc, union_of(TSStr, TOptSArr));
 
+  EXPECT_EQ(TOptSStr,
+            union_of(opt(sval(s_test.get())), opt(sval(s_TestClass.get()))));
+
+  EXPECT_EQ(TOptInt, union_of(opt(ival(2)), opt(ival(3))));
+  EXPECT_EQ(TOptDbl, union_of(opt(dval(2.0)), opt(dval(3.0))));
   EXPECT_EQ(TOptNum, union_of(TInitNull, TNum));
   EXPECT_EQ(TOptNum, union_of(TInitNull, union_of(dval(1), ival(0))));
+
+  auto const program = make_program();
+  Index index { borrow(program) };
+  auto const rcls = index.builtin_class(s_WaitHandle.get());
+
+  EXPECT_TRUE(union_of(TObj, opt(objExact(rcls))) == TOptObj);
 }
 
 TEST(Type, OptTV) {
@@ -727,6 +748,29 @@ TEST(Type, OptCouldBe) {
       EXPECT_TRUE(x.couldBe(y));
     }
   }
+}
+
+TEST(Type, Ref) {
+  EXPECT_TRUE(TRef == TRef);
+  EXPECT_TRUE(TRef != ref_to(TInt));
+  EXPECT_TRUE(ref_to(TInt) == ref_to(TInt));
+  EXPECT_TRUE(ref_to(TInt) != ref_to(TOptInt));
+
+  EXPECT_TRUE(TRef.couldBe(ref_to(TInt)));
+  EXPECT_TRUE(ref_to(TInt).couldBe(TRef));
+  EXPECT_TRUE(!ref_to(TInt).couldBe(ref_to(TObj)));
+  EXPECT_TRUE(ref_to(TOptInt).couldBe(ref_to(TInt)));
+
+  EXPECT_TRUE(!TRef.subtypeOf(ref_to(TInt)));
+  EXPECT_TRUE(ref_to(TInt).subtypeOf(TRef));
+  EXPECT_TRUE(ref_to(TInt).subtypeOf(ref_to(TOptInt)));
+  EXPECT_TRUE(!ref_to(TOptInt).subtypeOf(ref_to(TInt)));
+  EXPECT_TRUE(!ref_to(TObj).subtypeOf(ref_to(TInt)));
+  EXPECT_TRUE(!ref_to(TInt).subtypeOf(ref_to(TObj)));
+
+  EXPECT_TRUE(union_of(TRef, ref_to(TInt)) == TRef);
+  EXPECT_TRUE(union_of(ref_to(TInt), ref_to(TObj)) == ref_to(TInitCell));
+  EXPECT_TRUE(union_of(ref_to(TInitNull), ref_to(TObj)) == ref_to(TOptObj));
 }
 
 TEST(Type, SpecificExamples) {
@@ -1256,22 +1300,18 @@ TEST(Type, Interface) {
   auto const subObjAATy  = subObj(*clsAA);
   auto const subClsAATy  = subCls(*clsAA);
 
-  // we don't support interfaces quite yet so let's put few tests
-  // that will fail once interfaces are supported
-
-  // first 2 are "not precise" - should be true
-  EXPECT_FALSE(subClsATy.subtypeOf(objcls(subObjIATy)));
-  EXPECT_FALSE(objcls(subObjATy).strictSubtypeOf(subClsIATy));
+  EXPECT_TRUE(subClsATy.subtypeOf(objcls(subObjIATy)));
   EXPECT_TRUE(subClsATy.couldBe(objcls(subObjIATy)));
-
-  // first 2 are "not precise" - should be true
-  EXPECT_FALSE(subClsAATy.subtypeOf(objcls(subObjIAATy)));
-  EXPECT_FALSE(objcls(subObjAATy).strictSubtypeOf(objcls(subObjIAATy)));
+  EXPECT_TRUE(objcls(subObjATy).strictSubtypeOf(subClsIATy));
+  EXPECT_TRUE(subClsAATy.subtypeOf(objcls(subObjIAATy)));
   EXPECT_TRUE(subClsAATy.couldBe(objcls(subObjIAATy)));
+  EXPECT_TRUE(objcls(subObjAATy).strictSubtypeOf(objcls(subObjIAATy)));
 
-  // 3rd one is not precise - should be false
   EXPECT_FALSE(subClsATy.subtypeOf(objcls(subObjIAATy)));
   EXPECT_FALSE(objcls(subObjATy).strictSubtypeOf(objcls(subObjIAATy)));
+
+  // We don't support couldBe intelligently for interfaces quite yet, so here's
+  // a test that will start failing if we ever do:
   EXPECT_TRUE(clsExactATy.couldBe(objcls(subObjIAATy)));
 }
 

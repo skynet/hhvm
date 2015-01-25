@@ -23,8 +23,8 @@
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-String HHVM_FUNCTION(json_encode, const Variant& value, int64_t options = 0,
-                                  int64_t depth = 512);
+Variant HHVM_FUNCTION(json_encode, const Variant& value, int64_t options = 0,
+                                   int64_t depth = 512);
 Variant HHVM_FUNCTION(json_decode, const String& json, bool assoc = false,
                                    int64_t depth = 512, int64_t options = 0);
 int64_t HHVM_FUNCTION(json_last_error);
@@ -39,6 +39,7 @@ extern const int64_t k_JSON_NUMERIC_CHECK;
 extern const int64_t k_JSON_UNESCAPED_SLASHES;
 extern const int64_t k_JSON_PRETTY_PRINT;
 extern const int64_t k_JSON_UNESCAPED_UNICODE;
+extern const int64_t k_JSON_PARTIAL_OUTPUT_ON_ERROR;
 extern const int64_t k_JSON_FB_LOOSE;
 extern const int64_t k_JSON_FB_EXTRA_ESCAPES;
 extern const int64_t k_JSON_FB_UNLIMITED;

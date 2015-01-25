@@ -17,10 +17,12 @@
 #ifndef incl_HPHP_PREG_H_
 #define incl_HPHP_PREG_H_
 
+#include "hphp/runtime/base/smart-containers.h"
 #include "hphp/runtime/base/type-string.h"
 
 #include <cstdint>
 #include <cstddef>
+#include <pcre.h>
 
 #define PREG_PATTERN_ORDER          1
 #define PREG_SET_ORDER              2
@@ -49,11 +51,57 @@ namespace HPHP {
 class Array;
 struct Variant;
 
-struct PCREglobals {
-  // pcre ini_settings
-  int64_t m_preg_backtrace_limit;
-  int64_t m_preg_recursion_limit;
+class pcre_cache_entry {
+  pcre_cache_entry(const pcre_cache_entry&);
+  pcre_cache_entry& operator=(const pcre_cache_entry&);
+
+public:
+  pcre_cache_entry() : subpat_names(nullptr) {}
+  ~pcre_cache_entry();
+
+  pcre *re;
+  pcre_extra *extra; // Holds results of studying
+  int preg_options:1;
+  int compile_options:31;
+  int num_subpats;
+  mutable std::atomic<char**> subpat_names;
 };
+
+struct PCREglobals {
+  PCREglobals();
+  ~PCREglobals();
+
+  // pcre ini_settings
+  int64_t preg_backtrace_limit;
+  int64_t preg_recursion_limit;
+  pcre_jit_stack* jit_stack;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Cache management
+
+/*
+ * Initialize PCRE cache.
+ */
+void pcre_init();
+
+/*
+ * Clear PCRE cache.  Not thread safe - call only after parsing options.
+ */
+void pcre_reinit();
+
+/*
+ * Clean up thread-local PCREs.
+ */
+void pcre_session_exit();
+
+/*
+ * Dump the contents of the PCRE cache to filename.
+ */
+void pcre_dump_cache(const std::string& filename);
+
+///////////////////////////////////////////////////////////////////////////////
+// PHP API
 
 Variant preg_grep(const String& pattern, const Array& input, int flags = 0);
 

@@ -16,6 +16,8 @@
 #ifndef incl_HPHP_RUNTIME_BASE_STRING_DATA_INL_H_
 #define incl_HPHP_RUNTIME_BASE_STRING_DATA_INL_H_
 
+#include "hphp/runtime/base/cap-code.h"
+
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
@@ -25,17 +27,14 @@ inline StringData* StringData::Make() {
 }
 
 //////////////////////////////////////////////////////////////////////
-
 // CopyString
 
 inline StringData* StringData::Make(const char* data) {
   return Make(data, CopyString);
 }
 
-inline StringData* StringData::Make(const char* data,
-                                    int len,
-                                    CopyStringMode) {
-  return Make(StringSlice(data, len), CopyString);
+inline StringData* StringData::Make(const char* data, CopyStringMode) {
+  return Make(data, strlen(data), CopyString);
 }
 
 inline StringData* StringData::Make(const StringData* s, CopyStringMode) {
@@ -43,7 +42,6 @@ inline StringData* StringData::Make(const StringData* s, CopyStringMode) {
 }
 
 //////////////////////////////////////////////////////////////////////
-
 // AttachString
 
 inline StringData* StringData::Make(char* data, AttachStringMode) {
@@ -53,15 +51,7 @@ inline StringData* StringData::Make(char* data, AttachStringMode) {
   return sd;
 }
 
-inline StringData* StringData::Make(char* data, int len, AttachStringMode) {
-  auto const sd = Make(StringSlice(data, len), CopyString);
-  free(data);
-  assert(sd->checkSane());
-  return sd;
-}
-
 //////////////////////////////////////////////////////////////////////
-
 // Concat creation
 
 inline StringData* StringData::Make(const StringData* s1,
@@ -75,19 +65,6 @@ inline StringData* StringData::Make(const StringData* s1, StringSlice s2) {
 
 inline StringData* StringData::Make(const StringData* s1, const char* lit2) {
   return Make(s1->slice(), lit2);
-}
-
-//////////////////////////////////////////////////////////////////////
-
-inline void StringData::destruct() {
-  assert(checkSane());
-
-  // N.B. APC code assumes it is legal to call destruct() on a static
-  // string.  Probably it shouldn't do that....
-  if (!isStatic()) {
-    assert(m_data == static_cast<void*>(this + 1));
-    free(this);
-  }
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -107,7 +84,7 @@ inline StringSlice StringData::slice() const {
 
 inline MutableSlice StringData::bufferSlice() {
   assert(!isImmutable());
-  return MutableSlice(m_data, capacity() - 1);
+  return MutableSlice(m_data, capacity());
 }
 
 inline void StringData::invalidateHash() {
@@ -118,7 +95,7 @@ inline void StringData::invalidateHash() {
 }
 
 inline void StringData::setSize(int len) {
-  assert(len >= 0 && len < capacity() && !isImmutable());
+  assert(len >= 0 && len <= capacity() && !isImmutable());
   assert(!hasMultipleRefs());
   m_data[len] = 0;
   m_len = len;
@@ -139,7 +116,15 @@ inline const char* StringData::data() const {
 inline char* StringData::mutableData() const { return m_data; }
 inline int StringData::size() const { return m_len; }
 inline bool StringData::empty() const { return size() == 0; }
-inline uint32_t StringData::capacity() const { return m_cap; }
+inline uint32_t StringData::capacity() const {
+  assert(m_kind == HeaderKind::String);
+  return packedCodeToCap(m_capCode - (HeaderKind::String << 24));
+}
+
+inline size_t StringData::heapSize() const {
+  return isFlat() ? sizeof(StringData) + capacity() :
+         sizeof(StringData) + sizeof(SharedPayload);
+}
 
 inline bool StringData::isStrictlyInteger(int64_t& res) const {
   // Exploit the NUL terminator and unsigned comparison. This single comparison
@@ -203,8 +188,8 @@ inline StringData::SharedPayload* StringData::sharedPayload() {
   return static_cast<SharedPayload*>(voidPayload());
 }
 
-inline bool StringData::isShared() const { return !m_cap; }
 inline bool StringData::isFlat() const { return m_data == voidPayload(); }
+inline bool StringData::isShared() const { return m_data != voidPayload(); }
 inline bool StringData::isImmutable() const {
   return isStatic() || isShared() ||  isUncounted();
 }

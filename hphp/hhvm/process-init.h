@@ -27,7 +27,6 @@ void hphp_process_init();
 
 void ProcessInit();
 void initialize_repo();
-
 /*
  * This must be called before execute_program_impl in an hhvm build.
  */
@@ -51,8 +50,9 @@ inline void init_for_unit_test() {
   register_process_init();
   initialize_repo();
   init_thread_locals();
+  IniSetting::Map ini = IniSetting::Map::object;
   Hdf config;
-  RuntimeOption::Load(config);
+  RuntimeOption::Load(ini, config);
   compile_file(0, 0, MD5(), 0);
   hphp_process_init();
 }

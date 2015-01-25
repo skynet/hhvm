@@ -30,17 +30,26 @@ namespace HPHP {
  * of the operation is always available and waiting for the wait handle finishes
  * immediately.
  */
-FORWARD_DECLARE_CLASS(StaticWaitHandle);
-class c_StaticWaitHandle : public c_WaitHandle {
+class c_StaticWaitHandle final : public c_WaitHandle {
  public:
   DECLARE_CLASS_NO_SWEEP(StaticWaitHandle)
 
   explicit c_StaticWaitHandle(Class* cls = c_StaticWaitHandle::classof())
     : c_WaitHandle(cls)
   {}
-  ~c_StaticWaitHandle() {}
+  ~c_StaticWaitHandle() {
+    assert(isFinished());
+    tvRefcountedDecRef(&m_resultOrException);
+  }
 
   void t___construct();
+
+ public:
+  static c_StaticWaitHandle* CreateSucceeded(Cell result);
+  static c_StaticWaitHandle* CreateFailed(ObjectData* exception);
+
+ private:
+  void setState(uint8_t state) { setKindState(Kind::Static, state); }
 };
 
 ///////////////////////////////////////////////////////////////////////////////

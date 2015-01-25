@@ -22,15 +22,18 @@
 #include <memory>
 #include <type_traits>
 
-#include "folly/gen/Base.h"
-#include "folly/Conv.h"
-#include "folly/Optional.h"
-#include "folly/Memory.h"
+#include <folly/gen/Base.h>
+#include <folly/Conv.h>
+#include <folly/Optional.h>
+#include <folly/Memory.h>
 
-#include "hphp/runtime/vm/unit.h"
-#include "hphp/runtime/vm/func.h"
-#include "hphp/runtime/vm/preclass-emit.h"
+#include "hphp/runtime/base/repo-auth-type.h"
+#include "hphp/runtime/base/repo-auth-type-array.h"
+#include "hphp/runtime/base/repo-auth-type-codec.h"
 #include "hphp/runtime/vm/bytecode.h"
+#include "hphp/runtime/vm/func-emitter.h"
+#include "hphp/runtime/vm/preclass-emitter.h"
+#include "hphp/runtime/vm/unit-emitter.h"
 #include "hphp/hhbbc/representation.h"
 #include "hphp/hhbbc/cfg.h"
 #include "hphp/hhbbc/unit-util.h"
@@ -317,7 +320,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
       euState.defClsMap[id] = startOffset;
     };
 
-    auto nopdefcls = [&] {
+    auto defclsnop = [&] {
       auto const id = inst.DefCls.arg1;
       always_assert(euState.defClsMap[id] == kInvalidOffset);
       euState.defClsMap[id] = startOffset;
@@ -333,6 +336,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 #define IMM_IA(n)      ue.emitIVA(data.iter##n->id);
 #define IMM_DA(n)      ue.emitDouble(data.dbl##n);
 #define IMM_SA(n)      ue.emitInt32(ue.mergeLitstr(data.str##n));
+#define IMM_RATA(n)    encodeRAT(ue, data.rat);
 #define IMM_AA(n)      ue.emitInt32(ue.mergeArray(data.arr##n));
 #define IMM_OA_IMPL(n) ue.emitByte(static_cast<uint8_t>(data.subop));
 #define IMM_OA(type)   IMM_OA_IMPL
@@ -370,7 +374,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 #define O(opcode, imms, inputs, outputs, flags)                   \
     auto emit_##opcode = [&] (const bc::opcode& data) {           \
       if (Op::opcode == Op::DefCls)    defcls();                  \
-      if (Op::opcode == Op::NopDefCls) nopdefcls();               \
+      if (Op::opcode == Op::DefClsNop) defclsnop();               \
       if (isRet(Op::opcode))           ret_assert();              \
       ue.emitOp(Op::opcode);                                      \
       POP_##inputs                                                \
@@ -399,6 +403,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 #undef IMM_IA
 #undef IMM_DA
 #undef IMM_SA
+#undef IMM_RATA
 #undef IMM_AA
 #undef IMM_BA
 #undef IMM_OA_IMPL
@@ -461,7 +466,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
     for (auto& inst : b->hhbcs) emit_inst(inst);
 
     if (b->fallthrough) {
-      if (boost::next(blockIt) == endBlockIt || blockIt[1] != b->fallthrough) {
+      if (std::next(blockIt) == endBlockIt || blockIt[1] != b->fallthrough) {
         if (b->fallthroughNS) {
           emit_inst(bc::JmpNS { b->fallthrough });
         } else {
@@ -486,17 +491,17 @@ void emit_locals_and_params(FuncEmitter& fe,
     if (id < func.params.size()) {
       auto& param = func.params[id];
       FuncEmitter::ParamInfo pinfo;
-      pinfo.setDefaultValue(param.defaultValue);
-      pinfo.setTypeConstraint(param.typeConstraint);
-      pinfo.setUserType(param.userTypeConstraint);
-      pinfo.setPhpCode(param.phpCode);
-      pinfo.setUserAttributes(param.userAttributes);
-      pinfo.setBuiltinType(param.builtinType);
-      pinfo.setRef(param.byRef);
-      pinfo.setVariadic(param.isVariadic);
+      pinfo.defaultValue = param.defaultValue;
+      pinfo.typeConstraint = param.typeConstraint;
+      pinfo.userType = param.userTypeConstraint;
+      pinfo.phpCode = param.phpCode;
+      pinfo.userAttributes = param.userAttributes;
+      pinfo.builtinType = param.builtinType;
+      pinfo.byRef = param.byRef;
+      pinfo.variadic = param.isVariadic;
       fe.appendParam(func.locals[id]->name, pinfo);
       if (auto const dv = param.dvEntryPoint) {
-        fe.setParamFuncletOff(id, info.blockInfo[dv->id].offset);
+        fe.params[id].funcletOff = info.blockInfo[dv->id].offset;
       }
     } else {
       if (loc->name) {
@@ -513,7 +518,7 @@ void emit_locals_and_params(FuncEmitter& fe,
   fe.setNumIterators(func.iters.size());
 
   for (auto& sv : func.staticLocals) {
-    fe.addStaticVar(Func::SVInfo { sv.name, sv.phpCode });
+    fe.staticVars.push_back(Func::SVInfo {sv.name, sv.phpCode});
   }
 }
 
@@ -545,7 +550,7 @@ void emit_eh_region(FuncEmitter& fe,
   } else {
     eh.m_parentIndex = -1;
   }
-  parentIndexMap[region] = fe.ehtab().size() - 1;
+  parentIndexMap[region] = fe.ehtab.size() - 1;
 
   match<void>(
     region->node->info,
@@ -721,17 +726,13 @@ void emit_ehent_tree(FuncEmitter& fe,
   for (auto& r : regions) {
     emit_eh_region(fe, r, info.blockInfo, parentIndexMap);
   }
-  fe.setEhTabIsSorted();
+  fe.setEHTabIsSorted();
 }
 
 void emit_finish_func(const php::Func& func,
                       FuncEmitter& fe,
                       const EmitBcInfo& info) {
-  fe.setMaxStackCells(
-    info.maxStackDepth + fe.numLocals() +
-      info.maxFpiDepth * kNumActRecCells
-  );
-  if (info.containsCalls) fe.setContainsCalls();
+  if (info.containsCalls) fe.containsCalls = true;;
 
   for (auto& fpi : info.fpiRegions) {
     auto& e = fe.addFPIEnt();
@@ -743,17 +744,22 @@ void emit_finish_func(const php::Func& func,
   emit_locals_and_params(fe, func, info);
   emit_ehent_tree(fe, func, info);
 
-  fe.setUserAttributes(func.userAttributes);
-  fe.setReturnUserType(func.returnUserType);
-  fe.setOriginalFilename(func.originalFilename);
-  fe.setIsClosureBody(func.isClosureBody);
-  fe.setIsAsync(func.isAsync);
-  fe.setIsGenerator(func.isGenerator);
-  fe.setIsPairGenerator(func.isPairGenerator);
+  fe.userAttributes = func.userAttributes;
+  fe.retUserType = func.returnUserType;
+  fe.originalFilename = func.originalFilename;
+  fe.isClosureBody = func.isClosureBody;
+  fe.isAsync = func.isAsync;
+  fe.isGenerator = func.isGenerator;
+  fe.isPairGenerator = func.isPairGenerator;
   if (func.nativeInfo) {
-    fe.setReturnType(func.nativeInfo->returnType);
+    fe.returnType = func.nativeInfo->returnType;
   }
-  fe.setReturnTypeConstraint(func.retTypeConstraint);
+  fe.retTypeConstraint = func.retTypeConstraint;
+
+  fe.maxStackCells = info.maxStackDepth +
+                     fe.numLocals() +
+                     fe.numIterators() * kNumIterCells +
+                     info.maxFpiDepth * kNumActRecCells;
 
   fe.finish(fe.ue().bcPos(), false /* load */);
   fe.ue().recordFunction(&fe);
@@ -790,23 +796,53 @@ void emit_pseudomain(EmitUnitState& state,
   emit_finish_func(pm, *fe, info);
 }
 
-RepoAuthType make_repo_type(UnitEmitter& ue, const Type& t) {
+void merge_repo_auth_type(UnitEmitter& ue, RepoAuthType rat) {
   using T = RepoAuthType::Tag;
 
-  if (t.strictSubtypeOf(TObj) || (is_opt(t) && t.strictSubtypeOf(TOptObj))) {
-    auto const dobj = dobj_of(t);
-    auto const tag =
-      is_opt(t)
-        ? (dobj.type == DObj::Exact ? T::OptExactObj : T::OptSubObj)
-        : (dobj.type == DObj::Exact ? T::ExactObj    : T::SubObj);
-    ue.mergeLitstr(dobj.cls.name());
-    return RepoAuthType { tag, dobj.cls.name() };
-  }
+  switch (rat.tag()) {
+  case T::OptBool:
+  case T::OptInt:
+  case T::OptSStr:
+  case T::OptStr:
+  case T::OptDbl:
+  case T::OptRes:
+  case T::OptObj:
+  case T::Null:
+  case T::Cell:
+  case T::Ref:
+  case T::InitUnc:
+  case T::Unc:
+  case T::InitCell:
+  case T::InitGen:
+  case T::Gen:
+  case T::Uninit:
+  case T::InitNull:
+  case T::Bool:
+  case T::Int:
+  case T::Dbl:
+  case T::Res:
+  case T::SStr:
+  case T::Str:
+  case T::Obj:
+    return;
 
-#define ASSERTT_OP(x) if (t.subtypeOf(T##x)) return RepoAuthType{T::x};
-  ASSERTT_OPS
-#undef ASSERTT_OP
-  return RepoAuthType{};
+  case T::OptSArr:
+  case T::OptArr:
+  case T::SArr:
+  case T::Arr:
+    // We don't need to merge the litstrs in the array, because rats
+    // in arrays in the array type table must be using global litstr
+    // ids.  (As the array type table itself is not associated with
+    // any unit.)
+    return;
+
+  case T::OptSubObj:
+  case T::OptExactObj:
+  case T::SubObj:
+  case T::ExactObj:
+    ue.mergeLitstr(rat.clsName());
+    return;
+  }
 }
 
 void emit_class(EmitUnitState& state,
@@ -829,9 +865,10 @@ void emit_class(EmitUnitState& state,
 
   for (auto& x : cls.interfaceNames)     pce->addInterface(x);
   for (auto& x : cls.usedTraitNames)     pce->addUsedTrait(x);
-  for (auto& x : cls.traitRequirements)  pce->addTraitRequirement(x);
+  for (auto& x : cls.requirements)       pce->addClassRequirement(x);
   for (auto& x : cls.traitPrecRules)     pce->addTraitPrecRule(x);
   for (auto& x : cls.traitAliasRules)    pce->addTraitAliasRule(x);
+  pce->setNumDeclMethods(cls.numDeclMethods);
 
   for (auto& m : cls.methods) {
     FTRACE(2, "    method: {}\n", m->name->data());
@@ -845,11 +882,22 @@ void emit_class(EmitUnitState& state,
   auto const privateProps   = state.index.lookup_private_props(&cls);
   auto const privateStatics = state.index.lookup_private_statics(&cls);
   for (auto& prop : cls.properties) {
-    auto const repoTy = [&] (const PropState& ps) {
-      // TODO(#3599292): we don't currently infer closure use var types.
+    auto const repoTy = [&] (const PropState& ps) -> RepoAuthType {
+      /*
+       * Skip closures, because the types of their used vars can be
+       * communicated via assert opcodes right now.  At the time of this
+       * writing there was nothing to gain by including RAT's for the
+       * properties, since closure properties are only used internally by the
+       * runtime, not directly via opcodes like CGetM.
+       */
       if (is_closure(cls)) return RepoAuthType{};
+
       auto it = ps.find(prop.name);
-      return it == end(ps) ? RepoAuthType{} : make_repo_type(ue, it->second);
+      if (it == end(ps)) return RepoAuthType{};
+      auto const rat = make_repo_type(*state.index.array_table_builder(),
+                                      it->second);
+      merge_repo_auth_type(ue, rat);
+      return rat;
     };
 
     pce->addProperty(
@@ -863,13 +911,22 @@ void emit_class(EmitUnitState& state,
   }
 
   for (auto& cconst : cls.constants) {
-    pce->addConstant(
-      cconst.name,
-      cconst.typeConstraint,
-      &cconst.val,
-      cconst.phpCode
-    );
+    if (!cconst.val.hasValue()) {
+      pce->addAbstractConstant(
+        cconst.name,
+        cconst.typeConstraint
+      );
+    } else {
+      pce->addConstant(
+        cconst.name,
+        cconst.typeConstraint,
+        &cconst.val.value(),
+        cconst.phpCode
+      );
+    }
   }
+
+  pce->setEnumBaseTy(cls.enumBaseTy);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -883,7 +940,8 @@ std::unique_ptr<UnitEmitter> emit_unit(const Index& index,
 
   auto ue = folly::make_unique<UnitEmitter>(unit.md5);
   FTRACE(1, "  unit {}\n", unit.filename->data());
-  ue->setFilepath(unit.filename);
+  ue->m_filepath = unit.filename;
+  ue->m_preloadPriority = unit.preloadPriority;
 
   EmitUnitState state { index };
   state.defClsMap.resize(unit.classes.size(), kInvalidOffset);
@@ -900,9 +958,9 @@ std::unique_ptr<UnitEmitter> emit_unit(const Index& index,
    * this.)
    */
   if (is_systemlib) {
-    ue->setMergeOnly(true);
+    ue->m_mergeOnly = true;
     auto const tv = make_tv<KindOfInt64>(1);
-    ue->setMainReturn(&tv);
+    ue->m_mainReturn = tv;
   } else {
     /*
      * TODO(#3017265): UnitEmitter is very coupled to emitter.cpp, and
@@ -910,7 +968,7 @@ std::unique_ptr<UnitEmitter> emit_unit(const Index& index,
      * quite clear.  If you don't set returnSeen things relating to
      * hoistability break.
      */
-    ue->returnSeen();
+    ue->m_returnSeen = true;
   }
 
   emit_pseudomain(state, *ue, unit);

@@ -3,16 +3,10 @@
  * Contains some reusable utilities for command line php scripts.
  */
 
-//////////////////////////////////////////////////////////////////////
-/*
- * General utilities.
- */
+require_once(__DIR__.'/command_line_lib_UNSAFE.php');
 
-$saved_argv0 = $GLOBALS['argv'][0];
 function error(string $message): void {
-  global $saved_argv0;
-  echo "$saved_argv0: $message\n";
-  exit(1);
+  error_unsafe($message);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -54,19 +48,32 @@ function error(string $message): void {
  */
 
 type OptionInfo    = Pair<string,string>;
-type OptionInfoMap = Map<string,OptInfo>;
+type OptionInfoMap = Map<string,OptionInfo>;
 type OptionMap     = Map<string,mixed>;
 
 function parse_options(OptionInfoMap $optmap): OptionMap {
+  return parse_options_UNSAFE($optmap);
+}
+
+function parse_options_impl(OptionInfoMap $optmap, array<string> &$argv): OptionMap {
   $short_to_long     = Map {};
   $long_to_default   = Map {};
   $long_supports_arg = Map {};
-  $long_requres_arg  = Map {};
+  $long_requires_arg = Map {};
+  $long_set_arg      = Map {};
   $all_longs         = Map {};
 
   foreach ($optmap as $k => $v) {
     $m = null;
-    if (preg_match('/^([^:]*)(:(:(.*))?)?/', $k, $m)) {
+    if (preg_match('/^([^:]*)(\[\])/', $k, $m)) {
+      invariant($m !== null);
+      $k = $m[1];
+      $all_longs[$k] = true;
+      $long_supports_arg[$k] = true;
+      $long_requires_arg[$k] = true;
+      $long_set_arg[$k] = true;
+    } else if (preg_match('/^([^:]*)(:(:(.*))?)?/', $k, $m)) {
+      invariant($m !== null);
       $k = $m[1];
       $all_longs[$k] = true;
       $long_supports_arg[$k] = isset($m[2]);
@@ -76,6 +83,7 @@ function parse_options(OptionInfoMap $optmap): OptionMap {
       } else {
         $long_to_default[$k] = false;
       }
+      $long_set_arg[$k] = false;
 
       if ($v[0] != '') {
         $short_to_long[$v[0]] = $k;
@@ -87,7 +95,6 @@ function parse_options(OptionInfoMap $optmap): OptionMap {
 
   $ret = Map {};
 
-  global $argv;
   array_shift($argv);
   while (count($argv) > 0) {
     $arg = $argv[0];
@@ -101,9 +108,10 @@ function parse_options(OptionInfoMap $optmap): OptionMap {
     $read_argument = function($long) use (&$argv,
                                            $long_supports_arg,
                                            $long_requires_arg,
-                                           $long_to_default) {
+                                           $long_to_default,
+                                           $long_set_arg) {
       if (!$long_supports_arg[$long]) error("precondition");
-      if ($long_requires_arg[$long]) {
+      if ($long_requires_arg[$long] || $long_set_arg[$long]) {
         array_shift($argv);
         if (count($argv) == 0) {
           error("option --$long requires an argument");
@@ -126,6 +134,7 @@ function parse_options(OptionInfoMap $optmap): OptionMap {
     // Long-style arguments.
     $m = null;
     if (preg_match('/^--([^=]*)(=(.*))?/', $arg, $m)) {
+      assert($m);
       $long = $m[1];
       $has_val = !empty($m[3]);
       $val = $has_val ? $m[3] : false;
@@ -143,7 +152,14 @@ function parse_options(OptionInfoMap $optmap): OptionMap {
         $val = $read_argument($long);
       }
 
-      $ret[$long] = $val;
+      if ($long_set_arg[$long]) {
+        if (!$ret->containsKey($long)) {
+          $ret[$long] = new Set();
+        }
+        $ret[$long][] = $val;
+      } else {
+        $ret[$long] = $val;
+      }
       array_shift($argv);
       continue;
     }
@@ -151,6 +167,7 @@ function parse_options(OptionInfoMap $optmap): OptionMap {
     // Short-style arguments
     $m = null;
     if (preg_match('/^-([^-=]*)(=(.*))?/', $arg, $m)) {
+      assert($m);
       $shorts = $m[1];
       $has_val = !empty($m[3]);
       $val = $has_val ? $m[3] : false;
@@ -224,7 +241,7 @@ function display_help(string $message, OptionInfoMap $optmap): void {
     }
   }
 
-  $longest_col = max($first_cols->values()->map('strlen')->toArray());
+  $longest_col = max($first_cols->values()->map(fun('strlen'))->toArray());
 
   foreach ($first_cols as $long => $col) {
     $pad = str_repeat(' ', $longest_col - strlen($col) + 5);

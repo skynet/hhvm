@@ -1,5 +1,3 @@
 *.bc
 *.opt
-
-# auto generated
-utils/build_id.ml
+!Makefile

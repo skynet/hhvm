@@ -114,6 +114,8 @@
 #define  MAX(a,b)  (((a) > (b)) ? (a) : (b))
 #endif
 
+#define OFFSET_OOB(n, o, i)    ((n) < (o) || (i) > ssize_t((n) - (o)))
+
 #ifndef HOWMANY
 # define HOWMANY (256 * 1024)  /* how much of the file to look at */
 #endif
@@ -315,7 +317,7 @@ struct magic {
 #define PSTRING_LEN  \
     (PSTRING_1_BE|PSTRING_2_LE|PSTRING_2_BE|PSTRING_4_LE|PSTRING_4_BE)
 #define PSTRING_LENGTH_INCLUDES_ITSELF    BIT(12)
-#define  STRING_TRIM        BIT(13)
+#define  HHVM_FN(trim)        BIT(13)
 #define CHAR_COMPACT_WHITESPACE      'W'
 #define CHAR_COMPACT_OPTIONAL_WHITESPACE  'w'
 #define CHAR_IGNORE_LOWERCASE      'c'
@@ -426,7 +428,7 @@ protected int file_encoding(struct magic_set *, const unsigned char *, size_t,
     unichar **, size_t *, const char **, const char **, const char **);
 protected int file_is_tar(struct magic_set *, const unsigned char *, size_t);
 protected int file_softmagic(struct magic_set *, const unsigned char *, size_t,
-    int, int);
+    size_t, int, int);
 protected int file_apprentice(struct magic_set *, const char *, int);
 protected int file_magicfind(struct magic_set *, const char *, struct mlist *);
 protected uint64_t file_signextend(struct magic_set *, struct magic *,

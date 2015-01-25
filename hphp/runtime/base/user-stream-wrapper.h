@@ -25,20 +25,27 @@
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-class UserStreamWrapper : public Stream::Wrapper {
- public:
-  UserStreamWrapper(const String& name, const String& clsname, int flags);
-  virtual File* open(const String& filename, const String& mode,
-                     int options, const Variant& context);
-  virtual int access(const String& path, int mode);
-  virtual int lstat(const String& path, struct stat* buf);
-  virtual int stat(const String& path, struct stat* buf);
-  virtual int unlink(const String& path);
-  virtual int rename(const String& oldname, const String& newname);
-  virtual int mkdir(const String& path, int mode, int options);
-  virtual int rmdir(const String& path, int options);
-  virtual Directory* opendir(const String& path);
- private:
+struct UserStreamWrapper final : Stream::Wrapper {
+  UserStreamWrapper(const String& name, Class*, int flags);
+
+  SmartPtr<File> open(const String& filename, const String& mode,
+                      int options, const Variant& context) override;
+  int access(const String& path, int mode) override;
+  int lstat(const String& path, struct stat* buf) override;
+  int stat(const String& path, struct stat* buf) override;
+  int unlink(const String& path) override;
+  int rename(const String& oldname, const String& newname) override;
+  int mkdir(const String& path, int mode, int options) override;
+  int rmdir(const String& path, int options) override;
+  SmartPtr<Directory> opendir(const String& path) override;
+  bool touch(const String& path, int64_t mtime, int64_t atime);
+  bool chmod(const String& path, int64_t mode);
+  bool chown(const String& path, int64_t uid);
+  bool chown(const String& path, const String& uid);
+  bool chgrp(const String& path, int64_t gid);
+  bool chgrp(const String& path, const String& gid);
+
+private:
   String m_name;
   LowClassPtr m_cls;
 };

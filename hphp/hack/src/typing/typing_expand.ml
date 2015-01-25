@@ -35,10 +35,10 @@ let rec fully_expand seen env (r, ty) =
 and fully_expand_ seen env = function
   | Tvar _ -> assert false
   | Tmixed | Tgeneric _ | Tany | Tanon _ | Tprim _ as x -> x
-  | Tarray (b, ty1, ty2) ->
+  | Tarray (ty1, ty2) ->
       let ty1 = fully_expand_opt seen env ty1 in
       let ty2 = fully_expand_opt seen env ty2 in
-      Tarray (b, ty1, ty2)
+      Tarray (ty1, ty2)
   | Ttuple tyl ->
       Ttuple (List.map (fully_expand seen env) tyl)
   | Tunresolved tyl ->
@@ -50,7 +50,13 @@ and fully_expand_ seen env = function
       let expand_param (name, ty) = name, fully_expand seen env ty in
       let params = List.map expand_param ft.ft_params in
       let ret  = fully_expand seen env ft.ft_ret in
-      Tfun { ft with ft_params = params; ft_ret = ret }
+      let arity = match ft.ft_arity with
+        | Fvariadic (min, (p_n, p_ty)) ->
+          Fvariadic (min, (p_n, fully_expand seen env p_ty))
+        | x -> x
+      in
+      Tfun { ft with ft_params = params; ft_arity = arity; ft_ret = ret }
+  | Taccess (_, _, _) as ty -> ty
   | Tabstract (x, tyl, cstr) ->
       let tyl = List.map (fully_expand seen env) tyl in
       let cstr = fully_expand_opt seen env cstr in
@@ -59,12 +65,10 @@ and fully_expand_ seen env = function
       let tyl = List.map (fully_expand seen env) tyl in
       Tapply (x, tyl)
   | Tobject as x -> x
-  | Tshape fdm -> 
-      Tshape (SMap.map (fully_expand seen env) fdm)
+  | Tshape fdm ->
+      Tshape (Nast.ShapeMap.map (fully_expand seen env) fdm)
 
-and fully_expand_opt seen env = function
-  | None -> None
-  | Some x -> Some (fully_expand seen env x)
+and fully_expand_opt seen env x = opt_map (fully_expand seen env) x
 
 (*****************************************************************************)
 (* External API *)

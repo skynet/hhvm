@@ -66,11 +66,11 @@ class RedisSessionModule implements SessionHandlerInterface {
       }
       if ($args['weight'] < 1) {
         error_log("Invalid weight specified for session.save_path(redis), ".
-                  "assuming 1", E_USER_WARNING);
+                  "assuming 1");
         $args['weight'] = 1;
       }
 
-      if ($url['scheme'] == 'file') {
+      if (isset($url['scheme']) && ($url['scheme'] == 'file')) {
         $args['host'] = "unix://{$url['path']}";
         $args['port'] = null;
       } else {
@@ -152,7 +152,12 @@ class RedisSessionModule implements SessionHandlerInterface {
 
   public function destroy($key) {
     $redis = $this->connect($key);
-    return $redis->del($key);
+    if ($redis === false) {
+        return false;
+    } else {
+        $redis->del($key);
+        return true;
+    }
   }
 
   public function gc($maxlifetime) {

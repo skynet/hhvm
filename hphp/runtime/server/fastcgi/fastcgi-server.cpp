@@ -19,43 +19,41 @@
 #include "hphp/runtime/server/fastcgi/fastcgi-session.h"
 #include "hphp/runtime/server/fastcgi/fastcgi-worker.h"
 #include "hphp/runtime/server/fastcgi/socket-connection.h"
-#include "folly/io/IOBuf.h"
-#include "folly/io/IOBufQueue.h"
-#include "thrift/lib/cpp/async/TEventBaseManager.h"
-#include "thrift/lib/cpp/async/TAsyncTransport.h"
-#include "ti/proxygen/lib/workers/WorkerThread.h"
-#include "ti/proxygen/lib/services/Acceptor.h"
+#include <folly/io/IOBuf.h>
+#include <folly/io/IOBufQueue.h>
+#include <folly/io/async/EventBaseManager.h> // @nolint
+#include "thrift/lib/cpp/async/TAsyncTransport.h" // @nolint
 
 namespace HPHP {
 
 using folly::IOBuf;
 using folly::IOBufQueue;
 using folly::io::Cursor;
-using apache::thrift::async::TEventBase;
+using folly::EventBase;
 using apache::thrift::async::TAsyncTransport;
-using apache::thrift::async::TAsyncServerSocket;
 using apache::thrift::async::TAsyncTimeout;
-using apache::thrift::transport::TSocketAddress;
 using apache::thrift::transport::TTransportException;
 
 ////////////////////////////////////////////////////////////////////////////////
 
 const int FastCGIAcceptor::k_maxConns = 50;
 const int FastCGIAcceptor::k_maxRequests = 1000;
-const TSocketAddress FastCGIAcceptor::s_unknownSocketAddress("0.0.0.0", 0);
 
-bool FastCGIAcceptor::canAccept(const TSocketAddress& address) {
+const folly::SocketAddress
+FastCGIAcceptor::s_unknownSocketAddress("127.0.0.1", 0);
+
+bool FastCGIAcceptor::canAccept(const folly::SocketAddress& address) {
   // TODO: Support server IP whitelist.
   return m_server->canAccept();
 }
 
 void FastCGIAcceptor::onNewConnection(
-    apache::thrift::async::TAsyncSocket::UniquePtr sock,
-    const apache::thrift::transport::TSocketAddress* peerAddress,
-    const std::string& nextProtocolName,
-    const facebook::proxygen::TransportInfo& tinfo)
+  folly::AsyncSocket::UniquePtr sock,
+  const folly::SocketAddress* peerAddress,
+  const std::string& nextProtocolName,
+  const ::folly::TransportInfo& tinfo)
 {
-  TSocketAddress localAddress;
+  folly::SocketAddress localAddress;
   try {
     sock->getLocalAddress(&localAddress);
   } catch (...) {
@@ -81,14 +79,14 @@ void FastCGIAcceptor::onConnectionsDrained() {
 
 FastCGIConnection::FastCGIConnection(
   FastCGIServer* server,
-  TAsyncTransport::UniquePtr sock,
-  const TSocketAddress& localAddr,
-  const TSocketAddress& peerAddr)
+  folly::AsyncSocket::UniquePtr sock,
+  const folly::SocketAddress& localAddr,
+  const folly::SocketAddress& peerAddr)
   : SocketConnection(std::move(sock), localAddr, peerAddr),
     m_server(server) {
   m_eventBase = m_server->getEventBaseManager()->getExistingEventBase();
   assert(m_eventBase != nullptr);
-  m_sock->setReadCallback(this);
+  m_sock->setReadCB(this);
   m_session.setCallback(this);
 }
 
@@ -113,15 +111,18 @@ void FastCGIConnection::readDataAvailable(size_t len) noexcept {
   resetTimeout();
 
   size_t length = m_session.onIngress(m_readBuf.front());
-  m_readBuf.split(length);
+  if (m_readBuf.front() != nullptr) {
+    m_readBuf.split(length);
+  }
 }
 
 void FastCGIConnection::readEOF() noexcept {
-  shutdownTransport();
+  m_session.onClose();
+  close();
 }
 
 void FastCGIConnection::readError(const TTransportException& ex) noexcept {
-  shutdownTransport();
+  readEOF();
 }
 
 bool FastCGIConnection::hasReadDataAvailable() {
@@ -158,7 +159,7 @@ void FastCGIConnection::onSessionError() {
 }
 
 void FastCGIConnection::onSessionClose() {
-  shutdownTransport();
+  close();
   m_shutdown = true;
   if (m_writeCount == 0) {
     delete this;
@@ -195,7 +196,7 @@ FastCGIServer::FastCGIServer(const std::string &address,
                  RuntimeOption::ServerThreadJobLIFOSwitchThreshold,
                  RuntimeOption::ServerThreadJobMaxQueuingMilliSeconds,
                  RequestPriority::k_numPriorities) {
-  TSocketAddress sock_addr;
+  folly::SocketAddress sock_addr;
   if (useFileSocket) {
     sock_addr.setFromPath(address);
   } else if (address.empty()) {
@@ -203,8 +204,8 @@ FastCGIServer::FastCGIServer(const std::string &address,
   } else {
     sock_addr.setFromHostPort(address, port);
   }
-  m_socketConfig.setAddress(sock_addr);
-  m_socketConfig.setAcceptBacklog(RuntimeOption::ServerBacklog);
+  m_socketConfig.bindAddress = sock_addr;
+  m_socketConfig.acceptBacklog = RuntimeOption::ServerBacklog;
   std::chrono::seconds timeout;
   if (RuntimeOption::ConnectionTimeoutSeconds > 0) {
     timeout = std::chrono::seconds(RuntimeOption::ConnectionTimeoutSeconds);
@@ -212,7 +213,7 @@ FastCGIServer::FastCGIServer(const std::string &address,
     // default to 2 minutes
     timeout = std::chrono::seconds(120);
   }
-  m_socketConfig.setConnectionIdleTime(timeout);
+  m_socketConfig.connectionIdleTimeout = timeout;
 }
 
 void FastCGIServer::addTakeoverListener(TakeoverListener* lisener) {
@@ -224,17 +225,21 @@ void FastCGIServer::removeTakeoverListener(TakeoverListener* lisener) {
 }
 
 void FastCGIServer::start() {
-  m_socket.reset(new TAsyncServerSocket(m_worker.getEventBase()));
+  m_socket.reset(new apache::thrift::async::TAsyncServerSocket(m_worker.getEventBase()));
   try {
-    m_socket->bind(m_socketConfig.getAddress());
+    m_socket->bind(m_socketConfig.bindAddress);
   } catch (const apache::thrift::transport::TTransportException& ex) {
     LOG(ERROR) << ex.what();
-    if (m_socketConfig.getAddress().getFamily() == AF_UNIX) {
-      throw FailedToListenException(m_socketConfig.getAddress().getPath());
+    if (m_socketConfig.bindAddress.getFamily() == AF_UNIX) {
+      throw FailedToListenException(m_socketConfig.bindAddress.getPath());
     } else {
-      throw FailedToListenException(m_socketConfig.getAddress().getAddressStr(),
-                                    m_socketConfig.getAddress().getPort());
+      throw FailedToListenException(m_socketConfig.bindAddress.getAddressStr(),
+                                    m_socketConfig.bindAddress.getPort());
     }
+  }
+  if (m_socketConfig.bindAddress.getFamily() == AF_UNIX) {
+    auto path = m_socketConfig.bindAddress.getPath();
+    chmod(path.c_str(), 0760);
   }
   m_acceptor.reset(new FastCGIAcceptor(m_socketConfig, this));
   m_acceptor->init(m_socket.get(), m_worker.getEventBase());
@@ -243,7 +248,7 @@ void FastCGIServer::start() {
         // Someone called stop before we got here
         return;
       }
-      m_socket->listen(m_socketConfig.getAcceptBacklog());
+      m_socket->listen(m_socketConfig.acceptBacklog);
       m_socket->startAccepting();
     });
   setStatus(RunStatus::RUNNING);
@@ -273,7 +278,7 @@ void FastCGIServer::stop() {
       } else {
         terminateServer();
       }
-    });
+  });
 }
 
 void FastCGIServer::onConnectionsDrained() {
@@ -290,10 +295,18 @@ void FastCGIServer::timeoutExpired() noexcept {
 }
 
 void FastCGIServer::terminateServer() {
+  if (getStatus() != RunStatus::STOPPING) {
+    setStatus(RunStatus::STOPPING);
+  }
+
   m_worker.stopWhenIdle();
   m_dispatcher.stop();
 
   setStatus(RunStatus::STOPPED);
+
+  for (auto listener: m_listeners) {
+    listener->serverStopped(this);
+  }
 }
 
 bool FastCGIServer::canAccept() {
@@ -317,4 +330,3 @@ void FastCGIServer::handleRequest(
 
 ////////////////////////////////////////////////////////////////////////////////
 }
-

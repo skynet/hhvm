@@ -26,12 +26,12 @@
 #include <boost/regex.hpp>
 #include <boost/algorithm/string.hpp>
 
-#include "folly/Format.h"
-#include "folly/String.h"
+#include <folly/Format.h>
+#include <folly/String.h>
 
 #include "hphp/util/disasm.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 typedef X64Assembler Asm;
 using namespace reg;
@@ -193,7 +193,7 @@ template<> struct Gen<Reg8> {
 };
 
 template<> struct Gen<MemoryRef> {
-  static const std::vector<MemoryRef>& gen() {
+  static const std::vector<MemoryRef>& gen_mr() {
     static bool inited = false;
     static std::vector<MemoryRef> vec;
     if (inited) return vec;
@@ -207,17 +207,13 @@ template<> struct Gen<MemoryRef> {
     inited = true;
     return vec;
   }
-};
-
-template<> struct Gen<IndexedMemoryRef> {
-  static const std::vector<IndexedMemoryRef>& gen() {
+  static const std::vector<MemoryRef>& gen() {
     static bool inited = false;
-    static std::vector<IndexedMemoryRef> vec;
+    static std::vector<MemoryRef> vec;
     if (inited) return vec;
     auto& indexes = Gen<Reg64>::gen();
-    auto& mrs = Gen<MemoryRef>::gen();
+    auto& mrs = Gen<MemoryRef>::gen_mr();
     std::vector<int> scales = { 4 };
-
     for (auto& mr : mrs) {
       for (auto& idx : indexes) {
         if (idx == rsp) continue;
@@ -263,19 +259,14 @@ std::string expected_str(MemoryRef mr) {
   if (mr.r.disp != 0) {
     expected_disp_str(mr.r.disp, out);
   }
-  out << '(' << expected_str(mr.r.base) << ')';
-  return out.str();
-}
-
-std::string expected_str(IndexedMemoryRef imr) {
-  std::ostringstream out;
-  if (imr.r.disp != 0) {
-    expected_disp_str(imr.r.disp, out);
+  if (int(mr.r.index) != -1) {
+    out << '(' << expected_str(mr.r.base)
+        << ',' << expected_str(mr.r.index)
+        << ',' << mr.r.scale
+        << ')';
+  } else {
+    out << '(' << expected_str(mr.r.base) << ')';
   }
-  out << '(' << expected_str(imr.r.base)
-      << ',' << expected_str(imr.r.index)
-      << ',' << imr.r.scale
-      << ')';
   return out.str();
 }
 
@@ -342,24 +333,24 @@ typedef void (Asm::*OpR8R64)(Reg8, Reg64);
 typedef void (Asm::*OpMR64)(MemoryRef, Reg64);
 typedef void (Asm::*OpMR32)(MemoryRef, Reg32);
 typedef void (Asm::*OpMR8)(MemoryRef, Reg8);
-typedef void (Asm::*OpSMR64)(IndexedMemoryRef, Reg64);
-typedef void (Asm::*OpSMR32)(IndexedMemoryRef, Reg32);
-typedef void (Asm::*OpSMR8)(IndexedMemoryRef, Reg8);
+typedef void (Asm::*OpSMR64)(MemoryRef, Reg64);
+typedef void (Asm::*OpSMR32)(MemoryRef, Reg32);
+typedef void (Asm::*OpSMR8)(MemoryRef, Reg8);
 typedef void (Asm::*OpRM64)(Reg64, MemoryRef);
 typedef void (Asm::*OpRM32)(Reg32, MemoryRef);
 typedef void (Asm::*OpRM8)(Reg8, MemoryRef);
-typedef void (Asm::*OpRSM64)(Reg64, IndexedMemoryRef);
-typedef void (Asm::*OpRSM32)(Reg32, IndexedMemoryRef);
-typedef void (Asm::*OpRSM8)(Reg8, IndexedMemoryRef);
+typedef void (Asm::*OpRSM64)(Reg64, MemoryRef);
+typedef void (Asm::*OpRSM32)(Reg32, MemoryRef);
+typedef void (Asm::*OpRSM8)(Reg8, MemoryRef);
 typedef void (Asm::*OpIR64)(Immed, Reg64);
 typedef void (Asm::*OpIR32)(Immed, Reg32);
 typedef void (Asm::*OpIR8)(Immed, Reg8);
 typedef void (Asm::*OpIM64)(Immed, MemoryRef);
 typedef void (Asm::*OpIM32)(Immed, MemoryRef);
 typedef void (Asm::*OpIM16)(Immed, MemoryRef);
-typedef void (Asm::*OpISM64)(Immed, IndexedMemoryRef);
-typedef void (Asm::*OpISM32)(Immed, IndexedMemoryRef);
-typedef void (Asm::*OpISM16)(Immed, IndexedMemoryRef);
+typedef void (Asm::*OpISM64)(Immed, MemoryRef);
+typedef void (Asm::*OpISM32)(Immed, MemoryRef);
+typedef void (Asm::*OpISM16)(Immed, MemoryRef);
 
 //////////////////////////////////////////////////////////////////////
 
@@ -656,7 +647,7 @@ TEST(Asm, CMov) {
   Asm a { db };
   a.   testq  (rax, rax);
   a.   cload_reg64_disp_reg64(CC_Z, rax, 0, rax);
-  a.   cload_reg64_disp_reg32(CC_Z, rax, 0, rax);
+  a.   cload_reg64_disp_reg32(CC_Z, rax, 0, eax);
   expect_asm(a, R"(
 test %rax, %rax
 cmovzq (%rax), %rax
@@ -798,6 +789,180 @@ cvttsd2si %xmm2, %rcx
 cvttsd2si %xmm15, %rdx
 cvttsd2si %xmm12, %r12
 )");
+}
+
+TEST(Asm, Baseless) {
+  TestDataBlock db(10 << 24);
+  Asm a { db };
+
+  a.   call  (baseless(rax*8 + 0x400));
+  a.   call  (baseless(rax*8 + 0x40));
+  a.   call  (baseless(rsi*4 + 0x42));
+  a.   call  (baseless(rbx*2 + 0x700));
+  expect_asm(a, R"(
+callq 0x400(,%rax,8)
+callq 0x40(,%rax,8)
+callq 0x42(,%rsi,4)
+callq 0x700(,%rbx,2)
+)");
+}
+
+TEST(Asm, IncDecIndexed) {
+  TestDataBlock db(10 << 24);
+  Asm a { db };
+
+  a.   incw  (rax[rdi*2 + 0x10]);
+  a.   incw  (rax[rsi*4 + 0x15]);
+  a.   decw  (rbp[r15*2 + 0x12]);
+  a.   incl  (rax[rdi*2 + 0x10]);
+  a.   incl  (rax[rsi*4 + 0x15]);
+  a.   decl  (rbp[r15*2 + 0x12]);
+  a.   incq  (rax[rdi*2 + 0x10]);
+  a.   incq  (rax[rsi*4 + 0x15]);
+  a.   decq  (rbp[r15*2 + 0x12]);
+  expect_asm(a, R"(
+incw 0x10(%rax,%rdi,2)
+incw 0x15(%rax,%rsi,4)
+decw 0x12(%rbp,%r15,2)
+incl 0x10(%rax,%rdi,2)
+incl 0x15(%rax,%rsi,4)
+decl 0x12(%rbp,%r15,2)
+incq 0x10(%rax,%rdi,2)
+incq 0x15(%rax,%rsi,4)
+decq 0x12(%rbp,%r15,2)
+)");
+}
+
+TEST(Asm, Unpcklpd) {
+  TestDataBlock db(256);
+  Asm a { db };
+
+  Address current = db.frontier();
+  a.unpcklpd(xmm0, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x0f, current[1]);
+  EXPECT_EQ(0x14, current[2]);
+
+  current = db.frontier();
+  a.unpcklpd(xmm11, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x41, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x14, current[3]);
+
+  current = db.frontier();
+  a.unpcklpd(xmm5, xmm13);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x44, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x14, current[3]);
+
+  current = db.frontier();
+  a.unpcklpd(xmm11, xmm13);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x45, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x14, current[3]);
+}
+
+TEST(Asm, Ucomisd) {
+  TestDataBlock db(256);
+  Asm a { db };
+
+  Address current = db.frontier();
+  a.ucomisd(xmm0, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x0f, current[1]);
+  EXPECT_EQ(0x2e, current[2]);
+
+  current = db.frontier();
+  a.ucomisd(xmm9, xmm2);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x44, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x2e, current[3]);
+
+  current = db.frontier();
+  a.ucomisd(xmm3, xmm12);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x41, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x2e, current[3]);
+
+  current = db.frontier();
+  a.ucomisd(xmm11, xmm12);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x45, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x2e, current[3]);
+}
+
+TEST(Asm, Pxor) {
+  TestDataBlock db(256);
+  Asm a { db };
+
+  Address current = db.frontier();
+  a.pxor(xmm0, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x0f, current[1]);
+  EXPECT_EQ(0xef, current[2]);
+
+  current = db.frontier();
+  a.pxor(xmm8, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x41, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0xef, current[3]);
+
+  current = db.frontier();
+  a.pxor(xmm0, xmm15);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x44, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0xef, current[3]);
+
+  current = db.frontier();
+  a.pxor(xmm11, xmm15);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x45, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0xef, current[3]);
+}
+
+TEST(Asm, Psrlq) {
+  TestDataBlock db(256);
+  Asm a { db };
+
+  Address current = db.frontier();
+  a.psrlq(3, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x0f, current[1]);
+  EXPECT_EQ(0x73, current[2]);
+
+  current = db.frontier();
+  a.psrlq(3, xmm9);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x41, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x73, current[3]);
+}
+
+TEST(Asm, Psllq) {
+  TestDataBlock db(256);
+  Asm a { db };
+
+  Address current = db.frontier();
+  a.psllq(3, xmm1);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x0f, current[1]);
+  EXPECT_EQ(0x73, current[2]);
+
+  current = db.frontier();
+  a.psllq(3, xmm9);
+  EXPECT_EQ(0x66, current[0]);
+  EXPECT_EQ(0x41, current[1]);
+  EXPECT_EQ(0x0f, current[2]);
+  EXPECT_EQ(0x73, current[3]);
 }
 
 }}

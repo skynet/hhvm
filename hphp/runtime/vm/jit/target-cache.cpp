@@ -35,7 +35,7 @@
 #include "hphp/runtime/vm/treadmill.h"
 #include "hphp/util/text-util.h"
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 TRACE_SET_MOD(targetcache);
 
@@ -90,7 +90,7 @@ const Func* FuncCache::lookup(RDS::Handle handle, StringData* sd) {
     // Miss. Does it actually exist?
     func = Unit::lookupFunc(sd);
     if (UNLIKELY(!func)) {
-      JIT::VMRegAnchor _;
+      VMRegAnchor _;
       func = Unit::loadFunc(sd);
       if (!func) {
         raise_error("Call to undefined function %s()", sd->data());
@@ -150,7 +150,7 @@ namespace MethodCache {
 namespace {
 ///////////////////////////////////////////////////////////////////////////////
 
-NEVER_INLINE __attribute__((noreturn))
+NEVER_INLINE __attribute__((__noreturn__))
 void raiseFatal(ActRec* ar, Class* cls, StringData* name, Class* ctx) {
   try {
     g_context->lookupMethodCtx(
@@ -322,7 +322,7 @@ void handleSlowPath(Entry* mce,
   if (UNLIKELY(cls->numMethods() <= mceValue->methodSlot())) {
     return lookup<fatal>(mce, ar, name, cls, ctx);
   }
-  auto const cand = cls->methods()[mceValue->methodSlot()];
+  auto const cand = cls->getMethod(mceValue->methodSlot());
 
   // If this class has the same func at the same method slot we're
   // good to go.  No need to recheck permissions, since we already
@@ -424,7 +424,21 @@ void handlePrimeCacheInit(Entry* mce,
   if (!(rawTarget & 0x1)) {
     return lookup<fatal>(mce, ar, name, cls, ctx);
   }
-  auto const smashTarget = reinterpret_cast<SmashTarget*>(rawTarget & ~0x1);
+
+  // We should be able to use DECLARE_FRAME_POINTER here,
+  // but that fails inside templates.
+  // Fortunately, this code is very x86 specific anyway...
+#if defined(__x86_64__)
+  ActRec* framePtr;
+  asm volatile("mov %%rbp, %0" : "=r" (framePtr) ::);
+#else
+  ActRec* framePtr = ar;
+  always_assert(false);
+#endif
+
+  TCA toSmash =
+    mcg->backEnd().smashableCallFromReturn(TCA(framePtr->m_savedRip));
+  TCA movAddr = TCA(rawTarget >> 1);
 
   // First fill the request local method cache for this call.
   lookup<fatal>(mce, ar, name, cls, ctx);
@@ -438,7 +452,8 @@ void handlePrimeCacheInit(Entry* mce,
 
   auto smashMov = [&] (TCA addr, uintptr_t value) -> bool {
     always_assert(mcg->backEnd().isSmashable(addr, kMovLen));
-    assert(addr[0] == 0x49 && addr[1] == 0xba);
+    //XX these assume the immediate move was to r10
+    //assert(addr[0] == 0x49 && addr[1] == 0xba);
     auto const ptr = reinterpret_cast<uintptr_t*>(addr + kMovImmOff);
     if (!(*ptr & 1)) {
       return false;
@@ -483,21 +498,15 @@ void handlePrimeCacheInit(Entry* mce,
     assert(!(mce->m_value->attrs() & AttrStatic));
     imm = fval << 32 | cval;
   }
-  if (!smashMov(smashTarget->movAddr, imm)) {
-    // Someone beat us to it.  Bail early so we don't double-free.
+  if (!smashMov(movAddr, imm)) {
+    // Someone beat us to it.  Bail early.
     return;
   }
 
   // Regardless of whether the inline cache was populated, smash the
   // call to start doing real dispatch.
-  //
-  // XXX Use of kCallLen here is a layering violation.
-  mcg->backEnd().smashCall(smashTarget->retAddr - X64::kCallLen,
+  mcg->backEnd().smashCall(toSmash,
                            reinterpret_cast<TCA>(handleSlowPath<fatal>));
-
-  // Wait to free this until no request threads could be picking up
-  // the immediate.
-  Treadmill::deferredFree(smashTarget);
 }
 
 template

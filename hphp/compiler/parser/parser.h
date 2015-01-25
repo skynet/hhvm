@@ -30,6 +30,7 @@
 #include "hphp/compiler/statement/statement.h"
 #include "hphp/compiler/statement/statement_list.h"
 #include "hphp/util/logger.h"
+#include "hphp/parser/parse-time-fatal-exception.h"
 
 #ifdef HPHP_PARSER_NS
 #undef HPHP_PARSER_NS
@@ -140,9 +141,11 @@ public:
   void onStaticVariable(Token &out, Token *exprs, Token &var, Token *value);
   void onClassVariableModifer(Token &mod) {}
   void onClassVariableStart(Token &out, Token *modifiers, Token &decl,
-                            Token *type);
+                            Token *type, bool abstract = false);
   void onClassVariable(Token &out, Token *exprs, Token &var, Token *value);
   void onClassConstant(Token &out, Token *exprs, Token &var, Token &value);
+  void onClassAbstractConstant(Token &out, Token *exprs, Token &var);
+  void onClassTypeConstant(Token &out, Token &var, Token &value);
   void onSimpleVariable(Token &out, Token &var);
   void onSynthesizedVariable(Token &out, Token &var) {
     onSimpleVariable(out, var);
@@ -151,19 +154,24 @@ public:
   void onIndirectRef(Token &out, Token &refCount, Token &var);
   void onStaticMember(Token &out, Token &cls, Token &name);
   void onRefDim(Token &out, Token &var, Token &offset);
-  void onCallParam(Token &out, Token *params, Token &expr, bool ref);
+  void onCallParam(Token &out, Token *params, Token &expr,
+                   bool ref, bool unpack);
   void onCall(Token &out, bool dynamic, Token &name, Token &params, Token *cls);
   void onEncapsList(Token &out, int type, Token &list);
   void addEncap(Token &out, Token *list, Token &expr, int type);
   void encapRefDim(Token &out, Token &var, Token &offset);
-  void encapObjProp(Token &out, Token &var, Token &name);
+  void encapObjProp(Token &out, Token &var, bool nullsafe, Token &name);
   void encapArray(Token &out, Token &var, Token &expr);
+  void onConst(Token &out, Token &name, Token &value);
   void onConstantValue(Token &out, Token &constant);
   void onScalar(Token &out, int type, Token &scalar);
   void onExprListElem(Token &out, Token *exprs, Token &expr);
 
-  void onObjectProperty(Token &out, Token &base, Token &prop);
-  void onObjectMethodCall(Token &out, Token &base, Token &prop, Token &params);
+  void onObjectProperty(Token &out, Token &base, bool nullsafe, Token &prop);
+  void onObjectMethodCall(Token &out, Token &base, bool nullsafe, Token &prop,
+                          Token &params);
+
+  void checkAllowedInWriteContext(ExpressionPtr e);
 
   void onListAssignment(Token &out, Token &vars, Token *expr,
                         bool rhsFirst = false);
@@ -181,6 +189,9 @@ public:
                    bool ref);
   void onEmptyCollection(Token &out);
   void onCollectionPair(Token &out, Token *pairs, Token *name, Token &value);
+  void onEmptyCheckedArray(Token &out);
+  void onCheckedArrayPair(Token &out, Token *pairs, Token *name, Token &value);
+  void onCheckedArray(Token &out, Token &pairs, int op);
   void onUserAttribute(Token &out, Token *attrList, Token &name, Token &value);
   void onClassConst(Token &out, Token &cls, Token &name, bool text);
   void onClassClass(Token &out, Token &cls, Token &name, bool text);
@@ -195,11 +206,14 @@ public:
                bool ref, Token *defValue, Token *attr, Token *modifier);
   void onClassStart(int type, Token &name);
   void onClass(Token &out, int type, Token &name, Token &base,
-               Token &baseInterface, Token &stmt, Token *attr);
+               Token &baseInterface, Token &stmt, Token *attr,
+               Token *enumTy);
   void onInterface(Token &out, Token &name, Token &base, Token &stmt,
                    Token *attr);
+  void onEnum(Token &out, Token &name, Token &baseTy,
+              Token &stmt, Token *attr);
   void onInterfaceName(Token &out, Token *names, Token &name);
-  void onTraitRequire(Token &out, Token &name, bool isClass);
+  void onClassRequire(Token &out, Token &name, bool isClass);
   void onTraitUse(Token &out, Token &traits, Token &rules);
   void onTraitName(Token &out, Token *names, Token &name);
   void onTraitRule(Token &out, Token &stmtList, Token &newStmt);
@@ -232,19 +246,20 @@ public:
   void onCase(Token &out, Token &cases, Token *cond, Token &stmt);
   void onBreakContinue(Token &out, bool isBreak, Token *expr);
   void onReturn(Token &out, Token *expr);
-  void onYield(Token &out, Token &expr);
-  void onYieldPair(Token &out, Token &key, Token &val);
+  void onYield(Token &out, Token *expr);
+  void onYieldPair(Token &out, Token *key, Token *val);
   void onYieldBreak(Token &out);
   void onAwait(Token &out, Token &expr);
   void onGlobal(Token &out, Token &expr);
   void onGlobalVar(Token &out, Token *exprs, Token &expr);
   void onStatic(Token &out, Token &expr);
+  void onHashBang(Token &out, Token &text);
   void onEcho(Token &out, Token &expr, bool html);
   void onUnset(Token &out, Token &expr);
   void onExpStatement(Token &out, Token &expr);
   void onForEachStart();
   void onForEach(Token &out, Token &arr, Token &name, Token &value,
-                 Token &stmt);
+                 Token &stmt, bool awaitAs);
   void onTry(Token &out, Token &tryStmt, Token &className, Token &var,
              Token &catchStmt, Token &catches, Token &finallyStmt);
   void onTry(Token &out, Token &tryStmt, Token &finallyStmt);
@@ -259,7 +274,8 @@ public:
                   Token& ref,
                   Token& params,
                   Token& cparams,
-                  Token& stmts);
+                  Token& stmts,
+                  Token& ret);
   Token onExprForLambda(const Token& expr);
   void onClosureParam(Token &out, Token *params, Token &param, bool ref);
 
@@ -292,10 +308,13 @@ public:
   // for namespace support
   void onNamespaceStart(const std::string &ns, bool file_scope = false);
   void onNamespaceEnd();
-  void onUse(const std::string &ns, const std::string &as);
   void nns(int token = 0, const std::string& text = std::string());
   std::string nsDecl(const std::string &name);
   std::string resolve(const std::string &ns, bool cls);
+
+  void onUse(const std::string &ns, const std::string &as);
+  void onUseFunction(const std::string &fn, const std::string &as);
+  void onUseConst(const std::string &cnst, const std::string &as);
 
   /*
    * Get the current label scope. A new label scope is demarcated by
@@ -337,18 +356,18 @@ public:
 private:
   struct FunctionContext {
     FunctionContext()
-      : hasReturn(false)
+      : hasNonEmptyReturn(false)
       , isGenerator(false)
       , isAsync(false)
     {}
 
     void checkFinalAssertions() {
-      assert(!isGenerator || (!isAsync && !hasReturn));
+      assert(!isGenerator || !hasNonEmptyReturn);
     }
 
-    bool hasReturn;       // function contains a return statement
-    bool isGenerator;     // function determined to be a generator
-    bool isAsync;         // function determined to be async
+    bool hasNonEmptyReturn; // function contains a non-empty return statement
+    bool isGenerator;       // function determined to be a generator
+    bool isAsync;           // function determined to be async
   };
 
   enum class FunctionType {
@@ -385,11 +404,13 @@ private:
   void newScope();
   void completeScope(BlockScopePtr inner);
 
+  void setHasNonEmptyReturn(ConstructPtr blame);
+
   void invalidYield();
-  bool setIsGenerator();
+  void setIsGenerator();
 
   void invalidAwait();
-  bool setIsAsync();
+  void setIsAsync();
 
   static bool canBeAsyncOrGenerator(string funcName, string clsName);
   void checkFunctionContext(string funcName,
@@ -411,7 +432,13 @@ private:
 
   bool hasType(Token &type);
 
+  void checkAssignThis(string var);
+
   void checkAssignThis(Token &var);
+
+  void checkAssignThis(ExpressionPtr e);
+
+  void checkAssignThis(ExpressionListPtr params);
 
   void addStatement(StatementPtr stmt, StatementPtr new_stmt);
 
@@ -469,7 +496,16 @@ private:
   NamespaceState m_nsState;
   bool m_nsFileScope;
   std::string m_namespace; // current namespace
-  AliasTable m_aliasTable;
+  AliasTable m_nsAliasTable;
+  std::vector<uint32_t> m_nsStack;
+
+  // Function aliases
+  hphp_string_iset m_fnTable;
+  hphp_string_imap<std::string> m_fnAliasTable;
+
+  // Constant aliases
+  hphp_string_set m_cnstTable;
+  hphp_string_map<std::string> m_cnstAliasTable;
 
   void registerAlias(std::string name);
   bool isAutoAliasOn();

@@ -1,5 +1,14 @@
 <?hh
 require_once __DIR__.'/SortedIterator.php';
+require_once __DIR__.'/Options.php';
+
+class TimeoutException extends Exception {
+}
+
+# There's an outer timeout of 300s; this number must be less than that (with
+# fudge factor)
+const INSTALL_TIMEOUT_SECS = 240;
+const NETWORK_RETRIES = 1;
 
 // For determining number of processes
 function num_cpus() {
@@ -27,29 +36,11 @@ function remove_dir_recursive(string $root_dir) {
                RecursiveDirectoryIterator::SKIP_DOTS),
              RecursiveIteratorIterator::CHILD_FIRST);
 
-  // This can be better, but good enough for now.
-  // Maybe just use rm -rf, but that always seems
-  // a bit dangerous. The below is probably only
-  // O(2n) or so. No order depth order guaranteed
-  // with the iterator, so actual files can be
-  // deleted before symlinks
-
-  // Get rid of the symlinks first to avoid orphan
-  // symlinks that cannot be deleted.
-  foreach ($files as $fileinfo) {
-    if (is_link($fileinfo)) {
-      $target = readlink($fileinfo);
-      unlink($fileinfo);
-      unlink($target);
-    }
-  }
-
-  // Get rid of the rest
   foreach ($files as $fileinfo) {
     if ($fileinfo->isDir()) {
-      rmdir($fileinfo->getRealPath());
+      rmdir($fileinfo->getPathname());
     } else {
-      unlink($fileinfo->getRealPath());
+      unlink($fileinfo->getPathname());
     }
   }
 
@@ -98,7 +89,7 @@ function find_first_file_recursive(Set $filenames, string $root_dir,
 
 function find_all_files(string $pattern, string $root_dir,
                         string $exclude_file_pattern,
-                        Set $exclude_dirs = null): ?Set {
+                        ?Set<string> $exclude_dirs = null): ?Set<string> {
   if (!file_exists($root_dir)) {
     return null;
   }
@@ -111,7 +102,7 @@ function find_all_files(string $pattern, string $root_dir,
     if (preg_match($pattern, $fileinfo->getFileName()) === 1 &&
         preg_match($exclude_file_pattern, $fileinfo->getFileName()) === 0 &&
         strstr($fileinfo->getPath(), '/vendor/') === false &&
-        !$exclude_dirs->contains(dirname($fileinfo->getPath()))) {
+        !nullthrows($exclude_dirs)->contains(dirname($fileinfo->getPath()))) {
       $files[] = $fileinfo->getPathName();
     }
   }
@@ -119,10 +110,12 @@ function find_all_files(string $pattern, string $root_dir,
   return $files;
 }
 
-function find_all_files_containing_text(string $text,
-                                        string $root_dir,
-                                        string $exclude_file_pattern,
-                                        Set $exclude_dirs = null): ?Set {
+function find_all_files_containing_text(
+  string $text,
+  string $root_dir,
+  string $exclude_file_pattern,
+  ?Set<string> $exclude_dirs = null,
+): ?Set<string> {
   if (!file_exists($root_dir)) {
     return null;
   }
@@ -134,8 +127,8 @@ function find_all_files_containing_text(string $text,
   foreach ($sit as $fileinfo) {
     if (strpos(file_get_contents($fileinfo->getPathName()), $text) !== false &&
         preg_match($exclude_file_pattern, $fileinfo->getFileName()) === 0 &&
-        strstr($file_info->getPath(), '/vendor/') === false &&
-        !$exclude_dirs->contains(dirname($fileinfo->getPath()))) {
+        strstr($fileinfo->getPath(), '/vendor/') === false &&
+        !nullthrows($exclude_dirs)->contains(dirname($fileinfo->getPath()))) {
       $files[] = $fileinfo->getPathName();
     }
   }
@@ -143,17 +136,79 @@ function find_all_files_containing_text(string $text,
   return $files;
 }
 
-function idx(array $array, mixed $key, mixed $default = null): mixed {
-  return isset($array[$key]) ? $array[$key] : $default;
-}
-
 function command_exists(string $cmd): bool {
     $ret = shell_exec("which $cmd");
     return !empty($ret);
 }
 
-function verbose(string $msg, bool $verbose): void {
-  if ($verbose) {
+/**
+ * Print if output format is for humans
+ */
+function human(string $msg): void {
+  if (
+    (Options::$output_format === OutputFormat::HUMAN) ||
+    (Options::$output_format === OutputFormat::HUMAN_VERBOSE)
+  ) {
+    print $msg;
+  }
+}
+
+function fbmake_json(Map<string, mixed> $data) {
+  if (Options::$output_format === OutputFormat::FBMAKE) {
+    // Yep, really. STDERR. If you put it on STDOUT instead, 'All tests passed.'
+    fprintf(STDERR, "%s\n", json_encode($data));
+  }
+}
+
+function fbmake_test_name(Framework $framework, string $test) {
+  return $framework->getName().'/'.$test;
+}
+
+function fbmake_result_json(
+  Framework $framework,
+  string $test,
+  string $status
+): Map<string, mixed> {
+  if (Options::$output_format !== OutputFormat::FBMAKE) {
+    return Map { };
+  }
+
+  $expected = $framework->getCurrentTestStatuses();
+  if ($expected && $expected->containsKey($test)) {
+    $expected = $expected[$test];
+
+    if ($expected === $status) {
+      return Map {
+        'status' => 'passed',
+        'details' => 'Matched expected status: '.$status,
+      };
+    }
+    return Map {
+      'status' => 'failed',
+      'details' => 'Expected '.$expected.', got '.$status,
+    };
+  }
+  return Map {
+    'status' => 'failed',
+    'details' => 'Unknown test - updated expect file needed?',
+  };
+}
+
+/**
+ * Print output if verbose mode is on. This implies that the output format
+ * is human-readable.
+ */
+function verbose(string $msg): void {
+  if (Options::$output_format === OutputFormat::HUMAN_VERBOSE) {
+    print $msg;
+  }
+}
+
+/**
+ * Print output if format is human readable, but not not verbose.
+ */
+function not_verbose(string $msg): void {
+  if (Options::$output_format === OutputFormat::HUMAN) {
     print $msg;
   }
 }
@@ -199,24 +254,26 @@ function get_subclasses_of(string $parent): Vector {
 }
 
 function get_runtime_build(bool $use_php = false): string {
-  $build = "";
+  $executable = '';
+  $command = '';
 
-  // FIX: Should we try to install a vanilla zend binary here instead of
-  // relying on user to specify a path? Should we try to determine if zend
+  // FIX: Should we try to install a vanilla php binary here instead of
+  // relying on user to specify a path? Should we try to determine if php
   // is already installed via a $PATH variable?
-  if (Options::$zend_path !== null) {
-    if (!file_exists(Options::$zend_path)) {
-      error_and_exit("Zend build does not exists. Are you sure your path is ".
+  if (Options::$php_path !== null) {
+    if (!file_exists(Options::$php_path)) {
+      error_and_exit("PHP build does not exists. Are you sure your path is ".
                      "right?");
     }
-    $build = Options::$zend_path;
+    $executable = Options::$php_path;
+    $command = $executable;
   } else {
     $fbcode_root_dir = __DIR__.'/../../..';
     $oss_root_dir = __DIR__.'/../..';
     // See if we are using an internal development build
     if ((file_exists($fbcode_root_dir."/_bin"))) {
-      $build .= $fbcode_root_dir;
-      $build .= $use_php ? "/_bin/hphp/hhvm/php" : "/_bin/hphp/hhvm/hhvm";
+      $executable = $fbcode_root_dir;
+      $executable .= $use_php ? "/_bin/hphp/hhvm/php" : "/_bin/hphp/hhvm/hhvm";
     // Maybe we are in OSS land trying this script
     } else if (file_exists($oss_root_dir."/hhvm")) {
       // Pear won't run correctly unless a 'php' executable exists.
@@ -225,45 +282,96 @@ function get_runtime_build(bool $use_php = false): string {
       // a php symlink to hhvm
       symlink($oss_root_dir."/hhvm/hhvm", $oss_root_dir."/hhvm/php");
 
-      $build .= $oss_root_dir."/hhvm";
-      $build .= $use_php ? "/php" : "/hhvm";
+      $executable = $oss_root_dir."/hhvm";
+      $executable .= $use_php ? "/php" : "/hhvm";
     } else {
       error_and_exit("HHVM build doesn't exist. Did you build yet?");
     }
+    $command = $executable;
     if (!$use_php) {
       $repo_loc = tempnam('/tmp', 'framework-test');
       $repo_args = " -v Repo.Local.Mode=-- -v Repo.Central.Path=".$repo_loc;
-      $build .= $repo_args.
-        " --config ".__DIR__."/config.hdf".
+      $command .= $repo_args.
         " --config ".__DIR__."/php.ini";
     }
   }
-  return $build;
+  invariant(
+    file_exists($executable),
+    $executable.' does not exist'
+  );
+  invariant(
+    is_executable($executable),
+    $executable.' is not executable'
+  );
+  return nullthrows($command);
 }
 
-function error_and_exit(string $message, bool $to_file = false): void {
-  if ($to_file) {
-    $target = Options::$script_errors_file;
-  } else {
-    $target = 'php://stderr';
+function error_and_exit(
+  string $message,
+  string $fbmake_action = 'skipped',
+): void {
+  if (Options::$output_format === OutputFormat::FBMAKE) {
+    fprintf(
+      STDERR,
+      "%s\n",
+      json_encode(
+        [
+          'op' => 'test_done',
+          'test' => 'framework test setup',
+          'status' => $fbmake_action,
+          'details' => 'ERROR: '.$message,
+        ],
+        /* assoc array = */ true,
+      )
+    );
+    exit(0);
   }
-  file_put_contents($target, basename(__FILE__).": ".
-                    $message.PHP_EOL, FILE_APPEND);
+  fprintf(STDERR, "ERROR: %s\n", $message);
   exit(1);
 }
 
 // Include all PHP files in a directory
 function include_all_php($folder){
   foreach (glob("{$folder}/*.php") as $filename) {
-    include_once $filename;
+    require_once $filename;
   }
 }
 
 // This will run processes that will get the test infra dependencies
 // (e.g. PHPUnit), frameworks and framework dependencies.
-function run_install(string $proc, string $path, ?Map $env): ?int
+function run_install(
+  string $proc,
+  string $path,
+  ?Map $env = null,
+  int $retries = NETWORK_RETRIES
+): ?int {
+  // We need to output something every once in a while - if we go quiet, fbmake
+  // kills us.
+  for ($try = 1; $try <= $retries; ++$try) {
+    $test_name = $proc.' - attempt '.$try;
+    try {
+      fbmake_json(Map {'op' => 'start', 'test' => $test_name});
+      $result = run_install_impl($proc, $path, $env);
+      fbmake_json(
+        Map {'op' => 'test_done', 'test' => $test_name, 'status' => 'passed' }
+      );
+      return $result;
+    } catch (TimeoutException $e) {
+      verbose((string) $e);
+      remove_dir_recursive(nullthrows($path));
+      fbmake_json(
+        Map {'op' => 'test_done', 'test' => $test_name, 'status' => 'skipped' }
+      );
+    }
+  }
+
+  error_and_exit('Retries exceeded: '.$proc);
+  return null; // unrechable, but make the typechecker happy.
+}
+
+function run_install_impl(string $proc, string $path, ?Map $env): ?int
 {
-  verbose("Running: $proc\n", Options::$verbose);
+  verbose("Running: $proc\n");
   $descriptorspec = array(
     0 => array("pipe", "r"),
     1 => array("pipe", "w"),
@@ -274,24 +382,71 @@ function run_install(string $proc, string $path, ?Map $env): ?int
   if ($env !== null) {
     $env_arr = array_merge($_ENV, $env->toArray());
   }
+  // If you have this set, it probably points to hhvm objects, not OSS
+  // objects. Misses here seem to be a huge slowdown, causing problems with
+  // fbmake timeouts.
+  if (
+    $env_arr !== null &&
+    array_key_exists('GIT_ALTERNATE_OBJECT_DIRECTORIES', $env_arr)
+  ) {
+    unset($env_arr['GIT_ALTERNATE_OBJECT_DIRECTORIES']);
+  }
+
   $pipes = null;
   $process = proc_open($proc, $descriptorspec, $pipes, $path, $env_arr);
+  assert($pipes !== null);
   if (is_resource($process)) {
     fclose($pipes[0]);
     $start_time = microtime(true);
-    while ($line = fgets($pipes[1])) {
-      verbose("$line", Options::$verbose);
+
+    $read = [$pipes[1]];
+    $write = [];
+    $except = $read;
+    $ready = null;
+    $done_by = time() + INSTALL_TIMEOUT_SECS;
+    while ($done_by > time()) {
+      $remaining = $done_by - time();
+      $ready = stream_select(
+        $read, $write, $except,
+        $remaining > 0 ? $remaining : 1
+      );
+      if ($ready === 0) {
+        proc_terminate($process);
+        throw new TimeoutException("Hit timeout reading from proc: ".$proc);
+      }
+      if (feof($pipes[1])) {
+        break;
+      }
+      $block = fread($pipes[1], 8096);
+      verbose($block);
       if ((microtime(true) - $start_time) > 1) {
-        verbose(".", !Options::$verbose && !Options::$csv_only);
+        not_verbose('.');
         $start_time = microtime(true);
       }
     }
-    verbose(stream_get_contents($pipes[2]), Options::$verbose);
+    verbose(stream_get_contents($pipes[2]));
     fclose($pipes[1]);
     $ret = proc_close($process);
-    verbose("Returned status $ret\n", Options::$verbose);
+    verbose("Returned status $ret\n");
     return $ret;
   }
-  verbose("Couldn't proc_open: $proc\n", Options::$verbose);
+  verbose("Couldn't proc_open: $proc\n");
   return null;
+}
+
+function nullthrows<T>(?T $x, ?string $message = null): T {
+  if ($x !== null) {
+    return $x;
+  }
+  if ($message === null) {
+    $message = 'Unexpected null';
+  }
+  throw new Exception($message);
+}
+
+// Use this instead of unlink to avoid warnings
+function delete_file(?string $path): void {
+  if ($path !== null && file_exists($path)) {
+    unlink($path);
+  }
 }

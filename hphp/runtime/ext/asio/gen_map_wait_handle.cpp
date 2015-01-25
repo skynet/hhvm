@@ -19,10 +19,10 @@
 
 #include <hphp/runtime/ext/ext_collections.h>
 #include <hphp/runtime/ext/ext_closure.h>
+#include <hphp/runtime/ext/asio/asio_blockable.h>
 #include <hphp/runtime/ext/asio/asio_context.h>
 #include <hphp/runtime/ext/asio/asio_session.h>
-#include <hphp/runtime/ext/asio/static_exception_wait_handle.h>
-#include <hphp/runtime/ext/asio/static_result_wait_handle.h>
+#include <hphp/runtime/ext/asio/static_wait_handle.h>
 #include <hphp/system/systemlib.h>
 
 namespace HPHP {
@@ -41,21 +41,8 @@ namespace {
   }
 }
 
-void c_GenMapWaitHandle::t___construct() {
-  Object e(SystemLib::AllocInvalidOperationExceptionObject(
-        "Use GenMapWaitHandle::create() instead of constructor"));
-  throw e;
-}
-
 void c_GenMapWaitHandle::ti_setoncreatecallback(const Variant& callback) {
-  if (!callback.isNull() &&
-      (!callback.isObject() ||
-       !callback.getObjectData()->instanceof(c_Closure::classof()))) {
-    Object e(SystemLib::AllocInvalidArgumentExceptionObject(
-      "Unable to set GenMapWaitHandle::onCreate: on_create_cb not a closure"));
-    throw e;
-  }
-  AsioSession::Get()->setOnGenMapCreateCallback(callback.getObjectDataOrNull());
+  AsioSession::Get()->setOnGenMapCreateCallback(callback);
 }
 
 Object c_GenMapWaitHandle::ti_create(const Variant& dependencies) {
@@ -67,12 +54,13 @@ Object c_GenMapWaitHandle::ti_create(const Variant& dependencies) {
     throw e;
   }
   assert(dependencies.getObjectData()->instanceof(c_Map::classof()));
-  auto deps = p_Map::attach(c_Map::Clone(dependencies.getObjectData()));
+  auto deps = SmartPtr<c_Map>::attach(
+    c_Map::Clone(dependencies.getObjectData()));
   for (ssize_t iter_pos = deps->iter_begin();
        deps->iter_valid(iter_pos);
        iter_pos = deps->iter_next(iter_pos)) {
 
-    Cell* current = tvAssertCell(deps->iter_value(iter_pos));
+    auto* current = tvAssertCell(deps->iter_value(iter_pos));
     if (UNLIKELY(!c_WaitHandle::fromCell(current))) {
       Object e(SystemLib::AllocInvalidArgumentExceptionObject(
         "Expected dependencies to be a map of WaitHandle instances"));
@@ -85,20 +73,22 @@ Object c_GenMapWaitHandle::ti_create(const Variant& dependencies) {
        deps->iter_valid(iter_pos);
        iter_pos = deps->iter_next(iter_pos)) {
 
-    Cell* current = tvAssertCell(deps->iter_value(iter_pos));
+    auto* current = tvAssertCell(deps->iter_value(iter_pos));
     assert(current->m_type == KindOfObject);
     assert(current->m_data.pobj->instanceof(c_WaitHandle::classof()));
     auto child = static_cast<c_WaitHandle*>(current->m_data.pobj);
 
     if (child->isSucceeded()) {
-      cellSet(child->getResult(), *current);
+      auto k = deps->iter_key(iter_pos);
+      auto result = child->getResult();
+      deps->set(k.asCell(), &result);
     } else if (child->isFailed()) {
       putException(exception, child->getException());
     } else {
       assert(child->instanceof(c_WaitableWaitHandle::classof()));
       auto child_wh = static_cast<c_WaitableWaitHandle*>(child);
 
-      p_GenMapWaitHandle my_wh = NEWOBJ(c_GenMapWaitHandle)();
+      auto my_wh = makeSmartPtr<c_GenMapWaitHandle>();
       my_wh->initialize(exception, deps.get(), iter_pos, child_wh);
 
       AsioSession* session = AsioSession::Get();
@@ -106,18 +96,20 @@ Object c_GenMapWaitHandle::ti_create(const Variant& dependencies) {
         session->onGenMapCreate(my_wh.get(), dependencies);
       }
 
-      return my_wh;
+      return Object(std::move(my_wh));
     }
   }
 
   if (exception.isNull()) {
-    return c_StaticResultWaitHandle::Create(make_tv<KindOfObject>(deps.get()));
+    return Object::attach(c_StaticWaitHandle::CreateSucceeded(
+      make_tv<KindOfObject>(deps.detach())));
   } else {
-    return c_StaticExceptionWaitHandle::Create(exception.get());
+    return Object::attach(c_StaticWaitHandle::CreateFailed(exception.detach()));
   }
 }
 
 void c_GenMapWaitHandle::initialize(const Object& exception, c_Map* deps, ssize_t iter_pos, c_WaitableWaitHandle* child) {
+  setState(STATE_BLOCKED);
   m_exception = exception;
   m_deps = deps;
   m_iterPos = iter_pos;
@@ -128,26 +120,32 @@ void c_GenMapWaitHandle::initialize(const Object& exception, c_Map* deps, ssize_
     } catch (const Object& cycle_exception) {
       putException(m_exception, cycle_exception.get());
       m_iterPos = m_deps->iter_next(m_iterPos);
+      incRefCount();
       onUnblocked();
       return;
     }
   }
 
   blockOn(child);
+  incRefCount();
 }
 
 void c_GenMapWaitHandle::onUnblocked() {
+  assert(getState() == STATE_BLOCKED);
+
   for (;
        m_deps->iter_valid(m_iterPos);
        m_iterPos = m_deps->iter_next(m_iterPos)) {
 
-    Cell* current = tvAssertCell(m_deps->iter_value(m_iterPos));
+    auto* current = tvAssertCell(m_deps->iter_value(m_iterPos));
     assert(current->m_type == KindOfObject);
     assert(current->m_data.pobj->instanceof(c_WaitHandle::classof()));
     auto child = static_cast<c_WaitHandle*>(current->m_data.pobj);
 
     if (child->isSucceeded()) {
-      cellSet(child->getResult(), *current);
+      auto k = m_deps->iter_key(m_iterPos);
+      auto result = child->getResult();
+      m_deps->set(k.asCell(), &result);
     } else if (child->isFailed()) {
       putException(m_exception, child->getException());
     } else {
@@ -167,14 +165,19 @@ void c_GenMapWaitHandle::onUnblocked() {
     }
   }
 
+  auto parentChain = getParentChain();
   if (m_exception.isNull()) {
-    setResult(make_tv<KindOfObject>(m_deps.get()));
-    m_deps = nullptr;
+    setState(STATE_SUCCEEDED);
+    tvWriteObject(m_deps.get(), &m_resultOrException);
   } else {
-    setException(m_exception.get());
+    setState(STATE_FAILED);
+    tvWriteObject(m_exception.get(), &m_resultOrException);
     m_exception = nullptr;
-    m_deps = nullptr;
   }
+
+  m_deps = nullptr;
+  parentChain.unblock();
+  decRefObj(this);
 }
 
 String c_GenMapWaitHandle::getName() {
@@ -192,8 +195,7 @@ void c_GenMapWaitHandle::enterContextImpl(context_idx_t ctx_idx) {
 
   // recursively import current child
   {
-    assert(m_iterPos);
-    Cell* current = tvAssertCell(m_deps->iter_value(m_iterPos));
+    auto* current = tvAssertCell(m_deps->iter_value(m_iterPos));
 
     assert(current->m_type == KindOfObject);
     assert(current->m_data.pobj->instanceof(c_WaitableWaitHandle::classof()));
@@ -210,7 +212,7 @@ void c_GenMapWaitHandle::enterContextImpl(context_idx_t ctx_idx) {
          m_deps->iter_valid(iter_pos);
          iter_pos = m_deps->iter_next(iter_pos)) {
 
-      Cell* current = tvAssertCell(m_deps->iter_value(iter_pos));
+      auto* current = tvAssertCell(m_deps->iter_value(iter_pos));
       assert(current->m_type == KindOfObject);
       assert(current->m_data.pobj->instanceof(c_WaitHandle::classof()));
       auto child = static_cast<c_WaitHandle*>(current->m_data.pobj);

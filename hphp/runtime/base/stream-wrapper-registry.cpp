@@ -23,7 +23,7 @@
 #include "hphp/runtime/base/glob-stream-wrapper.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/request-event-handler.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include <set>
 #include <map>
 #include <algorithm>
@@ -65,8 +65,7 @@ const StaticString
   s_data("data");
 
 bool disableWrapper(const String& scheme) {
-  String lscheme = f_strtolower(scheme);
-
+  String lscheme = HHVM_FN(strtolower)(scheme);
   bool ret = false;
 
   // Unregister request-specific wrappers entirely
@@ -94,7 +93,7 @@ bool disableWrapper(const String& scheme) {
 }
 
 bool restoreWrapper(const String& scheme) {
-  String lscheme = f_strtolower(scheme);
+  String lscheme = HHVM_FN(strtolower)(scheme);
   bool ret = false;
 
   // Unregister request-specific wrapper
@@ -118,7 +117,7 @@ bool restoreWrapper(const String& scheme) {
 
 bool registerRequestWrapper(const String& scheme,
                             std::unique_ptr<Wrapper> wrapper) {
-  String lscheme = f_strtolower(scheme);
+  String lscheme = HHVM_FN(strtolower)(scheme);
 
   // Global, non-disabled wrapper
   if ((s_wrappers.find(lscheme.data()) != s_wrappers.end()) &&
@@ -156,11 +155,27 @@ Array enumWrappers() {
   return ret;
 }
 
-Wrapper* getWrapper(const String& scheme) {
-  String lscheme = f_strtolower(scheme);
+Wrapper* getWrapper(const String& scheme, bool warn /*= false */) {
+  /* As include() and require() support streams, we sometimes need to look up
+   * a wrapper outside of a request - eg in HPHP::lookupUnit when using
+   * StatCache. We can't look at the request locals then, as:
+   * 1. requestShutdown has already been called
+   * 2. dereferencing s_request_wrappers will call requestInit, and register
+   *    a request shutdown event handler
+   * 3. the list of request event handlers is a smart::vector, so it gets lost
+   *    at the end of the request.
+   *
+   * The result of this is that s_request_wrappers is no longer request-local -
+   * requestInit() and requestShutdown() will never be called again. As it
+   * holds references to request-allocated data, this leads to intermittent
+   * segfaults.
+   */
+  bool have_request_wrappers = s_request_wrappers.getInited();
+
+  String lscheme = HHVM_FN(strtolower)(scheme);
 
   // Request local wrapper?
-  {
+  if (have_request_wrappers) {
     auto it = s_request_wrappers->m_wrappers.find(lscheme);
     if (it != s_request_wrappers->m_wrappers.end()) {
       return it->second.get();
@@ -171,50 +186,57 @@ Wrapper* getWrapper(const String& scheme) {
   {
     auto it = s_wrappers.find(lscheme.data());
     if ((it != s_wrappers.end()) &&
+        (!have_request_wrappers ||
         (s_request_wrappers->m_disabled.find(lscheme) ==
-         s_request_wrappers->m_disabled.end())) {
+         s_request_wrappers->m_disabled.end()))) {
       return it->second;
     }
   }
 
+  if (warn) {
+    raise_warning("Unknown URI scheme \"%s\"", scheme.c_str());
+  }
   return nullptr;
 }
 
-static PlainStreamWrapper s_plain_stream_wrapper;
-static FileStreamWrapper s_file_stream_wrapper;
-
-Wrapper* getWrapperFromURI(const String& uri) {
-  const char *uri_string = uri.data();
-
-  /* Special case for PHP4 Backward Compatability */
+String getWrapperProtocol(const char* uri_string, int* pathIndex) {
+  /* Special case for PHP4 Backward Compatibility */
   if (!strncasecmp(uri_string, "zlib:", sizeof("zlib:") - 1)) {
-    return getWrapper(s_compress_zlib);
+    return s_compress_zlib;
   }
 
   // data wrapper can come with or without a double forward slash
   if (!strncasecmp(uri_string, "data:", sizeof("data:") - 1)) {
-    return getWrapper(s_data);
+    return s_data;
   }
 
-  const char *colon = strstr(uri_string, "://");
+  int n = 0;
+  const char* p = uri_string;
+  while (*p && (isalnum(*p) || *p == '+' || *p == '-' || *p == '.')) {
+    n++;
+    p++;
+  }
+  const char* colon = nullptr;
+  if (*p == ':' && n > 1 && (!strncmp("//", p + 1, 2))) {
+    colon = p;
+  }
+
   if (!colon) {
-    auto def = getWrapper(s_file);
-    if (def && def != &s_file_stream_wrapper) {
-      // Script has registered its own file:// wrapper
-      // apply that to plainfiles as well
-      return def;
-    }
-    return &s_plain_stream_wrapper;
+    return s_file;
   }
 
   int len = colon - uri_string;
-  if (Wrapper *w = getWrapper(String(uri_string, len, CopyString))) {
-    return w;
-  }
-  // FIXME: return nullptr for an unhandled stream
-  return &s_plain_stream_wrapper;
+  if (pathIndex != nullptr) *pathIndex = len + sizeof("://") - 1;
+  return String(uri_string, len, CopyString);
 }
 
+Wrapper* getWrapperFromURI(const String& uri,
+                           int* pathIndex /* = NULL */,
+                           bool warn /*= true */) {
+  return getWrapper(getWrapperProtocol(uri.data(), pathIndex), warn);
+}
+
+static FileStreamWrapper s_file_stream_wrapper;
 static PhpStreamWrapper  s_php_stream_wrapper;
 static HttpStreamWrapper s_http_stream_wrapper;
 static DataStreamWrapper s_data_stream_wrapper;

@@ -1,4 +1,3 @@
-#!/usr/bin/env php
 <?hh
 /*
  * This script allows us to more easily test the key OSS PHP frameworks
@@ -139,7 +138,7 @@ function prepare(Set $available_frameworks, Set $framework_class_overrides,
   return $frameworks;
 }
 
-function fork_buckets(Traversable $data, Callable $callback): int {
+function fork_buckets(Traversable $data, (function(array):int) $callback): int {
   $num_threads = min(count($data), num_cpus() + 1);
   if (Options::$num_threads !== -1) {
     $num_threads = min(count($data), Options::$num_threads);
@@ -190,11 +189,11 @@ function run_tests(Vector $frameworks): void {
     $framework->clean();
     if (file_exists($framework->getExpectFile())) {
       $framework->prepareCurrentTestStatuses(
-                                        PHPUnitPatterns::$status_code_pattern,
-                                        PHPUnitPatterns::$stop_parsing_pattern);
-      verbose(Colors::YELLOW.$framework->getName().Colors::NONE.": running. ".
-              "Comparing against ".count($framework->getCurrentTestStatuses()).
-              " tests\n", !Options::$csv_only);
+                                        PHPUnitPatterns::STATUS_CODE_PATTERN,
+                                        PHPUnitPatterns::STOP_PARSING_PATTERN);
+      human(Colors::YELLOW.$framework->getName().Colors::NONE.": running. ".
+            "Comparing against ".count($framework->getCurrentTestStatuses()).
+            " tests\n");
       $run_msg = "Comparing test suite with previous run. ".
         Colors::GREEN."Green . (dot) ".Colors::NONE.
         "means test result same as previous. ".
@@ -208,10 +207,10 @@ function run_tests(Vector $frameworks): void {
         "A ".Colors::LIGHTBLUE." light blue F ".Colors::NONE.
         "means we are having trouble accessing the tests from the ".
         "expected run and can't get a proper status".PHP_EOL;
-      verbose($run_msg, Options::$verbose);
+      verbose($run_msg);
     } else {
-      verbose("Establishing baseline statuses for ".$framework->getName().
-              " with gray dots...\n", !Options::$csv_only);
+      human("Establishing baseline statuses for ".$framework->getName().
+            " with gray dots...\n");
     }
 
     // If we are running the tests for the framework in parallel, then let's
@@ -233,12 +232,12 @@ function run_tests(Vector $frameworks): void {
   /*************************************
    * Run the test suite
    ************************************/
-  verbose("Beginning the unit tests.....\n", !Options::$csv_only);
+  human("Beginning the unit tests.....\n");
   if ($all_tests->isEmpty()) {
     error_and_exit("No tests found to run");
   }
 
-  fork_buckets($all_tests, ($bucket) ==> run_test_bucket($bucket));
+  fork_buckets($all_tests, fun('run_test_bucket'));
 
   /****************************************
   * All tests complete. Create results for
@@ -289,7 +288,7 @@ All tests ran as expected.
       (___)__.|_____
 
 THUMBSUP;
-   verbose($msg, !Options::$csv_only);
+   human($msg);
   } else {
     $msg = <<<THUMBSDOWN
 All tests did not run as expected. Either some statuses were
@@ -306,11 +305,14 @@ tests expected to run
          (_((
 
 THUMBSDOWN;
-    verbose($msg, !Options::$csv_only);
+    human($msg);
   }
 
   // Print the diffs
-  if (!Options::$csv_only) {
+  if (
+    (Options::$output_format === OutputFormat::HUMAN) ||
+    (Options::$output_format === OutputFormat::HUMAN_VERBOSE)
+  ) {
     foreach($diff_frameworks as $framework) {
       print_diffs($framework);
     }
@@ -324,8 +326,7 @@ THUMBSDOWN;
   // and current maps to see if we are different
   if (md5(serialize(Options::$original_framework_info)) !==
       md5(serialize(Options::$framework_info))) {
-    verbose("Updating frameworks.json because some hashes have been updated",
-            !Options::$csv_only);
+    human("Updating frameworks.json because some hashes have been updated");
     file_put_contents(__DIR__."/frameworks.yaml",
                       Spyc::YAMLDump(Options::$framework_info));
   }
@@ -340,14 +341,18 @@ function run_test_bucket(array $test_bucket): int {
 }
 
 function get_unit_testing_infra_dependencies(): void {
-  // Install composer.phar. If it exists, but it is nearing that
-  // 30 day old mark, resintall it anyway.
-  if (!(file_exists(__DIR__."/composer.phar")) ||
-      (time() - filectime(__DIR__."/composer.phar")) >= 29*24*60*60) {
-    verbose("Getting composer.phar....\n", !Options::$csv_only);
-    unlink(__DIR__."/composer.phar");
+  // Even if we have vendor/, try and grab composer in case we're missing
+  // we're running a framework that isn't already installed.
+  if (
+    (!Options::$local_source_only) &&
+    (!(file_exists(__DIR__."/composer.phar")) ||
+      (time() - filectime(__DIR__."/composer.phar")) >= 29*24*60*60)
+  ) {
+    human("Getting composer.phar....\n");
+    delete_file(__DIR__."/composer.phar");
     $comp_url = "http://getcomposer.org/composer.phar";
-    $get_composer_command = "wget ".$comp_url." -P ".__DIR__." 2>&1";
+    $get_composer_command = "curl ".$comp_url." -o ".
+      __DIR__."/composer.phar 2>&1";
     $ret = run_install($get_composer_command, __DIR__,
                        ProxyInformation::$proxies);
     if ($ret !== 0) {
@@ -355,27 +360,59 @@ function get_unit_testing_infra_dependencies(): void {
     }
   }
 
+  $checksum = md5(serialize([
+    // Use both in case composer.json has been changed, but the lock file
+    // hasn't been updated yet.
+    file_get_contents(__DIR__.'/composer.json'),
+    file_get_contents(__DIR__.'/composer.lock'),
+  ]));
+  $stamp_file = __DIR__.'/vendor/'.$checksum.'.stamp';
+  if (file_exists($stamp_file)) {
+    return;
+  }
+
+  $cache_dir = Options::$cache_directory;
+  $cache_file = $cache_dir.'/vendor-'.$checksum.'.tar.bz2';
+  if (!file_exists($stamp_file)) {
+    invariant(
+      file_exists($cache_file) || !Options::$local_source_only,
+      '--local-source-only specified, but no vendor cache'
+    );
+    if ($cache_dir && file_exists($cache_file)) {
+      human("Extracting vendor cache, eg PHPUnit...\n");
+      $pd = new PharData($cache_file);
+      $pd->extractTo(__DIR__);
+      invariant(file_exists($stamp_file), 'Failed to extract vendor cache');
+      invariant(
+        file_exists(__DIR__.'/vendor/bin/phpunit'),
+        'PHPUnit executable not in vendor cache',
+      );
+      return;
+    }
+  }
+
+  // We don't have a cached vendor/, but as --local-source-only wasn't
+  // specified, we can try to download it.
+
   // Quick hack to make sure we get the latest phpunit binary from composer
   $md5_file = __DIR__."/composer.json.md5";
-  $json_file_contents = file_get_contents(__DIR__."/composer.json");
   $vendor_dir = __DIR__."/vendor";
   $lock_file = __DIR__."/composer.lock";
   if (!file_exists($md5_file) ||
-      file_get_contents($md5_file) !== md5($json_file_contents)) {
-    verbose("\nUpdated composer.json found. Updating phpunit binary.\n",
-            !Options::$csv_only);
+      file_get_contents($md5_file) !== $checksum) {
+    human("\nUpdated composer.json found. Updating phpunit binary.\n");
     if (file_exists($vendor_dir)) {
       remove_dir_recursive($vendor_dir);
     }
-    unlink($lock_file);
-    file_put_contents($md5_file, md5($json_file_contents));
+    delete_file($lock_file);
+    file_put_contents($md5_file, $checksum);
   }
 
   // Install phpunit from composer.json located in __DIR__
   $phpunit_binary = __DIR__."/vendor/bin/phpunit";
   if (!(file_exists($phpunit_binary))) {
-    verbose("\nDownloading PHPUnit in order to run tests. There may be an ".
-            "output delay while the download begins.\n", !Options::$csv_only);
+    human("\nDownloading PHPUnit in order to run tests. There may be an ".
+          "output delay while the download begins.\n");
     // Use the timeout to avoid curl SlowTimer timeouts and problems
     $phpunit_install_command = get_runtime_build()." ".
                                "-v ResourceLimit.SocketDefaultTimeout=30 ".
@@ -388,6 +425,13 @@ function get_unit_testing_infra_dependencies(): void {
     }
   }
 
+  touch($stamp_file);
+  if ($cache_dir) {
+    run_install(
+      'tar jcf '.escapeshellarg($cache_file).' vendor/',
+      __DIR__
+    );
+  }
 }
 
 function print_diffs(Framework $framework): void {
@@ -410,33 +454,38 @@ function print_summary_information(string $summary_file): void {
     $decoded_results = json_decode($contents, true);
     ksort($decoded_results);
 
-    if (Options::$csv_only) {
-      if (Options::$csv_header) {
-        $print_str = str_pad("date,", 20);
+    switch (Options::$output_format) {
+      case OutputFormat::CSV:
+        if (Options::$csv_header) {
+          $print_str = str_pad("date,", 20);
+          foreach ($decoded_results as $key => $value) {
+            $print_str .= str_pad($key.",", 20);
+          }
+          print rtrim($print_str, " ,") . PHP_EOL;
+        }
+        $print_str = str_pad(date("Y/m/d-G:i:s").",", 20);
         foreach ($decoded_results as $key => $value) {
-          $print_str .= str_pad($key.",", 20);
+          $print_str .= str_pad($value.",", 20);
         }
         print rtrim($print_str, " ,") . PHP_EOL;
-      }
-      $print_str = str_pad(date("Y/m/d-G:i:s").",", 20);
-      foreach ($decoded_results as $key => $value) {
-        $print_str .= str_pad($value.",", 20);
-      }
-      print rtrim($print_str, " ,") . PHP_EOL;
-    } else {
-      print PHP_EOL."ALL TESTS COMPLETE!".PHP_EOL;
-      print "SUMMARY:".PHP_EOL;
-      foreach ($decoded_results as $key => $value) {
-        print $key."=".$value.PHP_EOL;
-      }
-      print PHP_EOL;
-      print "To run differing tests (if they exist), see above for the".PHP_EOL;
-      print "commands or the results/.diff file. To run erroring or".PHP_EOL;
-      print "fataling tests see results/.errors and results/.fatals".PHP_EOL;
-      print "files, respectively".PHP_EOL;
+        break;
+      case OutputFormat::FBMAKE:
+        break;
+      default:
+        print PHP_EOL."ALL TESTS COMPLETE!".PHP_EOL;
+        print "SUMMARY:".PHP_EOL;
+        foreach ($decoded_results as $key => $value) {
+          print $key."=".$value.PHP_EOL;
+        }
+        print PHP_EOL;
+        print "To run differing tests (if they exist), see above for the".PHP_EOL;
+        print "commands or the results/.diff file. To run erroring or".PHP_EOL;
+        print "fataling tests see results/.errors and results/.fatals".PHP_EOL;
+        print "files, respectively".PHP_EOL;
+        break;
     }
   } else {
-      verbose("\nNO SUMMARY INFO AVAILABLE!\n", !Options::$csv_only);
+      human("\nNO SUMMARY INFO AVAILABLE!\n");
   }
 }
 
@@ -468,8 +517,8 @@ INTRO;
     # Run all framework tests.
     % hhvm run.php --all
 
-    # Run all framework tests using zend for alternative options for downloads.
-    % hhvm run.php --all --zend ~/zend55/bin/php
+    # Run all framework tests using another PHP binary
+    % hhvm run.php --all --with-php ~/php55/bin/php
 
     # Run all framework tests forcing the download of all the frameworks and
     # creating new expected output files for all of the frameworks
@@ -554,15 +603,19 @@ function oss_test_option_map(): OptionInfoMap {
                                         "except for the ones listed. The ".
                                         "tests must be at the end of the ".
                                         "command argument list."},
+    'flakey'              => Pair {'',  'Include tests that intermittently '.
+                                        'fail.'},
     'timeout:'            => Pair {'',  "The maximum amount of time, in secs, ".
                                         "to allow a individual test to run.".
                                         "Default is 60 seconds."},
     'verbose'             => Pair {'v', "For a lot of messages about what is ".
                                         "going on."},
-    'zend:'               => Pair {'',  "Use zend to run the tests ".
-                                        "Currently, zend must be installed ".
-                                        "and the path to the zend binary".
+    'with-php:'           => Pair {'',  "Use php to run the tests ".
+                                        "Currently, php must be installed ".
+                                        "and the path to the php binary".
                                         "specified."},
+    'install-only'        => Pair {'',  "Download and install the framework, ".
+                                        "but don't run any tests."},
     'redownload'          => Pair {'',  "Forces a redownload of the framework ".
                                         "code and dependencies. This uses ".
                                         "the current git hash associated with ".
@@ -583,6 +636,8 @@ function oss_test_option_map(): OptionInfoMap {
     'csvheader'           => Pair {'',  "Add a header line for the summary ".
                                         "CSV which includes the framework ".
                                         "names."},
+    'fbmake'              => Pair {'',  "Output a stream of JSON objects that ".
+                                        "Facebook's test systems understand"},
     'by-file'             => Pair {'f',  "DEFAULT: Run tests for a framework ".
                                          "on a per test file basis, as ".
                                          "opposed to a an individual test ".
@@ -595,17 +650,25 @@ function oss_test_option_map(): OptionInfoMap {
     'as-phpunit'          => Pair {'',   "Run tests for a framework just ".
                                          "like it would be run normally with ".
                                          "PHPUnit"},
-    'numthreads:'          => Pair {'',   "The exact number of threads to use ".
+    'numthreads:'         => Pair {'',   "The exact number of threads to use ".
                                          "when running framework tests in ".
                                          "parallel"},
+    'isolate'             => Pair {'',   "Try to make tests that have ".
+                                         "external dependencies automatically ".
+                                         "fail"},
+    'cache-directory:'    => Pair {'',   'Directory to store source tarballs'},
+    'local-source-only'   => Pair {'',   'Fail if git or composer calls are '.
+                                         'needed'},
   };
 }
 
 function main(array $argv): void {
   $options = parse_options(oss_test_option_map());
   if ($options->containsKey('help')) {
-    return help();
+    help();
+    return;
   }
+
   // Parse all the options passed to run.php and come out with a list of
   // frameworks passed into test (or --all or --allexcept)
   $passed_frameworks = Options::parse($options, $argv);
@@ -614,7 +677,10 @@ function main(array $argv): void {
   $framework_class_overrides = get_subclasses_of("Framework")->toSet();
   $frameworks = prepare($available_frameworks, $framework_class_overrides,
                         $passed_frameworks);
-  run_tests($frameworks);
+
+  if (Options::$run_tests) {
+    run_tests($frameworks);
+  }
 }
 
 main($argv);

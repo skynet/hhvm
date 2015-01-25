@@ -29,7 +29,7 @@
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
 
-using namespace HPHP::JIT;
+using namespace HPHP::jit;
 
 namespace HPHP {
 namespace Debug {
@@ -95,6 +95,7 @@ void ElfWriter::initStrtab() {
   addSectionString("");
 }
 
+#if defined(LIBDWARF_USE_INIT_C) || defined(FACEBOOK)
 bool ElfWriter::initDwarfProducer() {
   Dwarf_Error error = 0;
   /* m_dwarfProducer is the handle used for interaction for libdwarf */
@@ -116,6 +117,27 @@ bool ElfWriter::initDwarfProducer() {
   }
   return true;
 }
+#else
+bool ElfWriter::initDwarfProducer() {
+  Dwarf_Error error = 0;
+  auto ret = dwarf_producer_init(
+    DW_DLC_WRITE | DW_DLC_SIZE_64 | DW_DLC_SYMBOLIC_RELOCATIONS,
+    g_dwarfCallback,
+    nullptr,
+    nullptr,
+    reinterpret_cast<Dwarf_Ptr>(this),
+    "x86_64",
+    "V2",
+    nullptr,
+    &m_dwarfProducer,
+    &error);
+  if (ret != DW_DLV_OK) {
+    logError("Unable to create dwarf producer");
+    return false;
+  }
+  return true;
+}
+#endif
 
 Dwarf_P_Die ElfWriter::addFunctionInfo(FunctionInfo* f, Dwarf_P_Die type) {
   Dwarf_Error error = 0;
@@ -538,14 +560,15 @@ int ElfWriter::writeStringSection() {
 
 int ElfWriter::writeTextSection() {
   int section = -1;
-  CodeBlock& a = mcg->code.main();
+  auto& code = mcg->code;
   if ((section = newSection(
-      ".text.tracelets", a.capacity(), SHT_NOBITS, SHF_ALLOC | SHF_EXECINSTR,
-      reinterpret_cast<uint64_t>(a.base()))) < 0) {
+         ".text.tracelets", code.codeSize(),
+         SHT_NOBITS, SHF_ALLOC | SHF_EXECINSTR,
+         reinterpret_cast<uint64_t>(code.base()))) < 0) {
     logError("unable to create text section");
     return -1;
   }
-  if (!addSectionData(section, nullptr, a.capacity())) {
+  if (!addSectionData(section, nullptr, code.codeSize())) {
     logError("unable to add text data");
     return -1;
   }

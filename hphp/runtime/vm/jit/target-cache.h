@@ -29,7 +29,7 @@ struct Class;
 struct NamedEntity;
 }
 
-namespace HPHP { namespace JIT {
+namespace HPHP { namespace jit {
 
 //////////////////////////////////////////////////////////////////////
 
@@ -126,16 +126,6 @@ constexpr int kMovImmOff = 2;
 struct Entry {
   uintptr_t m_key;
   const Func* m_value;
-};
-
-/*
- * When we first create method cache entries, we need some information to set
- * up an immediate for the first dispatched function.  A pointer to one of
- * these is passed in rawTarget to handlePrimeCacheInit.
- */
-struct SmashTarget {
-  JIT::TCA movAddr;
-  JIT::TCA retAddr;
 };
 
 template<bool fatal>

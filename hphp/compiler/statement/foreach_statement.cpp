@@ -32,10 +32,10 @@ using namespace HPHP;
 ForEachStatement::ForEachStatement
 (STATEMENT_CONSTRUCTOR_PARAMETERS,
  ExpressionPtr array, ExpressionPtr name, bool nameRef,
- ExpressionPtr value, bool valueRef, StatementPtr stmt)
+ ExpressionPtr value, bool valueRef, bool awaitAs, StatementPtr stmt)
   : LoopStatement(STATEMENT_CONSTRUCTOR_PARAMETER_VALUES(ForEachStatement)),
     m_array(array), m_name(name), m_value(value), m_ref(valueRef),
-    m_stmt(stmt) {
+    m_awaitAs(awaitAs), m_stmt(stmt) {
   if (!m_value) {
     m_value = m_name;
     m_ref = nameRef;
@@ -117,39 +117,6 @@ void ForEachStatement::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-void ForEachStatement::inferTypes(AnalysisResultPtr ar) {
-  IMPLEMENT_INFER_AND_CHECK_ASSERT(getScope());
-
-  m_array->inferAndCheck(ar, m_ref ? Type::Variant : Type::Array, m_ref);
-  if (m_name) {
-    if (m_name->is(Expression::KindOfListAssignment)) {
-      m_name->inferTypes(ar, TypePtr(), false);
-    } else {
-      m_name->inferAndCheck(ar, Type::Primitive, true);
-    }
-  }
-
-  if (m_value->is(Expression::KindOfListAssignment)) {
-    m_value->inferTypes(ar, TypePtr(), false);
-  } else {
-    m_value->inferAndCheck(ar, Type::Variant, true);
-  }
-
-  if (m_ref) {
-    TypePtr actualType = m_array->getActualType();
-    if (!actualType ||
-        actualType->is(Type::KindOfVariant) ||
-        actualType->is(Type::KindOfObject)) {
-      ar->forceClassVariants(getClassScope(), false, true);
-    }
-  }
-  if (m_stmt) {
-    getScope()->incLoopNestedLevel();
-    m_stmt->inferTypes(ar);
-    getScope()->decLoopNestedLevel();
-  }
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void ForEachStatement::outputCodeModel(CodeGenerator &cg) {
@@ -177,6 +144,7 @@ void ForEachStatement::outputCodeModel(CodeGenerator &cg) {
 void ForEachStatement::outputPHP(CodeGenerator &cg, AnalysisResultPtr ar) {
   cg_printf("foreach (");
   m_array->outputPHP(cg, ar);
+  if (m_awaitAs) cg_printf(" await");
   cg_printf(" as ");
   if (m_name) {
     m_name->outputPHP(cg, ar);

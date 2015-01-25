@@ -20,15 +20,17 @@
 
 #include <pcre.h>
 
-#include "hphp/runtime/ext/ext_mb.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/ext/ext_function.h"
+#include "hphp/runtime/ext/mbstring/ext_mbstring.h"
+#include "hphp/runtime/ext/std/ext_std_function.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/base/ini-setting.h"
 #include "hphp/runtime/base/request-local.h"
 
 namespace HPHP {
 
 ///////////////////////////////////////////////////////////////////////////////
+
+static int s_pcre_has_jit = 0;
 
 Variant HHVM_FUNCTION(preg_grep, const String& pattern, const Array& input,
                                  int flags /* = 0 */) {
@@ -73,10 +75,10 @@ Variant HHVM_FUNCTION(preg_replace_callback, const Variant& pattern, const Varia
                                              const Variant& subject,
                                              int limit /* = -1 */,
                                              VRefParam count /* = null */) {
-  if (!f_is_callable(callback)) {
+  if (!HHVM_FN(is_callable)(callback)) {
     raise_warning("Not a valid callback function %s",
         callback.toString().data());
-    return empty_string;
+    return empty_string_variant();
   }
   return preg_replace_impl(pattern, callback, subject,
                            limit, count, true, false);
@@ -117,23 +119,23 @@ int64_t HHVM_FUNCTION(preg_last_error) {
 String HHVM_FUNCTION(ereg_replace, const String& pattern,
                                    const String& replacement,
                                    const String& str) {
-  return f_mb_ereg_replace(pattern, replacement, str);
+  return HHVM_FN(mb_ereg_replace)(pattern, replacement, str);
 }
 
 String HHVM_FUNCTION(eregi_replace, const String& pattern,
                                     const String& replacement,
                                     const String& str) {
-  return f_mb_eregi_replace(pattern, replacement, str);
+  return HHVM_FN(mb_eregi_replace)(pattern, replacement, str);
 }
 
 Variant HHVM_FUNCTION(ereg, const String& pattern, const String& str,
                             VRefParam regs /* = null */) {
-  return f_mb_ereg(pattern, str, ref(regs));
+  return HHVM_FN(mb_ereg)(pattern, str, ref(regs));
 }
 
 Variant HHVM_FUNCTION(eregi, const String& pattern, const String& str,
                              VRefParam regs /* = null */) {
-  return f_mb_eregi(pattern, str, ref(regs));
+  return HHVM_FN(mb_eregi)(pattern, str, ref(regs));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -150,37 +152,33 @@ Variant HHVM_FUNCTION(spliti, const String& pattern, const String& str,
 }
 
 String HHVM_FUNCTION(sql_regcase, const String& str) {
-  unsigned char c;
-  register int i, j;
-
-  char *tmp = (char*)malloc(str.size() * 4 + 1);
-  for (i = j = 0; i < str.size(); i++) {
-    c = (unsigned char)str.charAt(i);
+  StringBuffer out(str.size());
+  for (int i = 0; i < str.size(); i++) {
+    unsigned char c = (unsigned char)str.charAt(i);
     if (isalpha(c)) {
-      tmp[j++] = '[';
-      tmp[j++] = toupper(c);
-      tmp[j++] = tolower(c);
-      tmp[j++] = ']';
+      out.append('[');
+      out.append((unsigned char)toupper(c));
+      out.append((unsigned char)tolower(c));
+      out.append(']');
     } else {
-      tmp[j++] = c;
+      out.append(c);
     }
   }
-  tmp[j] = 0;
 
-  return String(tmp, j, AttachString);
+  return out.detach();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
 const StaticString s_PCRE_VERSION("PCRE_VERSION");
 
-extern IMPLEMENT_THREAD_LOCAL(PCREglobals, s_pcre_globals);
+extern IMPLEMENT_THREAD_LOCAL(PCREglobals, tl_pcre_globals);
 
-class PcreExtension : public Extension {
+class PcreExtension final : public Extension {
 public:
   PcreExtension() : Extension("pcre", NO_EXTENSION_VERSION_YET) {}
 
-  virtual void moduleInit() {
+  void moduleInit() override {
     Native::registerConstant<KindOfString>(
       s_PCRE_VERSION.get(), makeStaticString(pcre_version())
     );
@@ -225,17 +223,22 @@ public:
     HHVM_FE(sql_regcase);
 
     loadSystemlib();
+
+    pcre_config(PCRE_CONFIG_JIT, &s_pcre_has_jit);
+    IniSetting::Bind(this, IniSetting::PHP_INI_ONLY,
+                     "hhvm.pcre.jit",
+                     &s_pcre_has_jit);
   }
 
-  virtual void threadInit() {
+  void threadInit() override {
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                      "pcre.backtrack_limit",
                      std::to_string(RuntimeOption::PregBacktraceLimit).c_str(),
-                     &s_pcre_globals->m_preg_backtrace_limit);
+                     &tl_pcre_globals->preg_backtrace_limit);
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                      "pcre.recursion_limit",
                      std::to_string(RuntimeOption::PregRecursionLimit).c_str(),
-                     &s_pcre_globals->m_preg_recursion_limit);
+                     &tl_pcre_globals->preg_recursion_limit);
   }
 
 } s_pcre_extension;

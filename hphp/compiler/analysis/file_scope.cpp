@@ -17,7 +17,7 @@
 
 #include <sys/stat.h>
 #include <map>
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 
 #include "hphp/compiler/analysis/code_error.h"
 #include "hphp/compiler/analysis/lambda_names.h"
@@ -46,6 +46,7 @@ namespace HPHP {
 FileScope::FileScope(const string &fileName, int fileSize, const MD5 &md5)
   : BlockScope("", "", StatementPtr(), BlockScope::FileScope),
     m_size(fileSize), m_md5(md5), m_includeState(0), m_system(false),
+    m_isHHFile(false), m_preloadPriority(0),
     m_fileName(fileName), m_redeclaredFunctions(0) {
   pushAttribute(); // for global scope
 }
@@ -73,6 +74,10 @@ void FileScope::setSystem() {
   m_system = true;
 }
 
+void FileScope::setHHFile() {
+  m_isHHFile = true;
+}
+
 FunctionScopePtr FileScope::setTree(AnalysisResultConstPtr ar,
                                     StatementListPtr tree) {
   m_tree = tree;
@@ -83,7 +88,7 @@ FunctionScopePtr FileScope::setTree(AnalysisResultConstPtr ar,
 void FileScope::cleanupForError(AnalysisResultConstPtr ar) {
   for (StringToClassScopePtrVecMap::const_iterator iter = m_classes.begin();
        iter != m_classes.end(); ++iter) {
-    BOOST_FOREACH(ClassScopePtr cls, iter->second) {
+    for (ClassScopePtr cls: iter->second) {
       cls->getVariables()->cleanupForError(ar);
     }
   }
@@ -184,7 +189,7 @@ int FileScope::getFunctionCount() const {
   int total = FunctionContainer::getFunctionCount();
   for (StringToClassScopePtrVecMap::const_iterator iter = m_classes.begin();
        iter != m_classes.end(); ++iter) {
-    BOOST_FOREACH(ClassScopePtr cls, iter->second) {
+    for (ClassScopePtr cls: iter->second) {
       total += cls->getFunctionCount();
     }
   }
@@ -195,7 +200,7 @@ void FileScope::countReturnTypes(std::map<std::string, int> &counts) {
   FunctionContainer::countReturnTypes(counts, m_redeclaredFunctions);
   for (StringToClassScopePtrVecMap::const_iterator iter = m_classes.begin();
        iter != m_classes.end(); ++iter) {
-    BOOST_FOREACH(ClassScopePtr cls, iter->second) {
+    for (ClassScopePtr cls: iter->second) {
       cls->countReturnTypes(counts, 0);
     }
   }
@@ -381,7 +386,7 @@ void FileScope::analyzeIncludesHelper(AnalysisResultPtr ar) {
           if (!fs->m_includeState) {
             fs->analyzeIncludesHelper(ar);
           }
-          BOOST_FOREACH(BlockScopeRawPtr bs, fs->m_providedDefs) {
+          for (BlockScopeRawPtr bs: fs->m_providedDefs) {
             m_providedDefs.insert(bs);
           }
           continue;

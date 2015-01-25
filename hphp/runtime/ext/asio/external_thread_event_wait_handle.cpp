@@ -19,8 +19,10 @@
 
 #include "hphp/runtime/ext/asio/asio_external_thread_event.h"
 #include "hphp/runtime/ext/asio/asio_external_thread_event_queue.h"
+#include "hphp/runtime/ext/asio/asio_blockable.h"
 #include "hphp/runtime/ext/asio/asio_context.h"
 #include "hphp/runtime/ext/asio/asio_session.h"
+#include "hphp/runtime/ext/asio/blockable_wait_handle.h"
 #include "hphp/system/systemlib.h"
 
 namespace HPHP {
@@ -28,6 +30,18 @@ namespace HPHP {
 
 namespace {
   StaticString s_externalThreadEvent("<external-thread-event>");
+}
+
+void c_ExternalThreadEventWaitHandle::ti_setoncreatecallback(const Variant& callback) {
+  AsioSession::Get()->setOnExternalThreadEventCreateCallback(callback);
+}
+
+void c_ExternalThreadEventWaitHandle::ti_setonsuccesscallback(const Variant& callback) {
+  AsioSession::Get()->setOnExternalThreadEventSuccessCallback(callback);
+}
+
+void c_ExternalThreadEventWaitHandle::ti_setonfailcallback(const Variant& callback) {
+  AsioSession::Get()->setOnExternalThreadEventFailCallback(callback);
 }
 
 void c_ExternalThreadEventWaitHandle::sweep() {
@@ -47,27 +61,27 @@ void c_ExternalThreadEventWaitHandle::sweep() {
   }
 }
 
-void c_ExternalThreadEventWaitHandle::t___construct() {
-  Object e(SystemLib::AllocInvalidOperationExceptionObject(
-        "ExternalThreadEventWaitHandle can be constructed only from extension"));
-  throw e;
-}
-
 c_ExternalThreadEventWaitHandle* c_ExternalThreadEventWaitHandle::Create(AsioExternalThreadEvent* event, ObjectData* priv_data) {
-  c_ExternalThreadEventWaitHandle* wh = NEWOBJ(c_ExternalThreadEventWaitHandle);
+  auto wh = newobj<c_ExternalThreadEventWaitHandle>();
   wh->initialize(event, priv_data);
   return wh;
 }
 
 void c_ExternalThreadEventWaitHandle::initialize(AsioExternalThreadEvent* event, ObjectData* priv_data) {
-  // this wait handle is owned by existence of unprocessed event
-  incRefCount();
+  setState(STATE_WAITING);
   m_event = event;
   m_privData = priv_data;
 
-  setState(STATE_WAITING);
+  // this wait handle is owned by existence of unprocessed event
+  incRefCount();
+
   if (isInContext()) {
     registerToContext();
+  }
+
+  auto session = AsioSession::Get();
+  if (UNLIKELY(session->hasOnExternalThreadEventCreateCallback())) {
+    session->onExternalThreadEventCreate(this);
   }
 }
 
@@ -112,30 +126,78 @@ void c_ExternalThreadEventWaitHandle::process() {
   try {
     m_event->unserialize(result);
   } catch (const Object& exception) {
-    setException(exception.get());
+    assert(exception->instanceof(SystemLib::s_ExceptionClass));
+    auto parentChain = getParentChain();
+    setState(STATE_FAILED);
+    tvWriteObject(exception.get(), &m_resultOrException);
+    parentChain.unblock();
+
+    auto session = AsioSession::Get();
+    if (UNLIKELY(session->hasOnExternalThreadEventFailCallback())) {
+      session->onExternalThreadEventFail(this, exception);
+    }
     return;
   } catch (...) {
-    setException(AsioSession::Get()->getAbruptInterruptException().get());
+    auto parentChain = getParentChain();
+    setState(STATE_FAILED);
+    tvWriteObject(AsioSession::Get()->getAbruptInterruptException(),
+                  &m_resultOrException);
+    parentChain.unblock();
     throw;
   }
 
   assert(cellIsPlausible(result));
-  setResult(result);
-  tvRefcountedDecRefCell(&result);
+  auto parentChain = getParentChain();
+  setState(STATE_SUCCEEDED);
+  cellCopy(result, m_resultOrException);
+  parentChain.unblock();
+
+  auto session = AsioSession::Get();
+  if (UNLIKELY(session->hasOnExternalThreadEventSuccessCallback())) {
+    session->onExternalThreadEventSuccess(this, tvAsCVarRef(&result));
+  }
 }
 
 String c_ExternalThreadEventWaitHandle::getName() {
   return s_externalThreadEvent;
 }
 
+void c_ExternalThreadEventWaitHandle::enterContextImpl(context_idx_t ctx_idx) {
+  assert(getState() == STATE_WAITING);
+
+  if (isInContext()) {
+    unregisterFromContext();
+  }
+
+  setContextIdx(ctx_idx);
+  registerToContext();
+}
+
+void c_ExternalThreadEventWaitHandle::exitContext(context_idx_t ctx_idx) {
+  assert(AsioSession::Get()->getContext(ctx_idx));
+  assert(getContextIdx() == ctx_idx);
+  assert(getState() == STATE_WAITING);
+
+  // Move us to the parent context.
+  setContextIdx(getContextIdx() - 1);
+
+  // Re-register if still in a context.
+  if (isInContext()) {
+    registerToContext();
+  }
+
+  // Recursively move all wait handles blocked by us.
+  getParentChain().exitContext(ctx_idx);
+}
+
 void c_ExternalThreadEventWaitHandle::registerToContext() {
   AsioContext *ctx = getContext();
-  m_index = ctx->registerTo(ctx->getExternalThreadEvents(), this);
+  m_ctxVecIndex = ctx->registerTo(ctx->getExternalThreadEvents(), this);
 }
 
 void c_ExternalThreadEventWaitHandle::unregisterFromContext() {
   AsioContext *ctx = getContext();
-  ctx->unregisterFrom(ctx->getExternalThreadEvents(), m_index);
+  ctx->unregisterFrom(ctx->getExternalThreadEvents(), m_ctxVecIndex);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

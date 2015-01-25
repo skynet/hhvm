@@ -24,7 +24,7 @@
 #include <set>
 #include <utility>
 #include <vector>
-#include "folly/String.h"
+#include <folly/String.h>
 #include "hphp/compiler/analysis/analysis_result.h"
 #include "hphp/compiler/parser/parser.h"
 #include "hphp/compiler/analysis/symbol_table.h"
@@ -33,11 +33,9 @@
 #include "hphp/compiler/json.h"
 #include "hphp/util/process.h"
 #include "hphp/util/logger.h"
-#include "hphp/util/db-conn.h"
-#include "hphp/util/db-query.h"
 #include "hphp/util/exception.h"
 #include "hphp/util/job-queue.h"
-#include "hphp/util/file-util.h"
+#include "hphp/runtime/base/file-util.h"
 #include "hphp/runtime/base/execution-context.h"
 
 using namespace HPHP;
@@ -225,7 +223,8 @@ public:
 void Package::addSourceFile(const char *fileName, bool check /* = false */) {
   if (fileName && *fileName) {
     Lock lock(m_mutex);
-    auto canonFileName = FileUtil::canonicalize(fileName);
+    auto canonFileName =
+      FileUtil::canonicalize(String(fileName)).toCppString();
     bool inserted = m_filesToParse.insert(canonFileName).second;
     if (inserted && m_dispatcher) {
       ((JobQueueDispatcher<ParserWorker>*)m_dispatcher)->enqueue(
@@ -302,7 +301,7 @@ bool Package::parseImpl(const char *fileName) {
   int lines = 0;
   try {
     Logger::Verbose("parsing %s ...", fullPath.c_str());
-    Scanner scanner(fullPath.c_str(), Option::GetScannerType(), true);
+    Scanner scanner(fullPath, Option::GetScannerType(), true);
     Compiler::Parser parser(scanner, fileName, m_ar, sb.st_size);
     parser.parse();
     lines = parser.line1();
@@ -359,55 +358,12 @@ void Package::saveStatsToFile(const char *filename, int totalSeconds) const {
 
     ms.add("VariableTableFunctions");
     JSON::CodeError::ListStream ls(o);
-    BOOST_FOREACH(const std::string &f, m_ar->m_variableTableFunctions) {
+    for (const std::string &f: m_ar->m_variableTableFunctions) {
       ls << f;
     }
     ls.done();
 
     ms.done();
     f.close();
-  }
-}
-
-int Package::saveStatsToDB(ServerDataPtr server, int totalSeconds,
-                           const std::string &branch, int revision) const {
-  std::map<std::string, int> counts;
-  SymbolTable::CountTypes(counts);
-  m_ar->countReturnTypes(counts);
-  std::ostringstream sout;
-  JSON::CodeError::OutputStream o(sout, m_ar);
-  o << counts;
-
-  DBConn conn;
-  conn.open(server);
-
-  const char *sql = "INSERT INTO hphp_run (branch, revision, file, line, "
-    "byte, program, function, class, types, time)";
-  DBQuery q(&conn, "%s", sql);
-  q.insert("'%s', %d, %d, %d, %d, %d, %d, %d, '%s', %d",
-           branch.c_str(), revision,
-           getFileCount(), getLineCount(), getCharCount(),
-           1, m_ar->getFunctionCount(),
-           m_ar->getClassCount(), sout.str().c_str(), totalSeconds);
-  q.execute();
-  return conn.getLastInsertId();
-}
-
-void Package::commitStats(ServerDataPtr server, int runId) const {
-  DBConn conn;
-  conn.open(server);
-
-  {
-    DBQuery q(&conn, "UPDATE hphp_dep");
-    q.setField("parent_file = parent");
-    q.filterBy("run = %d", runId);
-    q.filterBy("kind IN ('PHPInclude', 'PHPTemplate')");
-    q.execute();
-  }
-  {
-    DBQuery q(&conn, "UPDATE hphp_run");
-    q.setField("committed = 1");
-    q.filterBy("id = %d", runId);
-    q.execute();
   }
 }

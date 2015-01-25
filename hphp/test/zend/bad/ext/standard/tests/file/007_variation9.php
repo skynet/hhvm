@@ -32,7 +32,9 @@ var_dump( fread($file_handle, 100) );  //Check for read operation
 var_dump( fwrite($file_handle, $string) );  //Check for write operation; fails; expected: 0 bytes
 var_dump( fclose($file_handle) );  //Check for close operation on the file handle
 var_dump( get_resource_type($file_handle) );  //Check whether resource is lost after close operation
-echo "*** Done ***\n"; ?>
+echo "*** Done ***\n"; 
+?>
+<?php error_reporting(0); ?>
 <?php
 unlink(dirname(__FILE__)."/007_variation9.tmp");
 ?>
